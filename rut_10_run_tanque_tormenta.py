@@ -23,10 +23,30 @@ from rut_01_swmm_handel import SWMMSimplePlot
 
 if __name__ == "__main__":
 
-    inp_file = Path(r"C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\COLEGIO_TR25_v6.inp").resolve()
-    path_proy = r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\modulos\tanques_tormenta'
-    elev_files_list = [ r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\gis\01_raster\elev.tif' ]
-    image_path = r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\gis\01_raster\imagen.tif'
+    candidates = [
+        Path(r"C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta"),
+        Path(r"C:\Users\Alienware\OneDrive\SANTA_ISABEL\00_tanque_tormenta"),
+    ]
+
+    path_proy = None
+    for p in candidates:
+        if p.exists() and p.is_dir():
+            path_proy = p.resolve()
+            break
+
+    if path_proy is None:
+        raise FileNotFoundError(f"No server root found in candidates: {candidates}")
+
+    # use server_root from here on
+    print(path_proy)
+
+    swwm_file = r"COLEGIO_TR25_v6.inp"
+    elev_file = r'gis\01_raster\elev.tif'
+
+    inp_file = path_proy / swwm_file
+    elev_files_list = [ path_proy / elev_file ]
+    # image_path = r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\gis\01_raster\imagen.tif'
+    image_path = None
     
     source_crs = CRS("""PROJCRS["SIRES-DMQ",
 BASEGEOGCRS["WGS 84",
