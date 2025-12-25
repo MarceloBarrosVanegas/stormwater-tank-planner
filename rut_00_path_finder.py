@@ -18,8 +18,11 @@ from shapely.geometry import Point, MultiPoint
 from shapely.ops import split, linemerge, unary_union
 
 
-
+# Add local modules to path
+sys.path.append(r'C:\Users\Alienware\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\src')
+sys.path.append(r'C:\Users\Alienware\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\gui')
 sys.path.append(r'C:\Users\chelo\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\src')
+sys.path.append(r'C:\Users\chelo\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\gui')
 
 from rut_02_elevation import ElevationGetter, ElevationSource
 from utils_pypiper import DirTree
@@ -61,24 +64,47 @@ class PathFinder:
         lon, lat = transformer.transform(point[0], point[1])
         return (lat, lon)
 
-    def download_osm_data(self, safety_margin_km=0.5, network_type='all'):
+    def set_start_end_points(self, start_point, end_point):
         """
-        Downloads street network data from OpenStreetMap around the points.
-        The download radius is calculated as half the distance between the points plus a safety margin.
+        Updates the start and end points for the path finder.
+        Useful for reusing the existing graph with new endpoints.
+        
+        Args:
+            start_point (tuple): (easting, northing)
+            end_point (tuple): (easting, northing)
+        """
+        self.start_point = start_point
+        self.end_point = end_point
+        self.start_point_latlon = self._transform_to_latlon(start_point)
+        self.end_point_latlon = self._transform_to_latlon(end_point)
+
+    def download_osm_data(self, safety_margin_km=0.5, network_type='all', cache_path=None):
+
+        """
+        Downloads street network data from OpenStreetMap or loads from cache.
 
         Args:
-            safety_margin_km (float): The safety margin in kilometers to add to the radius.
-            network_type (str): The type of network to download (e.g., 'all', 'drive', 'walk').
+            safety_margin_km (float): The safety margin in kilometers.
+            network_type (str): The type of network to download.
+            cache_path (str, optional): Path to .graphml file for caching.
         """
+        if cache_path and os.path.exists(cache_path):
+            print(f"Loading OSM data from cache: {cache_path}...")
+            try:
+                self.graph = ox.load_graphml(cache_path)
+                print("OSM graph loaded from cache successfully.")
+                return
+            except Exception as e:
+                print(f"Error loading cache: {e}. Proceeding to download.")
+
         print(f"Downloading OSM data for network type '{network_type}'...")
         try:
-            # Calculate Euclidean distance in meters (assuming projected CRS)
+            # Calculate Euclidean distance in meters
             dist_between_points_m = math.sqrt(
                 (self.end_point[0] - self.start_point[0]) ** 2 +
                 (self.end_point[1] - self.start_point[1]) ** 2
             )
 
-            # The radius for the download is half the distance + safety margin
             radius_m = (dist_between_points_m / 2) + (safety_margin_km * 1000)
 
             center_point = (
@@ -88,9 +114,19 @@ class PathFinder:
 
             self.graph = ox.graph_from_point(center_point, dist=radius_m, network_type=network_type)
             print("OSM data downloaded and graph created successfully.")
+            
+            # Save to cache if requested
+            if cache_path and self.graph is not None:
+                try:
+                    ox.save_graphml(self.graph, cache_path)
+                    print(f"OSM graph saved to cache: {cache_path}")
+                except Exception as e:
+                     print(f"Warning: Could not save OSM cache: {e}")
+
         except Exception as e:
             print(f"An error occurred during OSM data download: {e}")
             self.graph = None
+
 
     def get_graph_geodataframes(self):
         """
@@ -189,8 +225,7 @@ class PathFinder:
         # Calcular valores máximos para normalización
         max_length = 0
         max_elevation_penalty = 0
-        
-        print("Calculando valores máximos para normalización...")
+
         for u, v, data in self.graph.edges(data=True):
             length = data.get('length', 0)
             max_length = max(max_length, length)
@@ -215,9 +250,8 @@ class PathFinder:
         min_penalty, max_penalty = min(penalties), max(penalties)
         penalty_range = (max_penalty - min_penalty) or 1.0
     
-        print("Calculando costos de aristas...")
-        print(f"Longitud máxima: {max_length:.2f}m")
-        print(f"Penalización máxima por elevación: {max_elevation_penalty:.2f}m")
+        # print(f"Longitud máxima: {max_length:.2f}m")
+        # print(f"Penalización máxima por elevación: {max_elevation_penalty:.2f}m")
         
         # Calcular costo para cada arista
         for u, v, data in self.graph.edges(data=True):
@@ -354,7 +388,7 @@ class PathFinder:
         max_length = 0
         max_elevation_penalty = 0
     
-        print("Calculando valores máximos para normalización...")
+        print("----" *10)
         for u, v, data in self.graph.edges(data=True):
             length = data.get('length', 0)
             max_length = max(max_length, length)
@@ -376,10 +410,7 @@ class PathFinder:
         penalties = list(road_preferences.values()) + [default_penalty]
         min_penalty, max_penalty = min(penalties), max(penalties)
         penalty_range = (max_penalty - min_penalty) or 1.0
-    
-        print("Calculando costos de aristas...")
-        print(f"Longitud máxima: {max_length:.2f}m")
-        print(f"Penalización máxima por elevación: {max_elevation_penalty:.2f}m")
+            
     
         # Calcular costo para cada arista
         for u, v, data in self.graph.edges(data=True):
@@ -475,16 +506,16 @@ class PathFinder:
                 # Opcional: dibujar flechas hacia la línea base
                 plt.plot([dist, dist], [elev_real, elev_base], color='gray', linestyle=':', linewidth=1, zorder=0)
     
-            # Configuración del gráfico
-            plt.title('Perfil de Elevación a lo largo de la Ruta Óptima')
-            plt.xlabel('Distancia Acumulada (m)')
-            plt.ylabel('Elevación (m)')
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
+            # # Configuración del gráfico
+            # plt.title('Perfil de Elevación a lo largo de la Ruta Óptima')
+            # plt.xlabel('Distancia Acumulada (m)')
+            # plt.ylabel('Elevación (m)')
+            # plt.legend()
+            # plt.grid(True)
+            # plt.tight_layout()
     
-            # Mostrar el gráfico
-            plt.show()
+            # # Mostrar el gráfico
+            # plt.show()
     
             return self.shortest_path
     
@@ -683,7 +714,7 @@ class PathFinder:
         # 1) extraemos los vértices "seguros" del primer simplify con preserve_topology
         base_simpl = merged.simplify(15, preserve_topology=True)
         
-        # CORRECCIÓN: Manejar tanto LineString como MultiLineString
+        
         safe_pts = []
         if hasattr(base_simpl, 'coords'):
             # Es LineString simple
@@ -733,40 +764,6 @@ class PathFinder:
         return gpd.GeoDataFrame(geometry=[final], crs=self.source_crs)
     
     
-    def get_simplified_path_old(self, tolerance=30):
-        poly_gdf = self.get_path_as_gdf()
-        if poly_gdf is None:
-            return None
-    
-        merged_line = poly_gdf.geometry.iloc[0]
-    
-        # 1) generar multipunto con las coordenadas de cada nodo
-        node_pts = [
-            Point((self.graph.nodes[n]['x'], self.graph.nodes[n]['y']))
-            for n in self.shortest_path
-        ]
-        splitter = MultiPoint(node_pts)
-    
-        # 2) split devuelve un GeometryCollection
-        raw = split(merged_line, splitter)
-    
-        # 3) extrae la lista de segmentos
-        if hasattr(raw, 'geoms'):
-            segments = list(raw.geoms)
-        else:
-            # en caso de que raw sea directamente un LineString u otro
-            segments = [raw]
-    
-        # 4) simplifica cada segmento
-        simplified_segs = [
-            seg.simplify(tolerance, preserve_topology=True)
-            for seg in segments
-        ]
-    
-        # 5) vuelve a unirlos
-        final_line = linemerge(unary_union(simplified_segs))
-    
-        return gpd.GeoDataFrame(geometry=[final_line], crs=poly_gdf.crs)
 
 
     def run(self,
@@ -840,19 +837,8 @@ class PathFinder:
 
             self.vector_name = project_name
 
-            
-            dt = DirTree()
-            tree_txt = dt.export_tree(r"C:\Users\chelo\OneDrive\SANTA_ISABEL\PROYECTO_SAN_SEBASTIAN")
-            dt.replicate_tree(tree_txt, r"PROYECTO_" + project_name)
-            
-            path_proy = r"PROYECTO_" + project_name + os.path.sep + "00_GIS" + os.path.sep + r"00_IN" + os.path.sep + r"01_EXISTING" + os.path.sep + r"PROYECTO_" + project_name + ".gpkg"
-            # path_gdf = self.get_path_as_gdf()
-            path_gdf = self.get_simplified_path(tolerance=50)
-            # path_gdf.to_crs(self.source_crs, inplace=True)
-            # path_gdf["geometry"] = path_gdf.geometry.simplify(tolerance=15, preserve_topology=True)
-
-            
+            path_gdf = self.get_simplified_path(tolerance=50)            
             path_gdf.to_file(path_proy)
-            
+        
             self.plot_downloaded_area(image_path, title)
             

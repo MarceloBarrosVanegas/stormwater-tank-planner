@@ -69,7 +69,7 @@ class SWMMOverflowAnalyzer:
         self.source_crs = source_crs
 
     def _run_swmm(self):
-        print(f"▶ Ejecutando SWMM sobre {self.inp_path.name}")
+        print(f">> Ejecutando SWMM sobre {self.inp_path.name}")
         cwd = os.getcwd()  # guarda cwd actual
         os.chdir(self.inp_path.parent)  # ⇦ cambia a la carpeta del .inp
         try:

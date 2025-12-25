@@ -9,9 +9,33 @@ from pathlib import Path
 import numpy as np
 from pyproj import CRS
 
+"""
+SWMM Modifier Module
+====================
+
+This module provides the `SWMMModifier` class, which allows for programmatic manipulation
+of SWMM (Storm Water Management Model) input files (.inp). It supports adding nodes,
+conduits, storage units, and coordinates, as well as integrating data from GeoPackage
+(GPKG) files for pipeline generation.
+
+Classes
+-------
+SWMMModifier
+    A class to parse, modify, and save SWMM .inp files.
+
+Dependencies
+------------
+- os, shutil, math, sys
+- swmmio
+- pandas, geopandas
+- numpy
+- pyproj
+- rut_06_pipe_sizing.SeccionLlena (optional, for section parsing)
+"""
+
 # SYS PATH APPEND for rut_06 (User provided paths)
-sys.path.append(r'C:\Users\Alienware\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\src')
-sys.path.append(r'C:\Users\Alienware\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\gui')
+import config
+config.setup_sys_path()
 try:
     from rut_06_pipe_sizing import SeccionLlena
     print("Successfully imported SeccionLlena from rut_06_pipe_sizing")
@@ -20,6 +44,34 @@ except ImportError as e:
     SeccionLlena = None
 
 class SWMMModifier:
+    """
+    A class to parse, modify, and save SWMM .inp files.
+
+    This class reads an existing .inp file into memory as a list of lines, allowing
+    for insertion of new sections and elements (junctions, conduits, storage units, etc.).
+    It also provides functionality to integrate geospatial data from GPKG files.
+
+    Parameters
+    ----------
+    inp_file : str
+        The path to the input SWMM .inp file.
+    crs : pyproj.CRS or str, optional
+        The Coordinate Reference System (CRS) to be used for spatial operations.
+        If None, it may be inferred from loaded GPKG data.
+
+    Attributes
+    ----------
+    inp_file : str
+        Path to the source .inp file.
+    lines : list of str
+        The content of the .inp file stored as a list of strings.
+    swmm_model : swmmio.Model
+        An initialized swmmio Model object for read operations (optional).
+    flooding_gdf : geopandas.GeoDataFrame
+        A GeoDataFrame containing flooding node data loaded from a GPKG.
+    swmm_crs : pyproj.CRS
+        The active CRS for the model.
+    """
     def __init__(self, inp_file, crs=None):
         self.inp_file = inp_file
         # Read file with compatible encoding
@@ -27,12 +79,28 @@ class SWMMModifier:
             self.lines = f.readlines()
             
         # Initialize swmmio model (optional usage)
-        self.swmm_model = swmmio.Model(self.inp_file)
+        self.swmm_model = swmmio.Model(str(self.inp_file))
         self.flooding_gdf = None
         self.swmm_crs = crs
         
     def load_flooding_data(self, gpkg_path):
-        """Loads the flooding nodes GPKG for fast data retrieval."""
+        """
+        Loads the flooding nodes GPKG for fast data retrieval.
+
+        Parameters
+        ----------
+        gpkg_path : str
+            Path to the GeoPackage file containing flooding node information.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        >>> modifier = SWMMModifier("model.inp")
+        >>> modifier.load_flooding_data("00_flooding_nodes.gpkg")
+        """
         try:
             self.flooding_gdf = gpd.read_file(gpkg_path)
             # Only override CRS if not manually provided
@@ -105,22 +173,88 @@ class SWMMModifier:
             
         return self._find_last_line_of_section(section_name)
 
-    def add_storage_unit(self, name, area, max_depth, terrain_elev=None, node_invert=None):
+    def set_report_step(self, time_step="00:00:30"):
         """
-        Adds a FUNCTIONAL storage unit (Constant Area).
-        Logic for Elevation:
-          - If terrain_elev is provided: Invert = terrain_elev - max_depth
-          - Else if node_invert is provided: Invert = node_invert - max_depth
-          - Else: Raises ValueError
+        Updates the REPORT_STEP in the [OPTIONS] section.
+        Essential for capturing flash flood peaks in the hydrograph.
         """
-        if terrain_elev is not None:
+        section = "[OPTIONS]"
+        header_idx = -1
+        
+        # Find section
+        for i, line in enumerate(self.lines):
+            if line.strip().upper() == section:
+                header_idx = i
+                break
+        
+        if header_idx == -1:
+            print("Warning: [OPTIONS] section not found.")
+            return
+
+        # Scan for REPORT_STEP
+        found = False
+        current_idx = header_idx + 1
+        while current_idx < len(self.lines):
+            line = self.lines[current_idx]
+            if line.strip().startswith("["):
+                break # New section
+                
+            parts = line.split()
+            if len(parts) > 1 and parts[0].upper() == "REPORT_STEP":
+                # Replace line
+                # Preserve whitespace structure roughly
+                self.lines[current_idx] = f"REPORT_STEP          {time_step}\n"
+                print(f"  [Info] Updated REPORT_STEP to {time_step}")
+                found = True
+                break
+            current_idx += 1
+            
+        if not found:
+            # Insert if not found
+            self.lines.insert(header_idx + 1, f"REPORT_STEP          {time_step}\n")
+
+    def add_storage_unit(self, name, area, max_depth, terrain_elev=None, node_invert=None, invert_elev=None):
+        """
+        Adds a FUNCTIONAL storage unit (Constant Area) to the SWMM model.
+
+        Parameters
+        ----------
+        name : str
+            The name/ID of the storage unit.
+        area : float
+            The constant surface area of the storage unit.
+        max_depth : float
+            The maximum depth of the storage unit.
+        terrain_elev : float, optional
+            The terrain elevation at the storage unit location. If provided,
+            Invert Elevation = terrain_elev - max_depth.
+        node_invert : float, optional
+            The invert elevation of the connecting node. Used if `terrain_elev`
+            is not provided. Invert Elevation = node_invert - max_depth.
+        invert_elev : float, optional
+            Directly sets the Invert Elevation (Bottom) of the tank. 
+            Overrides other elevation parameters if provided.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If no elevation parameter is provided.
+        """
+        if invert_elev is not None:
+             elev = float(invert_elev)
+             print(f"  [Info] Tank {name}: Using direct Invert Elevation {elev:.2f}")
+        elif terrain_elev is not None:
             elev = terrain_elev - max_depth
             print(f"  [Info] Tank {name}: Calc Invert {elev:.2f} = Terrain {terrain_elev:.2f} - Depth {max_depth:.2f}")
         elif node_invert is not None:
             elev = node_invert - max_depth
             print(f"  [Info] Tank {name}: Calc Invert {elev:.2f} = NodeInvert {node_invert:.2f} - Depth {max_depth:.2f}")
         else:
-            raise ValueError(f"Tank {name}: Must provide either terrain_elev or node_invert to calculate tank elevation.")
+            raise ValueError(f"Tank {name}: Must provide either invert_elev, terrain_elev or node_invert to calculate tank elevation.")
 
         # Params: A B C -> Area + 0*Depth^0
         params_str = f"{area:.2f} 0 0"
@@ -146,10 +280,38 @@ class SWMMModifier:
 
     def add_conduit(self, name, from_node, to_node, length, roughness=0.015, inlet_offset=0.0, outlet_offset=0.0):
         """
-        Adds a conduit definition.
-        [CONDUITS]
-        ;;Name     Inlet      Outlet     Length  ManningN  InletOff  OutletOff  InitFlow  MaxFlow
-        C1        Node1      TK1        10      0.013     0.0       0.0        0         0
+        Adds a conduit definition to the model.
+
+        Parameters
+        ----------
+        name : str
+            The name/ID of the conduit.
+        from_node : str
+            The ID of the inlet node.
+        to_node : str
+            The ID of the outlet node.
+        length : float
+            The length of the conduit.
+        roughness : float, optional
+            Manning's roughness coefficient (default is 0.015).
+        inlet_offset : float, optional
+            Depth of the conduit inlet above the node invert (default is 0.0).
+        outlet_offset : float, optional
+            Depth of the conduit outlet above the node invert (default is 0.0).
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        >>> modifier.add_conduit(
+        ...     name="C1",
+        ...     from_node="NodeA",
+        ...     to_node="NodeB",
+        ...     length=100.0,
+        ...     roughness=0.013
+        ... )
         """
         new_line = (
             f"{name:<16} "
@@ -170,13 +332,89 @@ class SWMMModifier:
              
         self.lines.insert(idx, new_line)
 
+    def add_weir(self, name, from_node, to_node, weir_type="SIDEFLOW", crest_height=0.5, 
+                 discharge_coeff=1.84, width=2.0, end_contractions=0, flap_gate=False):
+        """
+        Adds a weir to the model for flow diversion.
+
+        Parameters
+        ----------
+        name : str
+            The ID of the weir.
+        from_node : str
+            The ID of the inlet node (where water comes from).
+        to_node : str  
+            The ID of the outlet node (where water goes to, e.g., a tank or derivation).
+        weir_type : str, optional
+            Type of weir: 'TRANSVERSE', 'SIDEFLOW', 'V-NOTCH', 'TRAPEZOIDAL' (default 'SIDEFLOW').
+        crest_height : float, optional
+            Height of the weir crest above the inlet node invert (default 0.5m).
+        discharge_coeff : float, optional
+            Weir discharge coefficient (default 1.84 for rectangular).
+        width : float, optional
+            Crest width/length of the weir (default 2.0m).
+        end_contractions : int, optional
+            Number of end contractions (0, 1, or 2) (default 0).
+        flap_gate : bool, optional
+            Whether the weir has a flap gate (default False).
+
+        Returns
+        -------
+        None
+        """
+        flap_str = "YES" if flap_gate else "NO"
+        
+        # [WEIRS] format for SWMM 5.2:
+        # Name  FromNode  ToNode  Type  CrestHt  Cd  Gated  EC  Cd2  Surcharge
+        # For SIDEFLOW: EC (end contractions) and Cd2 are optional, use empty fields
+        new_line = (
+            f"{name:<16} "
+            f"{from_node:<16} "
+            f"{to_node:<16} "
+            f"{weir_type:<12} "
+            f"{crest_height:<10.2f} "
+            f"{discharge_coeff:<10.3f} "
+            f"{flap_str:<8}\n"
+        )
+        
+        section = "WEIRS"
+        idx = self._find_last_line_of_section(section)
+        if idx == -1:
+            headers = ";;Name           From Node        To Node          Type         CrestHt    Qcoeff     Gated"
+            idx = self._create_section(section, headers)
+        
+        self.lines.insert(idx, new_line)
+        print(f"  [Weir] Added: {name} from {from_node} to {to_node} (Crest: {crest_height:.2f}m, Width: {width:.2f}m)")
+        
+        # Also add the XSECTION for the weir (required)
+        # Weir XSection: Link Shape Height TopWidth SideSlope1 SideSlope2 Barrels Culvert
+        xsect_line = f"{name:<16} RECT_OPEN    {1.0:<10.2f} {width:<10.2f} 0          0          1          \n"
+        
+        xsect_section = "XSECTIONS"
+        xsect_idx = self._find_last_line_of_section(xsect_section)
+        if xsect_idx != -1:
+            self.lines.insert(xsect_idx, xsect_line)
+
     def add_rect_closed_xsection(self, link_name, height):
         """
-        Adds RECT_CLOSED XSECTION.
-        User Req: Base = 2 * Height.
-        [XSECTIONS]
-        ;;Link     Shape        Geom1(H)   Geom2(W)   Geom3  Geom4  Barrels
-        C1        RECT_CLOSED  1.0        2.0        0      0      1
+        Adds a RECT_CLOSED cross-section to a link.
+
+        The width is automatically set to 2.0 * height based on user requirements.
+
+        Parameters
+        ----------
+        link_name : str
+            The ID of the link (conduit).
+        height : float
+            The height of the rectangular section.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        >>> modifier.add_rect_closed_xsection(link_name="C1", height=1.5)
         """
         width = 2.0 * height
         
@@ -195,9 +433,24 @@ class SWMMModifier:
 
     def add_coordinate(self, name, x, y):
         """
-        Adds coordinate.
-        [COORDINATES]
-        ;;Node          X-Coord           Y-Coord
+        Adds a coordinate entry for a node.
+
+        Parameters
+        ----------
+        name : str
+            The ID of the node.
+        x : float
+            The X-coordinate (Easting).
+        y : float
+            The Y-coordinate (Northing).
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        >>> modifier.add_coordinate("NodeX", 500000.0, 9800000.0)
         """
         new_line = f"{name:<16} {x:<16.3f} {y:<16.3f}\n"
         
@@ -208,8 +461,24 @@ class SWMMModifier:
 
     def get_node_coords(self, node_id):
         """
-        Retrieves (x, y) coordinates for a given node.
-        Prioritizes loaded GPKG, falls back to swmmio.
+        Retrieves the (x, y) coordinates for a given node.
+
+        It prioritizes data from the loaded flooding GPKG. If not found, it falls
+        back to the loaded swmmio model.
+
+        Parameters
+        ----------
+        node_id : str
+            The ID of the node to lookup.
+
+        Returns
+        -------
+        tuple of (float, float)
+            The (x, y) coordinates of the node. Returns (0.0, 0.0) if not found.
+
+        Examples
+        --------
+        >>> x, y = modifier.get_node_coords("Node123")
         """
         # 1. Try GPKG
         if self.flooding_gdf is not None:
@@ -237,10 +506,63 @@ class SWMMModifier:
             
         return 0.0, 0.0
 
+    def place_node_at_distance(self, new_node_id, ref_node_id, dist_x=0.0, dist_y=0.0):
+        """
+        Places a new node at a specific distance offset from a reference node.
+
+        Calculates the new coordinates based on the reference node's position and the
+        provided offsets, then adds the coordinate entry to the SWMM model.
+
+        Parameters
+        ----------
+        new_node_id : str
+            The ID of the new node to place.
+        ref_node_id : str
+            The ID of the existing reference node.
+        dist_x : float, optional
+            The distance to move in the X direction (default is 0.0).
+        dist_y : float, optional
+            The distance to move in the Y direction (default is 0.0).
+
+        Returns
+        -------
+        tuple of (float, float)
+            The calculated (x, y) coordinates of the new node.
+
+        Examples
+        --------
+        >>> # Place 'NewNode' 5 meters East and 2 meters North of 'RefNode'
+        >>> modifier.place_node_at_distance("NewNode", "RefNode", dist_x=5.0, dist_y=2.0)
+        """
+        x, y = self.get_node_coords(ref_node_id)
+        
+        new_x = x + dist_x
+        new_y = y + dist_y
+        
+        print(f"Placing {new_node_id} at ({new_x:.3f}, {new_y:.3f}) relative to move {ref_node_id} ({x:.3f}, {y:.3f})")
+        self.add_coordinate(new_node_id, new_x, new_y)
+        return new_x, new_y
+
     def get_node_invert(self, node_id):
         """
-        Retrieves Invert Elevation for a given node.
-        Prioritizes loaded GPKG, falls back to swmmio.
+        Retrieves the Invert Elevation for a given node.
+
+        Prioritizes data from the loaded flooding GPKG. If not found, it falls
+        back to the loaded swmmio model.
+
+        Parameters
+        ----------
+        node_id : str
+            The ID of the node.
+
+        Returns
+        -------
+        float
+            The invert elevation of the node. Returns 0.0 if not found.
+
+        Examples
+        --------
+        >>> invert = modifier.get_node_invert("Node123")
         """
         # 1. Try GPKG
         if self.flooding_gdf is not None:
@@ -267,8 +589,27 @@ class SWMMModifier:
     def add_pipeline_from_gpkg(self, gpkg_path, connection_id=None):
         """
         Parses a GPKG file to generate a SWMM pipeline (Junctions + Conduits).
-        Replaces the FINAL Node with a Storage Unit using default sizing.
-        Connects the START Node to an existing 'connection_id' if provided.
+
+        This method reads a pipeline defined in a GeoPackage, adds the corresponding
+        junctions, conduits, and cross-sections to the SWMM model.
+        - It replaces the FINAL Node of the pipeline with a Storage Unit (Tank).
+        - It creates a connection from the START Node to an existing `connection_id` if provided.
+
+        Parameters
+        ----------
+        gpkg_path : str
+            Path to the GPKG file defining the pipeline.
+        connection_id : str, optional
+            The ID of an existing node in the model to connect the start of the pipeline to.
+            If provided, the start node of the pipeline is mapped to this ID.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        >>> modifier.add_pipeline_from_gpkg("pipeline.gpkg", connection_id="ExistingNodeID")
         """
         if SeccionLlena is None:
             print("Cannot generate pipeline: SeccionLlena dependency missing.")
@@ -462,7 +803,22 @@ class SWMMModifier:
             self.add_xsection(x['link'], x['shape'], x['geoms'])
 
     def add_junction(self, name, elev, max_depth=0):
-        """Adds a junction."""
+        """
+        Adds a junction to the model.
+
+        Parameters
+        ----------
+        name : str
+            The ID of the junction.
+        elev : float
+            The invert elevation of the junction.
+        max_depth : float, optional
+            The maximum depth of the junction (default is 0).
+
+        Returns
+        -------
+        None
+        """
         new_line = f"{name:<16} {elev:<10.2f} {max_depth:<10.2f} 0.0        0.0        0.0\n"
         section = "JUNCTIONS"
         idx = self._find_last_line_of_section(section)
@@ -472,7 +828,23 @@ class SWMMModifier:
         self.lines.insert(idx, new_line)
 
     def add_xsection(self, link, shape, geoms):
-        """Generic XSection adder. geoms is a list of [geom1, geom2, geom3, geom4]."""
+        """
+        Generic method to add a cross-section to a link.
+
+        Parameters
+        ----------
+        link : str
+            The ID of the link.
+        shape : str
+            The SWMM shape type (e.g., 'RECT_CLOSED', 'CIRCULAR').
+        geoms : list of float
+            A list of geometry parameters [Geom1, Geom2, Geom3, Geom4].
+            Specific meanings depend on the shape.
+
+        Returns
+        -------
+        None
+        """
         # SWMM format: Link Shape Geom1 Geom2 Geom3 Geom4 Barrels Culvert
         # Format string with fixed width
         geom_str = f"{geoms[0]:<10.2f} {geoms[1]:<10.2f} {geoms[2]:<10.2f} {geoms[3]:<10.2f}"
@@ -484,42 +856,172 @@ class SWMMModifier:
              self.lines.insert(idx, new_line)
 
     def save(self, output_path):
+        """
+        Saves the modified SWMM model to a file.
+
+        Parameters
+        ----------
+        output_path : str
+            The path where the .inp file will be saved.
+
+        Returns
+        -------
+        None
+        """
         with open(output_path, 'w', encoding='latin-1') as f:
             f.writelines(self.lines)
 
-# ------------------------------------------------------------------------------
-# TEST RUN
-# ------------------------------------------------------------------------------
+    def add_designed_pipeline(self, designed_gdf, connection_map=None):
+        """
+        Integrates a designed pipeline from rut_03 into the SWMM model.
+        
+        Parameters
+        ----------
+        designed_gdf : geopandas.GeoDataFrame
+            The output GDF from SewerPipeline.
+        connection_map : dict, optional
+            A mapping of {OriginalNodeID: FinalNodeID} to connect the new pipes
+            to existing model nodes (e.g. { 'R_1.0': 'NodeX', 'R_1.1': 'TK_NodeX' }).
+            Nodes in the values of this map are assumed to ALREADY EXIST (or be added separately),
+            so no new junction entries will be created for them.
+        """
+        if SeccionLlena is None:
+            print("Cannot generate pipeline: SeccionLlena dependency missing.")
+            return
+
+        print(f"Adding designed pipeline ({len(designed_gdf)} links)...")
+        connection_map = connection_map or {}
+        
+        # Identify nodes that should NOT be created (they effectively exist)
+        existing_targets = set(connection_map.values())
+        
+        # Track IDs we have added in this batch to avoid duplicates
+        added_nodes = set()
+        
+        xsections_to_add = []
+        
+        for idx, row in designed_gdf.iterrows():
+            tramo = str(row['Tramo'])
+            parts = tramo.split('-')
+            
+            # Robust split handling
+            if len(parts) >= 2:
+                u_original = parts[0]
+                v_original = parts[-1] # Handle multi-dash names if any? usually simple.
+            else:
+                print(f"Skipping malformed Tramo: {tramo}")
+                continue
+                
+            # Remap IDs
+            u_final = connection_map.get(u_original, u_original)
+            v_final = connection_map.get(v_original, v_original)
+            
+            # --- NODES ---
+            # Process U (Start)
+            if u_final not in existing_targets and u_final not in added_nodes:
+                # Get coords from start of geometry
+                if row.geometry.geom_type == 'LineString':
+                    pt = row.geometry.coords[0]
+                    # Add Junction
+                    # ZFI is invert at start of pipe. Node invert should be at least this.
+                    z = float(row.ZFI) if hasattr(row, 'ZFI') else 0.0
+                    self.add_junction(u_final, z)
+                    self.add_coordinate(u_final, pt[0], pt[1])
+                    added_nodes.add(u_final)
+            
+            # Process V (End)
+            if v_final not in existing_targets and v_final not in added_nodes:
+                if row.geometry.geom_type == 'LineString':
+                    pt = row.geometry.coords[-1]
+                    z = float(row.ZFF) if hasattr(row, 'ZFF') else 0.0
+                    self.add_junction(v_final, z)
+                    self.add_coordinate(v_final, pt[0], pt[1])
+                    added_nodes.add(v_final)
+            
+            # --- CONDUIT ---
+            # Use Tramo as Name, but maybe prefix to ensure uniqueness?
+            # rut_03 names are usually unique per project.
+            
+            length = float(row.L) if hasattr(row, 'L') else row.geometry.length
+            n = float(row.Rug) if hasattr(row, 'Rug') else 0.010
+            
+            self.add_conduit(tramo, u_final, v_final, length, n)
+            
+            # --- XSECTION ---
+            # Parse 'Seccion' and 'D_int' similar to add_pipeline_from_gpkg
+            d_int = str(row.D_int) if hasattr(row, 'D_int') else "0.3"
+            seccion_type = str(row.Seccion).lower().strip() if hasattr(row, 'Seccion') else "circular"
+            
+            # (Reuse logic from add_pipeline_from_gpkg or refactor. duplicating for safety/speed now)
+            try:
+                geom_arr = SeccionLlena.section_str2float([d_int], return_all=True, sep='x')
+                g = geom_arr[0]
+                
+                shape_swmm = 'CIRCULAR'
+                geoms = [0.0]*4
+                
+                if 'circular' in seccion_type:
+                    shape_swmm = 'CIRCULAR'
+                    geoms[0] = g[0]
+                elif 'rect' in seccion_type and 'closed' in seccion_type: # check rut_03 naming
+                     shape_swmm = 'RECT_CLOSED'
+                     geoms[0] = g[1] # H
+                     geoms[1] = g[0] # W
+                else:
+                     # Fallback to circular if unknown or add other types
+                     # rut_03 usually produces circular for sewers
+                     shape_swmm = 'CIRCULAR'
+                     geoms[0] = g[0]
+                
+                xsections_to_add.append({
+                    'link': tramo,
+                    'shape': shape_swmm,
+                    'geoms': geoms
+                })
+                
+            except Exception as e:
+                print(f"Error parsing section for {tramo}: {e}")
+                # Fallback
+                self.add_xsection(tramo, 'CIRCULAR', [0.3, 0, 0, 0])
+
+        # Add all xsections
+        for x in xsections_to_add:
+            self.add_xsection(x['link'], x['shape'], x['geoms'])
+
 if __name__ == "__main__":
     base_file = "COLEGIO_TR25_v6.inp"
-    gpkg_file = r"00_flooding_stats/00_flooding_nodes.gpkg" 
+    out_pipe = "COLEGIO_TR25_v6_PIPELINE.inp"
 
+    gpkg_file = r"00_flooding_stats/00_flooding_nodes.gpkg" 
+    gpkg_pipeline = r"P0061405_PredioID3.gpkg"
+    target_node = "P0061405" 
     source_crs = CRS("""PROJCRS["SIRES-DMQ",
-BASEGEOGCRS["WGS 84",
-    DATUM["World Geodetic System 1984",
-        ELLIPSOID["WGS 84",6378137,298.257223563,
-        LENGTHUNIT["metre",1]],ID["EPSG",6326]],
-    PRIMEM["Greenwich",0,
-        ANGLEUNIT["Degree",0.0174532925199433]]],
-CONVERSION["unnamed",
-    METHOD["Transverse Mercator",ID["EPSG",9807]],
-    PARAMETER["Latitude of natural origin",0,
-        ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8801]],
-    PARAMETER["Longitude of natural origin",-78.5,
-        ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8802]],
-    PARAMETER["Scale factor at natural origin",1.0004584,
-        SCALEUNIT["unity",1],ID["EPSG",8805]],
-    PARAMETER["False easting",500000,
-        LENGTHUNIT["metre",1],ID["EPSG",8806]],
-    PARAMETER["False northing",10000000,
-        LENGTHUNIT["metre",1],ID["EPSG",8807]]],
-CS[Cartesian,3],
-AXIS["(E)",east,ORDER[1],
-    LENGTHUNIT["metre",1,ID["EPSG",9001]]],
-AXIS["(N)",north,ORDER[2],
-    LENGTHUNIT["metre",1,ID["EPSG",9001]]],
-AXIS["ellipsoidal height (h)",up,ORDER[3],
-LENGTHUNIT["metre",1,ID["EPSG",9001]]]]""")
+        BASEGEOGCRS["WGS 84",
+            DATUM["World Geodetic System 1984",
+                ELLIPSOID["WGS 84",6378137,298.257223563,
+                LENGTHUNIT["metre",1]],ID["EPSG",6326]],
+            PRIMEM["Greenwich",0,
+                ANGLEUNIT["Degree",0.0174532925199433]]],
+        CONVERSION["unnamed",
+            METHOD["Transverse Mercator",ID["EPSG",9807]],
+            PARAMETER["Latitude of natural origin",0,
+                ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8801]],
+            PARAMETER["Longitude of natural origin",-78.5,
+                ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8802]],
+            PARAMETER["Scale factor at natural origin",1.0004584,
+                SCALEUNIT["unity",1],ID["EPSG",8805]],
+            PARAMETER["False easting",500000,
+                LENGTHUNIT["metre",1],ID["EPSG",8806]],
+            PARAMETER["False northing",10000000,
+                LENGTHUNIT["metre",1],ID["EPSG",8807]]],
+        CS[Cartesian,3],
+        AXIS["(E)",east,ORDER[1],
+            LENGTHUNIT["metre",1,ID["EPSG",9001]]],
+        AXIS["(N)",north,ORDER[2],
+            LENGTHUNIT["metre",1,ID["EPSG",9001]]],
+        AXIS["ellipsoidal height (h)",up,ORDER[3],
+        LENGTHUNIT["metre",1,ID["EPSG",9001]]]]"""
+    )
     
     
     if os.path.exists(base_file):
@@ -532,70 +1034,21 @@ LENGTHUNIT["metre",1,ID["EPSG",9001]]]]""")
         else:
             print(f"Warning: GPKG file {gpkg_file} not found.")
 
-        # --- TEST SETUP ---
-        target_node = "P0061405" 
-        print(f"Targeting Node: {target_node}")
 
+        print(f"Targeting Node: {target_node}")
         # 1. Get Node Data
         node_x, node_y = mod.get_node_coords(target_node)
         node_invert = mod.get_node_invert(target_node)
         
-        # Case A: Terrain Provided (e.g., 2800 m)
-        print("\n--- Test Case A: Terrain Provided (2800m) ---")
-        mod.add_storage_unit(
-            name="TK_TERRAIN",
-            area=20000.0,
-            max_depth=5.0,
-            terrain_elev=2780.0
-        )
-        
-        # # Case B: No Terrain, use Node Invert
-        # print("\n--- Test Case B: No Terrain (Use Node Invert) ---")
-        # mod.add_storage_unit(
-        #     name="TK_NODE",
-        #     area=200.0,
-        #     max_depth=5.0,
-        #     node_invert=node_invert
-        # )
-        
-        # Add supporting elements for TK_TERRAIN for completeness
-        # Add supporting elements for TK_TERRAIN for completeness
-        mod.add_coordinate("TK_TERRAIN", node_x + 5.0, node_y)
-        
-        # 5. Conduit
-        # CONNECT TO TOP: set outlet_offset = tank depth (5.0)
-        # CONNECT TO BOTTOM: set outlet_offset = 0.0
-        mod.add_conduit(
-            name="C_TERRAIN", 
-            from_node=target_node, 
-            to_node="TK_TERRAIN", 
-            length=15.0, 
-            outlet_offset=5.0  # <--- CONNECTING TO TOP (Matches MaxDepth)
-        )
-
-        mod.add_rect_closed_xsection("C_TERRAIN", 0.8)
-
-        # Save OLD test
-        # out_file = "COLEGIO_TR25_v6_MODIFIED.inp"
-        # mod.save(out_file)
-        
-        # --- TEST PIPELINE GPKG ---
-        print("\n--- Test Case C: Pipeline from GPKG ---")
-        gpkg_pipeline = r"P0061405_PredioID3.gpkg"
-        
         if os.path.exists(gpkg_pipeline):
-            # Reload fresh model to avoid duplicates from previous tests
-            # Pass the manual CRS (source_crs)
             mod_pipe = SWMMModifier(base_file, crs=source_crs)
-            
-            # Load flooding data (CRS already set manually, so it won't be overwritten)
+
             if os.path.exists(gpkg_file):
                  mod_pipe.load_flooding_data(gpkg_file)
             
-            # P0061405 is the derivation node
             mod_pipe.add_pipeline_from_gpkg(gpkg_pipeline, connection_id="P0061405")
             
-            out_pipe = "COLEGIO_TR25_v6_PIPELINE.inp"
+
             mod_pipe.save(out_pipe)
             print(f"Pipeline File saved: {out_pipe}")
         else:

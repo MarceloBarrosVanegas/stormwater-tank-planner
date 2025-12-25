@@ -5,6 +5,8 @@ from shapely.geometry import Point, LineString
 import matplotlib.pyplot as plt
 import networkx as nx
 import pandas as pd
+from pathlib import Path
+import os
 
 class SWMMSimplePlot:
     def __init__(self, inp):
@@ -185,18 +187,21 @@ class SWMMSimplePlot:
 
 # ----------------------------- USO ----------------------------------- #
 if __name__ == "__main__":
-    inp_file = r"E:\TANQUE MONJAS\MODELO EL COLEGIO Y EL BATAN 2012\ANEXO 4.  SWMM 2012\SWMM 2012\COLEGIO_ACTUAL_TR25_100%.inp"
 
+    # Se asume ejecución desde carpeta codigos: root = parent dir
+    project_root = Path(os.getcwd()).parent
+
+    inp_file = str(project_root / r"COLEGIO_TR25_v6.inp")
     net = SWMMSimplePlot(inp_file)
 
     nodes_gdf, edges_gdf = net.get_upstream_network('P0061408')
 
-    # # now you can save or further manipulate them with geopandas
-    # nodes_gdf.to_file('upstream_nodes.shp')
-    # edges_gdf.to_file('upstream_edges.shp')
+    # now you can save or further manipulate them with geopandas
+    nodes_gdf.to_file('upstream_nodes.shp')
+    edges_gdf.to_file('upstream_edges.shp')
 
     # 1) solo la red
-    # net.plot()
+    net.plot()
 
     # 2) con upstream resaltado
     net.plot(selected_node="P0061408")

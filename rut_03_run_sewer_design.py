@@ -38,6 +38,7 @@ import ezdxf
 from ezdxf import appsettings, zoom, xref
 from ezdxf.enums import TextEntityAlignment
 from ezdxf.addons import Importer
+from tqdm import tqdm
 from ezdxf.math import Vec3
 from ezdxf.entities import MText
 from ezdxf.enums import MTextLineAlignment
@@ -51,7 +52,7 @@ os.environ.update({"GDAL_DATA": os.path.join(base_dir, "Library", "share", "gdal
 
 
 import geopandas as gpd
-
+from pathlib import Path
 # import osmnx as ox
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
@@ -99,9 +100,9 @@ warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
 
 pd.options.mode.chained_assignment = None
 os.environ["USE_PYGEOS"] = "0"
-sys.path.append(r"C:\Users\chelo\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\src")
-sys.path.append(r"C:\Users\chelo\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\gui")
-sys.path.append(r"C:\Users\Alienware\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper")
+import config
+config.setup_sys_path()
+
 from pypiper_compiled import nb_isBetween, nb_line_intersect, nb_get_line_intersect, is_inside_sm, nb_is_inside_parallel, nb_cdist, nb_ortoSegmentPoint_all
 from RUT_0 import find_classes_and_functions
 from rut_02_elevation import ElevationSource, ElevationGetter, KDTreeSaveLoad
@@ -118,17 +119,17 @@ def par_basicos(h_min=0, D_min=0, h_D_max=0, seccion_min=0):
         
     
     if h_D_max != 0:
-        return 0.8
+        return 0.65
     
     if seccion_min != 0:
         return 0.3
 
 
 map_calado_dict = {
-    "critico": 0.75,
-    "sub-critico": 0.80,
+    "critico": 0.7,
+    "sub-critico": 0.7,
     "super-critico": 0.65,
-    "": 0.75,
+    "": 0.65,
 }
 velocidad_maxima_pypiper = {"PVC": 3.5, "PVC-1MPa": 9.0, "PEAD": 5.9, "PRFV": 3.5, "HS": 5.0, "HA": 5.9, "HD": 9.0}
 pendiente_minima_pypiper = {
@@ -3642,7 +3643,7 @@ def D_inter_sizing(m_ramales, i, index_seccion, seccion="circular"):
                             # max_diameters = {_:list(diametro_interno_externo_pypiper[_])[-1] for _ in diametro_interno_externo_pypiper if  _ != j}
                             # max_diameters = pd.DataFrame(max_diameters.values(), index= max_diameters.keys(), columns=['D'])
                             # max_diameters.sort_values('D', inplace=True)
-                            print(f"********************\nRamal {i} tiene diametro teorico mayor a los diametros disponibles\n********************")
+                            # print(f"********************\nRamal {i} tiene diametro teorico mayor a los diametros disponibles\n********************")
 
                             np.put(m_ramales[i]["Material"], index_chnage_material, ["HA"] * len(index_chnage_material))
                             np.put(m_ramales[i]["Seccion"], index_chnage_material, ["rectangular"] * len(index_chnage_material))
@@ -4435,7 +4436,7 @@ def get_sizing_SPLL(m_ramales, ramal, xy_inter):
                                 np.put(m_ramales[i]["D_int"], index_map_to_otiginal, D_new)
                                 seccion_control = False
                             else:
-                                print("aqui", i)
+                                # print("aqui", i)
 
                                 index_change_seccion = np.where(index_search >= Dmin_int.size)[0]
                                 index_change_seccion = index_map_to_otiginal[index_change_seccion]
@@ -4553,7 +4554,7 @@ def get_sizing_SPLL(m_ramales, ramal, xy_inter):
 
 
 def get_h_D_dict(m_ramales):
-    # map_calado_dict = {"critico": 0.70, "sub-critico": 0.75, "super-critico": 0.70, "": 0.75, }
+    map_calado_dict = {"critico": 0.65, "sub-critico": 0.65, "super-critico": 0.65, "": 0.65, }
     is_close_percentage = 0.05
 
     h_D_dict = {}
@@ -5582,11 +5583,11 @@ def get_opt_S(m_ramales, ramal, xy_inter):
         index = np.char.equal(m_ramales[i]["Estado"], "nuevo").nonzero()[0]
         if index.size > 0:
             n = n + 1
-            print(
-                f"\rprogreso get_opt_S: {round((n / n_count) * 100, 2)}%",
-                end="",
-                flush=True,
-            )
+            # print(
+            #     f"\rprogreso get_opt_S: {round((n / n_count) * 100, 2)}%",
+            #     end="",
+            #     flush=True,
+            # )
 
             # update elvations
             m_ramales = w_TFP(i, m_ramales)
@@ -5861,7 +5862,7 @@ def s_ang_SPLL_circular_root(s, manning, d_int, v, q_accu, i):
 
     except ValueError:
         # Log or handle the specific root-finding failure
-        print(f"Root finding failed for parameters: s={s}, manning={manning}, d_int={d_int}, v={v}, q_accu={q_accu}-tramo {i}")
+        # print(f"Root finding failed for parameters: s={s}, manning={manning}, d_int={d_int}, v={v}, q_accu={q_accu}-tramo {i}")
         return np.nan
 
 
@@ -7916,7 +7917,7 @@ def round_floats_in_string(arr, decimal_places=3):
     return np.array([re.sub(pattern, lambda x: f"{float(x.group()):.{decimal_places}f}", s) for s in arr])
 
 
-def shp_out(m_ramales, ramal, project_name, EPSG=32717):
+def shp_out(m_ramales, project_name, EPSG=str(32717), path_out=None):
     """
     Convert a DataFrame of ramal data into a GeoDataFrame with line segments grouped by Ramal,
     save it to a GeoPackage file, and generate a QML style file.
@@ -7931,6 +7932,8 @@ def shp_out(m_ramales, ramal, project_name, EPSG=32717):
         Name of the project for file naming and directory structure.
     EPSG : int, optional (default=32717)
         EPSG code for the Coordinate Reference System (e.g., 32717 for UTM Zone 17S).
+    path_out : str, optional
+        Custom output directory path. If None, uses default project structure.
 
     Returns:
     --------
@@ -7978,6 +7981,7 @@ def shp_out(m_ramales, ramal, project_name, EPSG=32717):
     # Step 8: Round values and set the Coordinate Reference System (CRS)
     gdf = gdf.round(3)  # Round to 3 decimal places as in the original
     gdf = gdf.set_crs(EPSG)
+    gdf.to_crs(EPSG)
 
     # Step 9: Adjust data types (similar to the original function)
     type_dict = type({"casima": "casima"})
@@ -7991,15 +7995,22 @@ def shp_out(m_ramales, ramal, project_name, EPSG=32717):
         pass
 
     # Step 11: Define output path
-    path_out = f"PROYECTO_{project_name}{os.path.sep}00_GIS{os.path.sep}02_OUT{os.path.sep}01_RAMALES{os.path.sep}"
+    if path_out is None:
+        path_out = f"PROYECTO_{project_name}{os.path.sep}00_GIS{os.path.sep}02_OUT{os.path.sep}01_RAMALES{os.path.sep}"
+    else:
+        # Ensure it ends with separator
+        if not path_out.endswith(os.path.sep):
+            path_out += os.path.sep
+            
     if not os.path.exists(path_out):
         os.makedirs(path_out)
 
     # Step 12: Save to GeoPackage
-    gdf.to_file(path_out + project_name + ".gpkg", driver="GPKG", layer=project_name)
+    gpkg_full_path = path_out + project_name + ".gpkg"
+    gdf.to_file(gpkg_full_path, driver="GPKG", layer=project_name)
 
     # Step 13: Create QML file
-    qml_out = f"PROYECTO_{project_name}{os.path.sep}00_GIS{os.path.sep}02_OUT{os.path.sep}01_RAMALES{os.path.sep}{project_name}.qml"
+    qml_out = path_out + f"{project_name}.qml"
     if "qml2file" in globals():
         qml_file = qml2file()
     else:
@@ -8492,37 +8503,15 @@ def get_repeated_intervals(arr):
 
 
 def cad_profile_out(
-    m_ramales, ramal, project_name, elev_source, step, fromEPSG=None, variable_list=None, add_street_names_osm=True, add_street_names_dxf=True, additional_profile_list=None
+    m_ramales, ramal, project_name, elev_source, step, fromEPSG=None, variable_list=None, add_street_names_osm=True, additional_profile_list=None
 ):
     df = m_ramales2df(m_ramales)
-    keep_draw_pz_dict = encontrar_pozos_identicos(df, return_replace_dict=True)
+    keep_draw_pz_dict = encontrar_pozos_identicos(m_ramales, df, return_replace_dict=True)
     remove_draw_pz_dict = reverse_dictionary(keep_draw_pz_dict)
 
     # preparar datos de perfil terreno y tuberia
     terreno = elev_source.get_profile_m_ramales(m_ramales, step, skip_existing=True, adjust_elevation=True)
 
-    if additional_profile_list:
-        additional_profile_dict = {}
-        for pos, elev_source_item in enumerate(additional_profile_list):
-            proj_to = 32717
-            threshold_distance = elev_source_item.get("threshold_distance")
-            elev_source_item_path = elev_source_item.get("elev_path")
-            alpha_shape_polygon_path = elev_source_item.get("alpha_shape_polygon_path")
-            if alpha_shape_polygon_path:
-                alpha_shape_polygon_path = path_proy + os.path.sep + alpha_shape_polygon_path
-
-            ges_ = ElevationSource(path_proy, proj_to)
-            elev_files_list_ = [path_proy + os.path.sep + elev_source_item_path]
-            tree_ = ges_.get_elev_source(
-                elev_files_list_,
-                check_unique_values=False,
-                ellipsoidal2orthometric=False,
-                m_ramales=None,
-                elevation_shift=0,
-            )
-            # tree_ = ges_.get_elev_source(elev_files_list_, check_unique_values=False, ellipsoidal2orthometric=False, m_ramales=None, elevation_shift=-70.458, )
-            elev_source_ = ElevationGetter(tree=tree_, m_ramales=m_ramales, threshold_distance=threshold_distance, alpha_shape_polygon_path=alpha_shape_polygon_path)
-            additional_profile_dict[pos] = elev_source_.get_profile_m_ramales(m_ramales, step, skip_existing=True)
 
     t_base, t_tapa = get_profile_tuberia(m_ramales, ramal)
     dat_abs, dat_elev, dat_corte = get_h_abcisas(m_ramales, ramal, t_base, terreno, skip_existing=True)
@@ -8631,10 +8620,6 @@ def cad_profile_out(
     abscisa_lista = []
     elevacion_lista = []
     ramal_lista = []
-
-    # if add_street_names_osm and  fromEPSG:
-    #     streets_gdf = download_street_names(utm_crs=fromEPSG, m_ramales=m_ramales)
-    #     streets_gdf.to_file('casima.gpkg')
 
 
 
@@ -8767,21 +8752,8 @@ def cad_profile_out(
         )
         p_GRILLA_h = list(zip(i_grilla_h, f_grilla_h))
 
-        if add_street_names_osm  and fromEPSG:
-            # if 'zanja mano' in np.unique(m_ramales[i]['metodo_constructivo']):
-            #     get_street_names_from_dxf(abs1, elevacion_id_pozo_4, i, m_ramales, msp, locations)
-            # else:
-            get_street_names_osmnx(abs1, elevacion_id_pozo_4, fromEPSG, i, m_ramales, msp, streets_gdf)
-
         # AGREGAR POLYLINEAS A MODELO
         msp.add_lwpolyline(p_TERRENO, dxfattribs=dict1)
-        if additional_profile_list:
-            for pos, elev_source_item in enumerate(additional_profile_list):
-                terreno_ = additional_profile_dict[pos]
-                elevacion_terreno_ = terreno_[i][3] * par_dxf(esc_V=1)
-                valid_elevation_filter = ~np.isnan(elevacion_terreno_)
-                p_TERRENO_ = list(zip(abscisa_terreno[valid_elevation_filter], elevacion_terreno_[valid_elevation_filter]))
-                msp.add_lwpolyline(p_TERRENO_, dxfattribs=dict1_)
 
         if tuberia_type in ["existente"]:
             msp.add_lwpolyline(p_TUBERIA_base, dxfattribs=dict_existente)
@@ -9291,7 +9263,7 @@ def cad_profile_out(
     try:
         extents = appsettings.update_extents(doc)
         zoom.center(doc.modelspace(), extents.center, extents.size)
-        doc.saveas("PROYECTO_" + project_name + os.path.sep + "01_DXF" + os.path.sep + "01_OUT" + os.path.sep + "01_PERFIL_" + str(project_name) + ".dxf")
+        doc.saveas(project_name + os.path.sep + "1.dxf")
 
         # PROFILES BOUNDS
         abscisa_start = np.array(abscisa_lista).T[0]
@@ -9310,10 +9282,7 @@ def cad_profile_out(
             ).T,
             columns=["abscisa_min", "abscisa_max", "elev_min", "elev_max", "ramal"],
         )
-        info_perfil.to_csv(
-            "PROYECTO_" + project_name + os.path.sep + "01_DXF" + os.path.sep + "01_OUT" + os.path.sep + "01_PERFIL_" + str(project_name) + "_bounds.csv",
-            index=False,
-        )
+
 
     except Exception as e:
         print("error DXF perfil tuberia")
@@ -10202,7 +10171,7 @@ def decide_pozo_to_keep(df, total_pos):
     return df["Pozo"].iloc[idx_max_lt]  # Siempre retornará un valor
 
 
-def encontrar_pozos_identicos(df, tolerancia=0.01, return_replace_dict=None):
+def encontrar_pozos_identicos(m_ramales, df, tolerancia=0.01, return_replace_dict=None):
     """
     Encuentra pozos idénticos o muy cercanos en un DataFrame basado en sus coordenadas XYZ.
 
@@ -11076,7 +11045,7 @@ def add_block_with_attributes(m_ramales, msp, block_name, insert_point, dxf_attr
 
 def cad_plane_out(m_ramales, ramal, scale, project_name):
     df = m_ramales2df(m_ramales)
-    keep_draw_pz, remove_draw_pz = encontrar_pozos_identicos(df)
+    keep_draw_pz, remove_draw_pz = encontrar_pozos_identicos(m_ramales, df)
     if len(remove_draw_pz) > 0:
         not_draw_pz = np.unique(np.concatenate([list(_) for _ in remove_draw_pz]))
     else:
@@ -21990,3982 +21959,6 @@ def generate_tabla_resumen_latex(
     return estado_resumen_latex
 
 
-def generar_resumen_secciones(gdf):
-    seccion_resumen = gdf.groupby("Seccion")["L"].sum().reset_index()
-    total = seccion_resumen["L"].sum()
-
-    texto = f"La longitud total de alcantarillado es {round(total, 2)} metros. "
-
-    for i, row in seccion_resumen.iterrows():
-        seccion = row["Seccion"]
-        longitud = round(row["L"], 2)
-        porcentaje = round((row["L"] / total) * 100, 2)
-
-        if i == 0:
-            texto += f"Para la sección {seccion}, se registra una longitud de {longitud} metros, que representa un {porcentaje}% del total."
-        elif i < len(seccion_resumen) - 1:
-            texto += f" Adicionalmente, para la sección {seccion}, se registra una longitud de {longitud} metros, que representa un {porcentaje}% del total."
-        else:
-            texto += f" Finalmente, para la sección {seccion}, se registra una longitud de {longitud} metros, que representa un {porcentaje}% del total."
-
-    return texto
-
-
-def make_docx(project_name, project_type, velocidad_maxima_pypiper, pendiente_minima_pypiper, diametro_interno_externo_pypiper, rugosidad_pypiper, dict_path_figuras):
-    path_out_figuras = "PROYECTO_" + project_name + os.path.sep + "04_RESULTADOS" + os.path.sep + "00_FIGURAS" + os.path.sep
-    path_out_tablas = "PROYECTO_" + project_name + os.path.sep + "04_RESULTADOS" + os.path.sep + "01_TABLAS" + os.path.sep
-    path_out_vector = "PROYECTO_" + project_name + os.path.sep + "00_GIS" + os.path.sep + "02_OUT" + os.path.sep + "01_RAMALES" + os.path.sep + project_name + ".gpkg"
-    path_out_areas = "PROYECTO_" + project_name + os.path.sep + "00_GIS" + os.path.sep + "02_OUT" + os.path.sep + "02_AREAS" + os.path.sep + "area_densidad_c_outfall_diss.xlsx"
-    path_out_areas_vector = "PROYECTO_" + project_name + os.path.sep + "00_GIS" + os.path.sep + "02_OUT" + os.path.sep + "02_AREAS" + os.path.sep + "area_densidad_c_outfall.gpkg"
-    path_out_tablas_resultados = "PROYECTO_" + project_name + os.path.sep + "02_TXT" + os.path.sep + "00_EXCELL" + os.path.sep
-    path_latex = "PROYECTO_" + project_name + os.path.sep + "04_RESULTADOS" + os.path.sep + "02_DOCUMENTO"
-
-    os.makedirs(path_latex, exist_ok=True)
-
-    # leer el resultado de el vector out
-    gpd_df = gpd.read_file(path_out_vector)
-    lat_lon_geometry = gpd_df.geometry.to_crs("4326")
-    x, y = np.array([_.xy for _ in lat_lon_geometry]).T[0]
-    boundaries = gpd_df.total_bounds
-    boundaries = [__ + str(round(_, 1)) for _, __ in zip(boundaries, ["E", "S", "O", "N"])]
-    boundaries = ", ".join(boundaries)
-
-    try:
-        geolocator = Nominatim(user_agent="PyPiper")
-        # Create a rate-limited reverse geocoding function
-        reverse_geocode = RateLimiter(geolocator.reverse, min_delay_seconds=1)
-        # Latitude & Longitude input
-        Latitude = str(np.mean(y))
-        Longitude = str(np.mean(x))
-        location = reverse_geocode(Latitude + "," + Longitude)
-
-        # First attempt to get address components with multiple possible keys
-        address = location.raw.get("address", {})
-
-        # For town/city - try multiple possible fields with fallback
-        project_town = address.get("town") or address.get("city") or address.get("village") or "Unknown"
-
-        # For state - try multiple possible fields with fallback
-        project_state = address.get("state") or address.get("province") or address.get("region") or "Unknown"
-
-        # Country usually exists but add fallback just in case
-        project_country = address.get("country", "Unknown")
-
-    except Exception as e:
-        # Fallback values if anything fails
-        project_town = "Unknown"
-        project_state = "Unknown"
-        project_country = "Unknown"
-        print(f"Error getting location details: {e}")
-
-    # lista de materiales y diametros usados en el proyecto
-    materiales = gpd_df["Material"].unique()
-    diametros_groupby_material = gpd_df.groupby("Material")["D_int"].unique().to_dict()
-
-    # crear tabla de velocidad maxima, pendiente minima y rugosidad utilizados por el proyecto
-    latex_table_velocidad_pendiente_rugosidad = r"""\begin{table}[H]
-    \centering
-    \caption{Velocidad maxima, pendiente minima y rugosidad segun material}
-    \label{tab:tab5}
-    \begin{tabular}{@{}cccc@{}}
-    \toprule
-    \textbf{material} & \textbf{\begin{tabular}[c]{@{}c@{}}velocidad maxima [m/s]\end{tabular}} & \textbf{\begin{tabular}[c]{@{}c@{}} pendiente minima [m/m]\end{tabular}}  & \textbf{\begin{tabular}[c]{@{}c@{}} rugosidad [$n$] [1/m]\end{tabular}} \\ \midrule
-    """
-    for key in velocidad_maxima_pypiper:
-        if key in materiales:
-            latex_table_velocidad_pendiente_rugosidad += (
-                key + " & " + str(velocidad_maxima_pypiper[key]) + " & " + str(pendiente_minima_pypiper[key]) + " & " + str(rugosidad_pypiper["manning"][key]) + r" \\ "
-            )
-    latex_table_velocidad_pendiente_rugosidad += r"""
-    \bottomrule
-    \end{tabular}
-    \end{table}"""
-
-    # tabla de diametros utilizados por el proyecto
-    diametros = {}
-    for material in materiales:
-        d_int = np.sort(seccion_str2float(diametros_groupby_material[material]))
-        pypiper_d_int = np.array(list(diametro_interno_externo_pypiper[material].keys()))
-        difference_matrix = np.abs(d_int[:, np.newaxis] - pypiper_d_int)
-        # Find the index of the closest value in array2 for each element in array1
-        closest_indices = np.argmin(difference_matrix, axis=1)
-        d_int = pypiper_d_int[closest_indices]
-
-        d_ext = np.array([itemgetter(*d_int)(diametro_interno_externo_pypiper[material])]).flatten()
-        diametros[material] = dict(zip(d_int, d_ext))
-
-    # determinar el numero maximo de filas para la tabla
-    rows = max([len(diametros[_]) for _ in materiales])
-    latex_table_diametro = (
-        r"""
-        \begin{table}[H]
-        \centering
-        \caption{Diametro interno y externo [$D_{int}$:$D_{ext}$]}
-        \label{tab:tab8}
-        \begin{tabular}"""
-        + r"""{@{}"""
-        + "l" * len(materiales)
-        + r"""@{}}
-    \toprule
-    """
-        + " & ".join([r" \textbf{" + str(_) + " [m]}" for _ in materiales])
-        + r""" \\ \midrule
-    """
-    )
-    for row in range(rows):
-        row_string = ""
-        for pos, material in enumerate(materiales):
-            try:
-                if pos < len(materiales) - 1:
-                    row_string += str(list(diametros[material].keys())[row]) + ":" + str(diametros[material][list(diametros[material].keys())[row]]) + " & "
-                else:
-                    row_string += str(list(diametros[material].keys())[row]) + ":" + str(diametros[material][list(diametros[material].keys())[row]])
-            except:
-                if pos < len(materiales) - 1:
-                    row_string += " & "
-                else:
-                    row_string += " "
-
-        latex_table_diametro += row_string + r" \\ "
-    latex_table_diametro += r"""
-       \bottomrule
-       \end{tabular}
-       \end{table}"""
-
-    # leer tablas de resumen de longitudes, diametros, materiales y fases
-    table_resumen = pd.read_excel(path_out_tablas + "01_resumen_longitudes.xlsx", dtype=object)
-    latex_table_resumen = table_resumen.copy()
-    # latex_table_resumen = latex_table_resumen.style.hide(axis="index").applymap_index(lambda v: "font-weight: bold;", axis="columns").to_latex(caption='Longitud según sección, dimensión y estado del tramo', label='tab:tab10', hrules=True, convert_css=True)
-    latex_table_resumen = latex_table_resumen.to_latex(
-        longtable=True,
-        caption="Longitud según sección, dimensión y estado del tramo",
-        label="tab:tab10",
-        index=False,
-        position="H",
-    )
-
-    # leer tablas de resumenareas
-    table_resumen_areas = pd.read_excel(path_out_areas, dtype=object, index_col=0)
-    try:
-        table_resumen_areas = table_resumen_areas.drop("geometry", axis=1)
-    except:
-        pass
-    table_resumen_areas = table_resumen_areas.dropna(axis=1, how="all")
-    latex_table_resumen_areas = table_resumen_areas.copy()
-    latex_table_resumen_areas = latex_table_resumen_areas.to_latex(
-        longtable=True,
-        caption="Planimetría: área de aporte typepypiper",
-        label="tab:tab10A",
-        index=False,
-        position="H",
-    )
-
-    # definir longitudes y porcentajes de tuberia
-    porcentaje_nuevo_existente = (gpd_df.groupby(["Estado"])["L"].sum().astype(int) / gpd_df["L"].sum() * 100).round(1).to_dict()
-    longitud_nuevo_existente = gpd_df.groupby(["Estado"])["L"].sum().astype(int).round(0).to_dict()
-    longitud_total = gpd_df["L"].sum().round(0).astype(int)
-    if len(porcentaje_nuevo_existente) > 1:
-        latex_estado = (
-            r" con un "
-            + str(porcentaje_nuevo_existente["nuevo"])
-            + r"$\%$ de tuberia nueva y un "
-            + str(porcentaje_nuevo_existente["existente"])
-            + r"$\%$  de tuberia existente que corresponde a "
-            + str(longitud_nuevo_existente["nuevo"])
-            + r"m y "
-            + str(longitud_nuevo_existente["existente"])
-            + r"m respectivamente."
-        )
-    else:
-        latex_estado = r" con un " + str(list(porcentaje_nuevo_existente.values())[0]) + r"$\%$ de tuberia de estado " + str(list(porcentaje_nuevo_existente.keys())[0]) + "."
-
-    # definir materialesy porcentajes de materiales
-    porcentaje_materiales_tuberia = (gpd_df.groupby(["Material"])["L"].sum().astype(int) / gpd_df["L"].sum() * 100).round(1).to_dict()
-    longitud_materiales_tuberia = gpd_df.groupby(["Material"])["L"].sum().astype(int).round(0).to_dict()
-    if len(porcentaje_materiales_tuberia) > 1:
-        latex_material = (
-            r" Los materiales de tuberia seleccionados fueron  "
-            + ", ".join(materiales)
-            + r" con una distribuccion porcentual de "
-            + r"$\%$, ".join(map(str, list(porcentaje_materiales_tuberia.values())))
-            + r"$\%$ y una longitud de "
-            + "m, ".join(map(str, list(longitud_materiales_tuberia.values())))
-            + "m"
-            + r" correspondientemente."
-        )
-    else:
-        latex_material = (
-            r" con un " + str(list(porcentaje_materiales_tuberia.values())[0]) + r"$\%$ de tuberia con material " + str(list(porcentaje_materiales_tuberia.keys())[0]) + "."
-        )
-
-    # definir materialesy porcentajes de materiales
-    porcentaje_secciones_tuberia = (gpd_df.groupby(["Seccion"])["L"].sum().astype(int) / gpd_df["L"].sum() * 100).round(1).to_dict()
-    if len(porcentaje_secciones_tuberia) > 1:
-        latex_seccion = (
-            r" Asi mismo, se observa un "
-            + str(porcentaje_secciones_tuberia["circular"])
-            + r"$\%$ de secciones circulares y un "
-            + str(porcentaje_secciones_tuberia["rectangular"])
-            + r"$\%$ de secciones rectangulares."
-        )
-    else:
-        list(porcentaje_secciones_tuberia.keys())
-        latex_seccion = (
-            r" con un " + str(list(porcentaje_secciones_tuberia.values())[0]) + r"$\%$ de tuberia con seccion " + str(list(porcentaje_secciones_tuberia.keys())[0]) + "."
-        )
-
-    # definir superficie de intervenccion
-    porcentaje_superficie_tuberia = (gpd_df.groupby(["sup_road"])["L"].sum().astype(int) / gpd_df["L"].sum() * 100).round(1).to_dict()
-    superficies_intervenccion = ", ".join(list(porcentaje_superficie_tuberia.keys()))
-    latex_superficie_intervenccion = (
-        r"Las superficies que se intervienen son "
-        + superficies_intervenccion.replace("_", "\\_")
-        + r" con una distribuccion porcentual de "
-        + ", ".join([str(_) for _ in porcentaje_superficie_tuberia.values()])
-        + r" respectivamente."
-    )
-
-    fases = table_resumen.Fase.unique()
-    latex_resumen_fases = []
-    contador_tabla = 12
-    for fase in fases:
-        tab_pos = table_resumen[table_resumen.Fase == fase].to_latex(
-            longtable=True,
-            caption="Fase " + str(fase) + " del sistema de  alcantarillado typepypiper",
-            label="tab:tab" + str(contador_tabla),
-            index=False,
-            position="H",
-        )
-        contador_tabla = contador_tabla + 1
-        latex_resumen_fases.append(tab_pos)
-    latex_resumen_fases = r"""
-    
-                          """.join(latex_resumen_fases)
-    latex_resumen_fases = latex_resumen_fases.replace("Continued on next page", "Continua en la siguiente página")
-
-    # resumen de variables fisicas
-    df_resumen_variables_fisicas = gpd_df[["v", "h", "HF", "S", "h/D", "indice_abrasion"]][gpd_df["v"] > 0].describe().round(2).astype(str)
-    df_resumen_variables_fisicas = df_resumen_variables_fisicas.iloc[[1, 2, 3, 7], :]
-    df_resumen_variables_fisicas.columns = ["v", "h", "HF", "S", "h/D", "abrasion"]
-
-    # df_resumen_variables_fisicas.index = ['numero', '$\mu$', '$\sigma$', 'min', '25\%', '50\%', '75\%', 'max']
-    df_resumen_variables_fisicas.index = [r"$\mu$", r"$\sigma$", "min", "max"]
-    latex_resumen_variables_fisicas = df_resumen_variables_fisicas.to_latex(
-        longtable=True,
-        caption="Resumen de las variables fisicas del sistema de alcantarillado",
-        label="tab:tab11",
-        index=True,
-        position="H",
-    )
-
-    # figura estado
-    if len(porcentaje_nuevo_existente) > 1:
-        latex_estado_figura = (
-            r" Se reutiliza un "
-            + str(porcentaje_nuevo_existente["existente"])
-            + r"$\%$  de tuberia existente y se diseño un "
-            + str(porcentaje_nuevo_existente["nuevo"])
-            + r"$\%$  de tuberia nueva  que corresponden respectivamente a "
-            + str(longitud_nuevo_existente["nuevo"])
-            + r"m  y "
-            + str(longitud_nuevo_existente["existente"])
-            + "m."
-        )
-    else:
-        try:
-            latex_estado_figura = (
-                r"Se diseño un " + str(porcentaje_nuevo_existente["nuevo"]) + r"$\%$ de tuberia de nueva, que correpsonde a " + str(longitud_nuevo_existente["nuevo"]) + r"m."
-            )
-        except:
-            latex_estado_figura = (
-                r"Se evaluo un "
-                + str(porcentaje_nuevo_existente["existente"])
-                + r"$\%$ de tuberia de existente, que correpsonde a "
-                + str(longitud_nuevo_existente["existente"])
-                + r"m."
-            )
-
-    # figura diametros
-    diametro_minimo_resultados = gpd_df["D_ext"][np.argmin(seccion_str2float(gpd_df["D_ext"]))]
-    diametro_maximo_resultados = gpd_df["D_ext"][np.argmax(seccion_str2float(gpd_df["D_ext"]))]
-    diametro_moda_resultados = gpd_df["D_ext"].mode().tolist()[0]
-
-    # figura velocidad
-    velocidad_minimo_resultados = str(np.round(gpd_df["v"].min(), 2))
-    velocidad_maximo_resultados = str(np.round(gpd_df["v"].max(), 2))
-    velocidad_moda_resultados = str(np.round(gpd_df["v"].mode().tolist()[0], 2))
-    velocidad_media_resultados = str(np.round(gpd_df["v"].mean(), 2))
-    velocidad_desviacion_resultados = str(np.round(gpd_df["v"].std(), 2))
-    velocidad_coefvar_resultados = str(
-        round(
-            float(velocidad_desviacion_resultados) / float(velocidad_media_resultados),
-            2,
-        )
-        * 100
-    )
-
-    # figura calado
-    calado_minimo_resultados = str(np.round(gpd_df["h/D"].min(), 2))
-    calado_maximo_resultados = str(np.round(gpd_df["h/D"].max(), 2))
-    calado_moda_resultados = str(np.round(gpd_df["h/D"].mode().tolist()[0], 2))
-    calado_media_resultados = str(np.round(gpd_df["h/D"].mean(), 2))
-    calado_coefseguridad_resultados = str(round(par_basicos(h_D_max=1) / np.round(gpd_df["h/D"].mean(), 2), 2))
-
-    # figura profunidad
-    profunidad_minimo_resultados = str(np.round(gpd_df["HF"].min(), 2))
-    profunidad_maximo_resultados = str(np.round(gpd_df["HF"].max(), 2))
-    profunidad_moda_resultados = str(np.round(gpd_df["HF"].mode().tolist()[0], 2))
-    profundidad_media_resultados = str(np.round(gpd_df["HF"].mean(), 2))
-
-    # figura caudal
-    caudal_minimo_resultados = str(np.round(gpd_df["q_accu"].min(), 2))
-    caudal_maximo_resultados = str(np.round(gpd_df["q_accu"].max(), 2))
-    caudal_moda_resultados = str(np.round(gpd_df["q_accu"].mode().tolist()[0], 2))
-    caudal_media_resultados = str(np.round(gpd_df["q_accu"].mean(), 2))
-
-    # figura pendiente
-    pendiente_minimo_resultados = str(np.round(gpd_df["S"].min() * 100, 3))
-    pendiente_maximo_resultados = str(np.round(gpd_df["S"].max() * 100, 3))
-    pendiente_moda_resultados = str(np.round(gpd_df["S"].mode().tolist()[0] * 100, 2))
-    pendiente_media_resultados = str(np.round(gpd_df["S"].mean() * 100, 2))
-
-    # figura indice de abrasion
-    abrasion_minimo_resultados = str(np.round(gpd_df["indice_abrasion"].min(), 3))
-    abrasion_maximo_resultados = str(np.round(gpd_df["indice_abrasion"].max(), 3))
-    abrasion_moda_resultados = str(np.round(gpd_df["indice_abrasion"].mode().tolist()[0], 2))
-    abrasion_media_resultados = np.round(gpd_df["indice_abrasion"].mean(), 2)
-    clasificaicon_abrasion_resultados = (
-        "abrasion reducida"
-        if abrasion_media_resultados <= 35
-        else ("abrasion media" if (abrasion_media_resultados >= 35) and (abrasion_media_resultados <= 75) else "amplia abrasion ")
-    )
-
-    # tablaes de resultados
-    df_resultados = pd.read_excel(path_out_tablas_resultados + "m_ramales_" + project_name + ".xlsx")
-    # Select float columns only
-    float_columns = df_resultados.select_dtypes(include=["float"])
-    # Round to 2 decimal places
-    df_resultados[float_columns.columns] = float_columns.round(3)
-
-    latex_m_ramales_resultados = df_resultados[["Pozo", "X", "Y", "Z"]].to_latex(
-        longtable=True,
-        caption="Ubicacion geografica y elevacion de los pozos",
-        label="tab:tab" + str(contador_tabla + 1),
-        index=False,
-        position="H",
-        float_format=lambda x: "{:.3f}".format(x) if isinstance(x, (float, int)) else x,
-    )
-    latex_m_ramales_resultados = latex_m_ramales_resultados.replace("Continued on next page", "Continua en la siguiente página")
-
-    df_geometria_m_ramales = df_resultados[df_resultados.L != 0][["Tramo", "Interferencia"]].dropna()
-    latex1_m_ramales_resultados = df_geometria_m_ramales.to_latex(
-        longtable=True,
-        caption="Caracteristicas geometricas de los tramos",
-        label="tab:tab" + str(contador_tabla + 2),
-        index=False,
-        position="H",
-    )
-    latex1_m_ramales_resultados = latex1_m_ramales_resultados.replace("Continued on next page", "Continua en la siguiente página")
-
-    # resultados hidraulicos
-    latex2_m_ramales_resultados_df = df_resultados[df_resultados.L != 0][
-        [
-            "Tramo",
-            "L",
-            "Material",
-            "D_ext",
-            "S",
-            "Rug",
-            "Estado",
-            "q_accu",
-            "Q_SLL",
-            "V_SLL",
-            "q/Q",
-            "h/D",
-            "v/V",
-            "v",
-            "h",
-        ]
-    ]
-    latex2_m_ramales_resultados_df.rename(columns=lambda x: x.replace("_", r"\_"), inplace=True)
-    float_columns = latex2_m_ramales_resultados_df.select_dtypes(include=["float"])
-    vmax = v_max(gpd_df["Material"])
-    vmin = velocidad_minima(
-        seccion_str2float(gpd_df["D_ext"]),
-        gpd_df["Rug"],
-        gpd_df["ang"],
-        1.5,
-        1000,
-        9.81,
-    )
-    max_h_D = np.array([par_basicos(h_D_max=1)] * len(vmax))
-
-    # latex2_m_ramales_resultados = (latex2_m_ramales_resultados_df.style.apply(color_velocidad, v_max=vmax, v_min=vmin, subset=["v"], axis=0).apply(color_calado, max_h_D=max_h_D, subset=["h/D"], axis=0).hide_index_().format(escape="latex").format(precision=3, subset=float_columns).to_latex(environment="longtable", caption="Resultados del dimensionamiento hidraulico", label="tab:tab" + str(contador_tabla + 3), position="H", convert_css=True, hrules=True, ))
-    # latex2_m_ramales_resultados = (
-    #     latex2_m_ramales_resultados_df.style.apply(color_velocidad, v_max=vmax[0], v_min=vmin[0], subset=["v"], axis=0)
-    #     .apply(color_calado, max_h_D=max_h_D, subset=["h/D"], axis=0)
-    #     .hide(axis="index")
-    #     .format(escape="latex")  # Format numbers with a dictionary
-    #     .format(precision=3, thousands=None, decimal=".")
-    #     .to_latex(
-    #         environment="longtable",
-    #         caption="Resultados del dimensionamiento hidraulico",
-    #         label="tab:tab" + str(contador_tabla + 3),
-    #         position="H",
-    #         convert_css=True,
-    #         hrules=True,
-    #     )
-    # )
-
-    latex2_m_ramales_resultados = (
-    latex2_m_ramales_resultados_df
-    .to_latex(
-        index=False,
-        longtable=True,  # Para que sea longtable en LaTeX
-        caption="Resultados del dimensionamiento hidráulico",
-        label="tab:tab" + str(contador_tabla + 3),
-        float_format="%.3f",  # Para que los números tengan 3 decimales
-        )
-    )
-
-    latex2_m_ramales_resultados = latex2_m_ramales_resultados.replace("Continued on next page", "Continua en la siguiente página")
-
-    latex3_m_ramales_resultados_df = df_resultados[df_resultados.L != 0][["Tramo", "L", "S", "ZTI", "ZTF", "ZFI", "ZFF", "HI", "HF", "SALTO"]]
-    latex3_m_ramales_resultados = latex3_m_ramales_resultados_df.to_latex(
-        longtable=True,
-        caption="Resultados elevacion y profunidad de instalacion",
-        label="tab:tab" + str(contador_tabla + 4),
-        index=False,
-        position="H",
-        float_format=lambda x: "{:.3f}".format(x) if isinstance(x, (float, int)) else x,
-    )
-    latex3_m_ramales_resultados = latex3_m_ramales_resultados.replace("Continued on next page", "Continua en la siguiente página")
-
-    latex4_m_ramales_resultados_df = df_resultados[df_resultados.L != 0][["Tramo", "Tension", "Froude", "Reynolds", "indice_abrasion"]]
-    latex4_m_ramales_resultados = latex4_m_ramales_resultados_df.to_latex(
-        longtable=True,
-        caption="Resultados numeros hidraulicos",
-        label="tab:tab" + str(contador_tabla + 5),
-        index=False,
-        position="H",
-        float_format=lambda x: "{:.3f}".format(x) if isinstance(x, (float, int)) else x,
-    )
-    latex4_m_ramales_resultados = latex4_m_ramales_resultados.replace("Continued on next page", "Continua en la siguiente página")
-
-    latex5_m_ramales_resultados_df = df_resultados[df_resultados.L != 0][
-        [
-            "Tramo",
-            "q_pluvial",
-            "q_san",
-            "q_accu",
-        ]
-    ]
-    latex5_m_ramales_resultados = latex5_m_ramales_resultados_df.to_latex(
-        longtable=True,
-        caption="Resultados caudales por tramo",
-        label="tab:tab" + str(contador_tabla + 6),
-        index=False,
-        position="H",
-        float_format=lambda x: "{:.3f}".format(x) if isinstance(x, (float, int)) else x,
-    )
-    latex5_m_ramales_resultados = latex5_m_ramales_resultados.replace("Continued on next page", "Continua en la siguiente página")
-    latex5_m_ramales_resultados = latex5_m_ramales_resultados.replace("_", "\\_")
-
-    gdf_areas = gpd.read_file(path_out_areas_vector, engine="pyogrio")
-    gdf_areas["area"] = gdf_areas.geometry.area / 10000
-
-    # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-    # Define the LaTeX source
-    latex_source = r"""
-    \documentclass[a4paper,twoside,openany,12pt]{report}
-    \usepackage[utf8]{inputenc}
-    \usepackage[T1]{fontenc}
-    \usepackage{lmodern}
-    \usepackage[spanish]{babel}
-    \selectlanguage{spanish}
-    \addto\captionsspanish{\renewcommand{\tablename}{Tabla}}
-    \usepackage{fancyhdr}
-    \usepackage{lscape}
-    \usepackage{graphicx}
-    \usepackage{amsmath}
-    \usepackage{booktabs}
-    \usepackage{float}
-    \usepackage{longtable}
-    \usepackage{subfigure}
-    
-    \usepackage{array}
-    \usepackage[svgnames]{xcolor}
-    \usepackage{hyperref}
-    \usepackage{adjustbox}
-    \usepackage{calc}
-
-
-    \usepackage[paper=a4paper, left=2.0cm, right=2.0cm, top=1.5cm, bottom=2.0cm,headheight=7pt]{geometry}
-    \usepackage{datetime}
-    \usepackage{enumitem}
-    \usepackage{xcolor}
-    \definecolor{lightgreen}{RGB}{144,238,144}
-    \definecolor{lightblue}{RGB}{173,216,230}
-    \usepackage{colortbl}
-    \usepackage{caption}
-    \usepackage{tikz}
-    \usetikzlibrary{arrows.meta,calc,shapes,positioning} % Add positioning here
-    
-    
-    
-    
-    
-    
-    \newcommand{\MONTH}{%
-      \ifcase\month% 0
-        \or Enero% 1
-        \or Febrero% 2\textit{}
-        \or Marzo% 3
-        \or Abril% 4
-        \or Mayo% 5
-        \or Junio% 6
-        \or Julio% 7
-        \or Agosto% 8
-        \or Septiembre% 9
-        \or Octubre% 10
-        \or Noviembre% 11
-        \or Diciembre% 12
-      \fi}
-    \newcommand{\YEAR}{\number\year}
-
-    
-    \AtBeginDocument{\renewcommand{\tablename}{Tabla}}
-    \renewcommand{\tablename}{Tabla}
-    \addto\captionsspanish{\renewcommand{\tablename}{Tabla}}
-    
-    \hypersetup{
-        unicode=true,          % non-Latin characters in Acrobat’s bookmarks
-        pdftoolbar=true,        % show Acrobat’s toolbar?
-        pdfmenubar=true,        % show Acrobat’s menu?
-        pdffitwindow=true,      % page fit to window when opened
-        pdftitle={PyPiper - Memoria de redes de alcantarillado },    % title
-        pdfauthor={PyPiper},     % author
-        pdfsubject={Memoria Hidraulica de las Redes de Alcantarilladot},   % subject of the document
-        pdfnewwindow=true,      % links in new window
-        pdfkeywords={keywords}, % list of keywords
-        colorlinks=true,       % false: boxed links; true: colored links
-        linkcolor=cyan,          % color of internal links
-        linkcolor=black,
-        citecolor=red,        % color of links to bibliography
-        filecolor=green,      % color of file links
-        urlcolor=blue,           % color of external links
-        pdfstartpage=1,
-        bookmarksopen =True
-        }
-
-
-    
-   
-   
-    \usepackage[automake,acronym,nopostdot]{glossaries}
-    \makeglossaries
-    \newglossaryentry{q}{name={q},description={caudal volumetrico de una seccion parcialmente llena [$m^{3}$/s]}}
-    \newglossaryentry{v}{name={v},description={velocidad media de una seccion parcialmente llena [m/s]}}
-    \newglossaryentry{A}{name={A},description={area de la seccion [$m^{2}$]}}
-    \newglossaryentry{n}{name={n},description={coeficiente de rugosidad de Manning [1/m]}}
-    \newglossaryentry{$R_{h}$}{name={$R_{h}$},description={radio hidráulico [m]}}
-    \newglossaryentry{S}{name={S},description={pendiente [m/m]}}
-    \newglossaryentry{C}{name={C},description={coeficiente de rugosidad de Chezzy [m]}}
-    \newglossaryentry{B}{name={B},description={base de la seccion rectangular [m]}}
-    \newglossaryentry{h}{name={h},description={lamina libre de agua de una seccion parcialmente llena [m]}}
-    \newglossaryentry{k}{name={k},description={dimension del bloque de rugosidad [m]}}
-    \newglossaryentry{D}{name={D},description={diametro interno de una seccion circular [m]}}
-    \newglossaryentry{r}{name={r},description={radio de la seccion circular [m]}}
-    \newglossaryentry{b}{name={b},description={ancho de la superficie de agua de una seccion circular parcilamente llena [m]}}
-    \newglossaryentry{F}{name={F},description={numero de Froude}}
-    \newglossaryentry{g}{name={g},description={gravedad [m/$s^{2}$]}}
-    \newglossaryentry{nu}{name={$\nu$},description={viscosidad cinemática del agua [$m^{2}$/s]}}
-    \newglossaryentry{angulo}{name={$\theta^{\circ}$},description={angulo que se forma con la superficie de agua [grado sexagesimal]}}
-    \newglossaryentry{tau}{name={$\tau$},description={tensión tractiva media [Pa]}}
-    \newglossaryentry{rho}{name={$\rho$},description={densidad del agua [kg/m3]}}
-    \newglossaryentry{wi}{name={wi},description={indice de abrasion}}
-    \newglossaryentry{vs}{name={vs},description={concentraccion de sedimento [$\%$]}}
-    
-    
-    
-    \fancypagestyle{landscape}{
-      \fancyhf{}
-          \rhead{\includegraphics[width=2.5cm]{icono.png}}
-          \rfoot{\begin{scriptsize}Página \thepage \end{scriptsize}}
-          \renewcommand{\headrulewidth}{0pt}
-          \renewcommand*\thesection{\arabic{section}}
-        \setlength\headheight{25pt}
-    }
-    
-
-    
-    \begin{document}
-    
-    \pagestyle{fancy}
-    \fancyhf{}
-    \rhead{\includegraphics[width=2.5cm]{icono.png}}
-    %\rfoot{\begin{scriptsize}Página \thepage \end{scriptsize}}
-    \fancyfoot[C]{\begin{scriptsize}Página \thepage \end{scriptsize}}  % Número de página en el centro
-    \renewcommand{\headrulewidth}{0pt}
-    \renewcommand*\thesection{\arabic{section}}
-    \setlength\headheight{25pt}
-    
-
-
-    
- 
-    
-
-    %--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \title{%
-     \includegraphics[width=6cm]{icono.png}\\[\bigskipamount]
-    \centering \textbf{\large \textbf{\textsc{RESULTADOS HIDRAULICOS REDES DE ALCANTARILLADO}} \large{\newline \newline Nombre: projectnamepypiper \\ Tipo: typepypiper}}
-    }
-
-
-    \author{Documento generado automaticamente por \textbf{PyPiper\textsuperscript{\textregistered}}}
-    \date{\MONTH\ \YEAR}
-    
-    \maketitle
-    \thispagestyle{fancy}
-    \tableofcontents
-    \thispagestyle{fancy}
-    \listoffigures
-    \thispagestyle{fancy}
-    \listoftables
-    \thispagestyle{fancy}
-    \printglossaries
-    \thispagestyle{fancy}
-    
-    \clearpage
-    \newpage
-    
-    
-    %variable para clacular el espacio remanente
-    \newlength{\espacioRestante}
-    %================================================================================================================================================================================================================================
-    \setlength{\parskip}{3pt} % Ajusta la separación entre párrafos
-    \chapter{Fundamentos teoricos}
-    \thispagestyle{fancy}
-    \section{Ecuaciones de gobierno}
-    En esta sección se presentan las ecuaciones de gobierno que describen el comportamiento del flujo tanto en condiciones permanentes como no permanentes.
-    Dichas ecuaciones, derivadas de los principios de conservación de masa y cantidad de movimiento, permiten simular el cambio de
-    la velocidad y la profundidad hidraulica bajo diversas condiciones de caudal, geometría y régimen de flujo.
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \subsection{Flujo no permanente}
-    El flujo no permanente se representa a través de la onda cinemática, la cual describe
-    una simplificación de las ecuaciones de Saint-Venant en 1 dimensión, que son un
-    conjunto de ecuaciones diferenciales hiperbólicas que describen el flujo de agua
-    de lámina libre. La simplificación consiste en asumir que el término de aceleración
-    local y el término de presión son insignificantes en comparación con los términos de
-    gravedad y fricción.
-    
-    En la aproximación de la onda cinemática, la ecuación de momento se
-    simplifica significativamente al asumir que el término de aceleración (tanto local como
-    convectiva) es pequeño y puede ser despreciado. Así, solo se considera el equilibrio
-    entre la pendiente del fondo del canal (que impulsa el flujo) y la resistencia al flujo
-    causada por la fricción del canal, la Ecuación \ref{eq:onda-cinematica}  presenta la onda cinemática.
-    
-    \begin{equation}
-        \frac{\partial Q}{\partial x}
-        + \frac{\partial (S \, A)}{\partial t}
-        = 0
-        \label{eq:onda-cinematica}
-    \end{equation}
-    
-    \noindent Donde: \newline
-    $Q$: Caudal \,($\text{m}^3/\text{s}$). \newline
-    $A$: Sección transversal del flujo \,($\text{m}^2$). \newline
-    $S$: Pendiente del canal (adimensional o en \%). \newline
-    $x$: Distancia a lo largo del canal \,($\text{m}$). \newline
-    $t$: Tiempo \,($\text{s}$). \newline
-  
-    Para la onda cinemática, la relación entre el caudal Q y el área A es típicamente dada
-    por una ley empírica de flujo, tal como la ecuación de Manning para el flujo en canales
-    abiertos.
-    
-    \newpage
-    \subsection{Flujo permanente y uniforme}
-    Esta seccion describe de forma particular las ecuaciones y suposiciones utilizadas para resolver el sistema de flujo libre. De forma general, se utilizan conjuntos de ecuaciones que describen flujo permanente y uniforme en
-    conductos circulares y rectangulares.
-    
-    \subsubsection{Ecuacion de la continuidad}
-    La ecuación de la continuidad (ecuacion \ref{eq:eq1}) se deriva a partir de la ley de conservación de la masa, que establece que la cantidad de masa de un sistema cerrado es constante. Esta expresion se utiliza para estimar en caudal volumetrico de un fluido que atraviesa una seccion, bajo la
-    suposicion de que el fluido es incompresible y el flujo a través del conducto es uniforme y laminar.
-    \begin{equation}
-    q = v.A
-    \label{eq:eq1}
-    \end{equation}
-    
-    \noindent Donde:  \newline
-	$\gls{q}$ \hspace{3mm} caudal volumétrico [$m^3$/s] \newline
-	$\gls{v}$ \hspace{3mm} velocidad media [m/s] \newline
-	$\gls{A}$ \hspace{3mm} área de la sección [$m^2$]
-    
-    
-    \subsubsection{Ecuacion de Gauckler–Manning–Strickler}
-    La ecuacion \ref{eq:eq2} muestra la formula de Gauckler–Manning–Strickler, la cual describe la relacion empirica que estima la velocidad media de la corriente de agua que atraviesa una seccion para un flujo de superficie libre, permanente y uniforme.
-    Esta ecuacion se utiliza para dimensionar la seccion con respecto a la velocidad media de flujo del conducto, con la suposicion que la pendiente de fondo del tramo es similar a la pendiente de la linea de energia y la superficie libre de agua en condiciones de flujo uniforme.
-    \begin{equation}
-    v = \frac{1}{n} \cdot R_{h}^{\frac{2}{3}} \cdot S^{\frac{1}{2}}
-    \label{eq:eq2}
-    \end{equation}
-    \noindent Donde: \newline
-    $v$	        \hspace{3mm} velocidad media [m/s] \newline
-    \Gls{$R_{h}$}	    \hspace{3mm} radio hidráulico [m] \newline
-    \Gls{S}	        \hspace{3mm} pendiente [m/m]
-    \gls{n}	        \hspace{3mm} coeficiente de rugosidad de Manning [1/m] \newline
-    
-    \begin{table}[h]
-    \centering
-    \small % o \footnotesize, \scriptsize
-    \caption{Tabla de coeficiente de rugosidad ``n'' según material}
-    \label{tab:coef-rugosidad}
-    \begin{tabular}{p{7cm}c}
-        \toprule
-        Material de Revestimiento & Coeficiente ``n'' \\
-        \midrule
-        Tuberías de PVC/PEAD/PRFV                             & 0.011 \\
-        Tuberías de hormigón (con buen acabado)               & 0.013 \\
-        Tuberías de hormigón con acabado regular              & 0.014 \\
-        Mampostería de piedra juntas con mortero de cemento   & 0.025 \\
-        Mampostería de piedra partida acomodada (sin juntas)  & 0.032 \\
-        Ladrillo juntas con mortero de cemento                & 0.025 \\
-        Tierra (trazo recto y uniforme) sin vegetación        & 0.030 \\
-        \bottomrule
-    \end{tabular}
-    \end{table}
-    
-    
-    \subsubsection{Ecuacion de Chezzy}
-    La ecuacion \ref{eq:eq3} muestra la formulacion de Chezy con la cual se estima la velocidad media de un flujo en un canal abierto. Esta ecuación se basa en la hipótesis de que el flujo es uniforme y en línea recta a
-    lo largo del canal.
-
-    \begin{equation}
-       v = C \cdot \sqrt{R_{h} \cdot S}
-    \label{eq:eq3}
-    \end{equation}
-    
-    \noindent Donde: \newline
-    $v$	        \hspace{3mm} velocidad media [m/s] \newline
-    $R_{h}$	    \hspace{0mm} radio hidraulico[$m^{2}$] \newline
-    \Gls{C}	        \hspace{0mm} coeficiente de rugosidad de Chezzy [m]
-    
-    
-    \subsubsection{Rugosidad artificiales en secciones rectangulares}
-    Para secciones rectangulares de pendientes elevadas (S $\approx > 10 \%$) y flujos con velocidades medias que provoquen erosion o daño en las paredes del conducto, se implementa rugosidades artificiales de geometria variada.
-    La ecuacion \ref{eq:eq3} muestra la generalizacion para la determinacion de la rugosidad equivalente del coeficiente de Chezzy para diferentes tipos de rugosidad.
-    \begin{equation}
-        \frac{1000}{C} = \alpha + \beta \cdot \left(\frac{h}{k}\right) + \gamma \cdot \left(\frac{B}{h}\right)
-    \label{eq:eq4}
-    \end{equation}
-    
-    \noindent Donde:\newline
-    $C$	        \hspace{0mm} coeficiente de rugosidad de Chezzy [m] \newline
-    \Gls{B}	        \hspace{3mm} base de la seccion rectangular [m]\newline
-    \gls{h}   	    \hspace{0mm} lamina libre de agua [m]   \newline
-    \gls{k}	        \hspace{0mm} dimension del bloque de rugosidad [m]
-    
-    La Tabla \ref{tab:tab6} muestra los coeficientes empiricos determinados para la modificacion de la rugosidad del conducto, su rango de aplicación se encuentra para valores de $\frac{h}{k}\geq 3$.
-    Asi mismo,el espaciamiento entre bloques recomendado es de 8k.
-   
-    \begin{small}
-    \begin{table}[H]
-    \centering
-    \caption{Coeficientes $\alpha$, $\beta$ y $\gamma$ de las diferentes tipos de rugosidad artificial}
-    \label{tab:tab6}
-    \begin{tabular}{@{}llll@{}}
-    \toprule
-    \multicolumn{1}{c}{\textbf{tipo}} & \textbf{$\alpha$} & \textbf{$\beta$} & \textbf{$\gamma$} \\ \midrule
-    dados                             & 52         & -5.1       & -0.8       \\
-    barras\_continuas                 & 47.5       & -1.2       & 0.1        \\
-    barras\_cortadas                  & 54.2       & -2.1       & 0.33       \\
-    v\_invertida                      & 85.8       & -3.9       & -0.8       \\
-    doble\_zig\_zag                   & 116.1      & -6.1       & -1.2       \\ \bottomrule
-    \end{tabular}
-    \end{table}
-    \end{small}
-    
- 
-    \subsubsection{Equivalencia entre el coeficiente de Mannig y Chezzy}
-     \begin{equation}
-        n = \frac{R_{h}^{\frac{1}{6}}}{C}
-    \label{eq:eq5}
-    \end{equation}
-    \noindent Donde: \newline
-    $C$	        \hspace{0pt} coeficiente de rugosidad de Chezzy [m] \newline
-    $n$	        \hspace{3pt} coeficiente de rugosidad de Manning [1/m] \newline
-    $R_{h}$	    \hspace{0pt} radio hidráulico [m]
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \newpage
-    \section{Geometria}
-    seccion-teoria-circular
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-teoria-rectangular
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \newpage
-    \section{Numeros adimensionales}
-    \subsection{Numero de Froude}
-    El número de Froude se define como el cociente entre las fuerzas inerciales y  gravitacionales que actúan sobre un fluido y define el régimen de estado del flujo, como se muestra en la ecuacion \ref{eq:eq6}.
-    
-    \begin{equation}
-    F = \frac{v}{\sqrt{g \cdot h}}
-    \label{eq:eq6}
-    \end{equation}
-    
-     \noindent Donde: \newline
-    \Gls{F}   \hspace{0mm} numero de Froude \newline
-    $v$	     \hspace{0mm} velocidad media [m/s] \newline
-    \gls{g}    \hspace{3mm} gravedad [m/$s^{2}$] \newline
-    $h$	     \hspace{0mm} longitud característica o lamina libre de agua [m]   \newline
-    
-    El número de Froude describe tres tipos de flujos, subcrítico, crítico y súper critico. Sí Fr=1, indica que las fuerzas viscosas que actúan en un fluido son iguales a las fuerzas de gravedad y el flujo se denomina crítico.
-    Sí Fr$<$1 nos indica que las fuerzas viscosas son menores que las gravitacionales y se denomina flujo subcrítico; esto ocurre cuando las velocidades son pequeñas y describe un flujo lento de poca inercia. Finalmente, sí F$>$1 nos indica que las fuerzas viscosas son mayores  que las gravitacionales y se denomina flujo supercrítico; esto ocurre cuando las velocidades son grandes y describe un flujo de gran inercia y de caracter torrencial.
- 
-    \subsection{Numero de Reynolds}
-    La ecucacion \ref{eq:eq7} muestra el número de Reynolds que se define como el cociente de las fuerzas inerciales y la viscosidad de un fluido, este relaciona la densidad, viscosidad, velocidad y dimensión típica de un flujo en una expresión adimensional que caracteriza un flujo como laminar o turbulento.
-    \begin{equation}
-    Re = \frac{v \cdot h}{\nu}
-    \label{eq:eq7}
-    \end{equation}
-    
-    \noindent Donde: \newline
-    $Re$	    \hspace{0mm} numero de Reynolds \newline
-    $v$	        \hspace{0mm} velocidad media [m/s] \newline
-    $g$          \hspace{3mm} gravedad [m/$s^{2}$] \newline
-    $h$	        \hspace{0mm} longitud característica o lamina libre de agua [m] \newline
-    \gls{nu}	    \hspace{0mm} viscosidad cinemática del agua [$m^{2}$/s]    \newline
-    
-    El número de Reynolds describe tres tipos de flujo, laminar, transicional y turbulento. Primero, el flujo laminar se describe como partículas de agua moviéndose en trayectorias rectilineas y describe un
-    fluido donde las fuerzas viscosas son dominantes sobre las fuerzas de inercia con un valor de Re $<$ 2000. Segundo, el flujo transicional se encuentra cuando el numero de Reynolds se encuentra entre 2000 y 3500, y describe un flujo inestable como resultado del inicio de la turbulencia.
-    Finalmente, el flujo turbulento se describe como partículas de agua que se mueven en trayectorias irregulares pero son representativas del vector de movimiento del fluido, donde las fuerzas de inercia dominan sobre las fuerzas viscosas y se caracteriza con un Re $>$ 3500.
-    
-    \subsection{Indice de resistencia a la abrasion}
-    El indice de resistencia a la abrasion (ecuacion \ref{eq:eq10}) clasifica el poder abrasivo de la corriente con respecto al conducto por el cual circular el  fluido. Este indice toma un valor de 0 a 100 considerandose un valor  de 50 como abrasion moderada.
-    
-    \begin{equation}
-     wi = \frac{v \cdot vs \cdot h}{D \cdot n}
-    \label{eq:eq10}
-    \end{equation}
-    
-    \noindent Donde:\newline
-    \gls{wi}     \hspace{0pt} indice de abrasion \newline
-    $v$	        \hspace{0pt} velocidad media [m/s] \newline
-    \gls{vs}     \hspace{0pt} concentraccion de sedimento [$\%$] \newline
-    $h$	        \hspace{0pt} lamina libre de agua [m] \newline
-    D	            \hspace{3pt} diametro [m] \newline
-    $n$	        \hspace{3pt} coeficiente de rugosidad de Manning [1/m] \newline
-    
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \section{Condiciones hidraulicas}
-    \subsection{Tension tractiva}
-    La tensión tractiva  es el esfuerzo tangencial ejercido por un fluido sobre el conducto que lo transporta y cuantifica la capacidad que tiene un flujo para mover partículas en deposito (ecuacion \ref{eq:eq8}).
-    
-    \begin{equation}
-    \tau = S \cdot R_{h} \cdot g \cdot \rho
-    \label{eq:eq8}
-    \end{equation}
-    
-    \noindent Donde: \newline
-    $\tau$        	\hspace{0mm} tensión tractiva media [Pa] \newline
-    $g$	        \hspace{3mm} gravedad [m/$s^{2}$] \newline
-    \gls{rho}	\hspace{0mm} densidad del agua [kg/m3] \newline
-    $R_{h}$	\hspace{0mm} radio hidraulico[$m^{2}$] \newline
-    $S$	        \hspace{3mm} pendiente [m/m]
-    
-    %------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \subsection{Velocidad minima}
-    La velocida minima (ecuacion \ref{eq:eq9}) de una seccion tiene el proposito de evitar el deposito de sedimento en los conductos. En este sentido, se debe garantizar la velocidad  de autolimpieza que produzca una tension tractiva de 1 Pa y 1.5 Pa para sistemas sanitarios y pluviales respectivamente,
-
-    \begin{equation}
-    v_{min} = \frac{1}{n} \cdot R_{h}^{\frac{2}{3}} \cdot  \left(\frac{\tau_{min}}{\rho \cdot g \cdot R_{h}}\right)^{\frac{1}{2}}
-    \label{eq:eq9}
-    \end{equation}
-    
-    \noindent Donde: \newline
-    $v_{min}$	    \hspace{3mm} velocidad de autolimpieza [m/s] \newline
-    $n$	            \hspace{3pt} coeficiente de rugosidad de Manning [1/m] \newline
-    $\tau_{min}$	    \hspace{0mm} tensión tractiva minima [Pa] \newline
-    $g$	            \hspace{3mm} gravedad [m/$s^{2}$] \newline
-    $\rho$	            \hspace{0mm} densidad del agua [kg/m3] \newline
-    $R_{h}$	    \hspace{0mm} radio hidraulico[$m^{2}$] \newline
-    $S$	            \hspace{3mm} pendiente [m/m]
-    
-
-    
-    
-    %------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \subsection{Velocidad máxima} % O \subsection, según tu estructura
-    \label{sec:velocidad_maxima}
-    
-    Para determinar la velocidad máxima se tiene varios criterios, el primero es evitar
-    la abrasión del material de la tubería, el segundo es dado un sistema pluvial o
-    combinado evitar que la presencia de piedras u objetos contundentes puedan
-    causar daño a las tuberías o pozos del sistema y tercero garantizar la ventilación
-    en el tramo.
-    
-    La velocidad máxima para limitar la abrasión dependerá del material de la tubería.
-    A continuación, la Tabla~\ref{tab:velmax} muestra las velocidades máximas admisibles
-    según material.
-    
-    \begin{footnotesize}
-    tabla-recomendacion-velocidad-maxima
-    \end{footnotesize}
-    
-    Cuando la velocidad final (\(V_f\)) es superior a la velocidad crítica (\(V_c\)),
-    el material puede absorber un 5\% del desnivel del colector,
-    asegurando la ventilación. La Ecuación~\eqref{eq:velocidad_critica}
-    presenta la velocidad requerida para la aireación:
-    
-    \begin{equation}
-        V_c = 6 \,\sqrt{g \cdot R_h}
-        \label{eq:velocidad_critica}
-    \end{equation}
-    
-    \noindent Donde:\newline
-    \(V_c\): Velocidad crítica (\(\mathrm{m}/\mathrm{s}\)) \newline
-    \(g\): Aceleración de la gravedad (\(\mathrm{m}/\mathrm{s}^2\)) \newline
-    \(R_h\): Radio hidráulico (\(\mathrm{m}\))
-    
-    %-----------------------------------------------------------------------------------------------------------------------------------------------------------
-    \subsection{Pendiente mínima}
-    \label{subsec:pendiente_minima}
-    
-    La pendiente mínima de los conductos se determina en función de la topografía del terreno.
-    Cuando la pendiente natural sea demasiado baja o casi plana, puede ser necesario
-    aumentar artificialmente la pendiente con una sección de transición o escalonada.
-    
-    \begin{equation}
-    S_{\text{min}} = \frac{\tau_{\text{min}}}{\rho \cdot g \cdot \frac{D}{4} \cdot \left(1 - \frac{360 \cdot \sin \theta^\circ}{2 \pi \theta^\circ}\right)}
-    \label{eq:pendiente_minima_tractiva}
-    \end{equation}
-    
-    
-    
-    \vspace{1em}
-    
-    \noindent Donde: \newline
-    $S_{\min}$: Pendiente mínima del tramo de tubería, en m/m. \newline
-    $\tau_{\min}$: Tensión tractiva mínima, en Pa. \newline
-    $\rho$: Peso específico del agua, $1000\,\text{kg/m}^3$. \newline
-    $g$: Aceleración de la gravedad, $9.81\,\text{m/s}^2$. \newline
-    $D$: Diámetro del conducto, en m. \newline
-    $\theta^\circ$: Ángulo en grados sexagesimales. \newline
-
-    
-    \subsection{Pendiente máxima}
-    \label{subsec:pendiente_maxima}
-    La pendiente máxima de los colectores será aquella que garantice, según su material,
-    la velocidad máxima recomendable en la tubería con la finalidad de evitar erosión en
-    estas. Esta tabla se muestra en la seccion  \ref{sec:velocidad_maxima}
-    
-    %------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \subsection{Profundidad hidráulica máxima o calado máximo}
-    \label{subsec:calado_maximo}
-    
-    Para permitir aireación adecuada del flujo de aguas pluviales en conductos cerrados,
-    el valor máximo permisible de la profundidad hidráulica o calado para el caudal de
-    diseño en un colector debe estar entre 60\% y 80\% del diámetro, en función del
-    número de Froude, ya sea subcrítico, crítico o supercrítico.
-    
-    \begin{small}
-    \begin{table}[H]
-        \centering
-        \caption{Relación de número de Froude y el calado máximo de la tubería}
-        \label{tab:froude_calado}
-        \begin{tabular}{lc}
-            \toprule
-            Número de Froude & Relación máxima de calado \\
-            \midrule
-            Crítico        & 0.70 \\
-            Sub-crítico    & 0.75 \\
-            Super-crítico  & 0.65 \\
-            \bottomrule
-        \end{tabular}
-    \end{table}
-    \end{small}
-    
-    
-    
-    \subsection{Profundidad mínima a la cota clave}
-    Las normas de diseño recomiendan que las redes de recolección y evacuación de aguas residuales se instalen a una
-    profundidad adecuada para facilitar el drenaje por gravedad de las descargas domiciliarias sin sótano, considerando una
-    pendiente mínima de estas del 1\%. Asimismo, el cubrimiento mínimo del colector debe ser suficiente para prevenir su ruptura
-    debido a las cargas vivas que pueda experimentar, como se detalla en la Tabla~\ref{tab:profundidad_minima}.
-    
-    \begin{table}[h]
-    \centering
-    \caption{Profundidad mínima de cobertura hasta la clave de las tuberías}
-    \label{tab:profundidad_minima}
-    \begin{tabular}{lc}
-    \toprule
-    Servidumbre & Profundidad mínima a la clave del colector (m) \\
-    \midrule
-    Vías peatonales o zonas verdes & 0.9 \\
-    Vías vehiculares & 1.2 \\
-    Vías sin rasante definida & 1.5 \\
-    \bottomrule
-    \end{tabular}
-    \end{table}
-    
-    
-    
-    
-    
-    
- 
-
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \newpage
-    \section{Parametros de diseño}
-    Esta seccion presenta los parametros para los limites de velocidad maxima, pendiente minima, rugosidad, profunidad de instalacion, diametro minimo, diametros internos y calado hidraulico maximo.
-    
-    \subsection{Velocidad maxima, pendiente minima y rugosidad}
-    La Tabla \ref{tab:tab5} muestra los rangos de velocidad a cuyo valor se limito para dimensionar las secciones de los conductos de alcantarillado, los valores minimos de pendiente en m/m segun el material a ser instalado
-    y la rugosidad de tuberia lisa con su respectivo coeficiente de Manning.
-    
-    \begin{small}
-    tablavelocidadpendienterugosidadpypiper
-    \end{small}
-    
-   \subsection{Parametros basicos}
-   La Tabla \ref{tab:tab7} muestra los parametros basicos para la limitacion de la profunidad minima de instalacion, calado maximo y las dimensiones minimas de la seccion ciruclar y rectangular.
-
-    \begin{small}
-    \begin{table}[H]
-    \centering
-    \caption{Parametros basicos}
-    \label{tab:tab7}
-    % Definimos 3 columnas:
-    %  1) l: alineada a la izquierda
-    %  2) m{5cm}: ancho fijo de 5 cm, con contenido centrado verticalmente
-    %  3) c: alineada al centro
-    \begin{tabular}{@{}l m{5cm} c@{}}
-    \toprule
-    \textbf{parametro} & \textbf{valor} & \textbf{unidad} \\
-    \midrule
-    profundidad minima desde clave &
-      profunidadminimapypiper &
-      m \\[0.1em]
-      
-    relacion h/D maxima &
-      hDpypiper &
-      m/m \\[1.0em]
-      
-    seccion minima circular &
-      seccionminimacircularpypiper &
-      m \\[0.1em]
-      
-    seccion minima rectangular &
-      seccionminimarectangularpypiper &
-      m \\
-    \bottomrule
-    \end{tabular}
-    \end{table}
-    \end{small}
-
-
-
-   
-    \subsection{Diametro interno y externo}
-    La Tabla \ref{tab:tab8} muestra los diametros internos y externos correspondiente a cada material.
-    \begin{small}
-    tabladiametrointernoexternopypiper
-    \end{small}
-    
-    
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-hidrologia
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-SUDS
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \chapter{Resultados hidráulicos}
-    \thispagestyle{fancy}
-    Este capitulo muestra los resutlados que describen de forma espacial y frecuencial las magnitudes fisicas y representaciones categoricas del sistema de alcantarillado typepypiper, ubicado en la ciudad
-    de projecttownpypiper perteneciente a la provincia de projectstatepypiper - projectcountrypypiper. En este sentido, esta seccion presenta  los resultados de las variables fisicas como velocidad, lamina libre de agua,
-    profunidad media, pendiente de fondo y caudal del sistema de alcantarillado typepypiper, asi como tambien las variables categoricas como el estado, material, seccion y superficie de emplazamiento.
-    
-    \section{Datos del proyecto} \label{datos_proyecto}
-    La Tabla \ref{tab:tab9} se presenta presenta los datos basicos del proyecto.
-    
-    \begin{table}[H]
-    \centering
-    \small{
-    \caption{Datos basicos}
-    \label{tab:tab9}
-    \begin{tabular}{@{}ll@{}}
-    \toprule
-    \textbf{Nombre}    & projectnamepypiper    \\ \midrule
-    \textbf{Tipo}      & typepypiper           \\ \toprule
-    \textbf{Ciudad}    & projecttownpypiper    \\
-    \textbf{Provincia} & projectstatepypiper   \\
-    \textbf{Pais}      & projectcountrypypiper \\
-    \textbf{Limites (UTM)} & projectboundariepypiper  \\ \bottomrule
-    \end{tabular}}
-    \end{table}
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \newpage
-    \section{Descripción general del sistema}
-    \subsection{Resumen de material, longitud, seccion, estado y fase}
-    La Tabla \ref{tab:tab10} muestra el resumen de las caracteristicas del proyecto emplazado, con el diametro en metros y longitud (L) en metros.
-    tablaresumendiametrospypiper
-    De forma general, la longitud del sistema de alcantarillado typepypiper es de longitudtotalpypiperm  estadoporcentajelongitudpypiper materialporcentajelongitudpypiper seccionporcentajelongitudpypiper
-    
-    \subsection{Variables fisicas y categoricas}
-    La Tabla \ref{tab:tab11} muestra el resumen de las magnitudes fisicas que representan de forma estadistica al sistema de alcantarillado.
-    tablaresumenvariablesfisicaspypiper
-    
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \newpage
-    \section{Descripcción de áreas de aporte}
-    seccion-distribuccion-areas
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-area-ramales
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-   \newpage
-   \section{Descripcción general de las redes}
-   seccion-estado-ramales
-    
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-metodoconstructivo
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-superficie-intervenccion
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-fases-ramales
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \newpage
-    \section{Propiedades fisicas}
-    seccion-diametro-ramales
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-profundidad-ramales
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-pendiente-ramales
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-material-ramales
-
-   %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-seccion-ramales
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \newpage
-    \section{Propiedades hidraulicas}
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-calado-ramales
-
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-velocidad-ramales
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-caudal-ramales
-    
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    seccion-abrasion-ramales
-    
-    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-    \chapter{Tabulacion de resultados}
-    \thispagestyle{fancy}
-    tabulacionresultadoshidrologia
-    
-    tabulacionresultadossanitario
-    
-    \section{Tabulación de resultados hidráulicos de tramos}
-
-    \subsection{Ubicacion geografica y elevacion de los pozos del sistema del alcantarillado}
-    latex_m_ramales_resultados
-
-    \newpage
-    \subsection{Resultados de elevacion y profunidad de instalacion}
-    latex3_m_ramales_resultados
-    
-    \newpage
-    \subsection{Resultados de caudales pluviales y sanitarios}
-    latex5_m_ramales_resultados
-    
-    
-    \begin{landscape}
-    \global\pdfpageattr\expandafter{/Rotate 90}
-    \thispagestyle{landscape}
-    \subsection{Resultados del dimensionamiento hidraulico de los tramos del sistema de alcantarillado}
-    latex2_m_ramales_resultados
-    \end{landscape}
-    \global\pdfpageattr\expandafter{/Rotate 0}
-
-
-    
-
-    
-    \end{document}
-    """
-
-    with OllamaImageDescriber() as describer:
-        # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        if "circular" in df_resultados["Seccion"].unique():
-            seccion_teoria_circular = r"""
-          \subsection{Sección circular}
-        \subsubsection{Propiedades geométricas de la sección circular}
-        La figura \ref{fig1} muestra las propiedades geometricas usadas para describir las magnitudes fisicas de velocidad, lamina libre de agua, caudal volumetrico, area y perimetro mojado de una seccion circular.
-        
-        \begin{figure}[ht]
-          \centering
-          \centerline{\includegraphics[width=0.4\textwidth]{circular_pipe.png}}
-          \caption{ Geometria de la sección circular}\label{fig1}
-        \end{figure}
-    
-        \noindent Donde: \newline
-        \Gls{D}	        \hspace{3mm} diametro [m] \newline
-        \gls{r}	        \hspace{3mm} radio [m] \newline
-        \gls{b}   	    \hspace{0mm} ancho de la superficie de agua [m] \newline
-        \gls{angulo}	\hspace{3mm} angulo que se forma con la superficie de agua [grado sexagesimal] \newline
-        h	        \hspace{3mm} lamina libre de agua [m]
-    
-        
-        \subsubsection{Relaciones geometricas para seccion circular parcialmente llena}
-        La Tabla \ref{tab:tab1} muestra las ecuaciones utilizadas para una seccion circular parcialmente llena, las dimensiones del caudal volumetrico, velocidad, radio hidraulico y angulo central son $m_{3}/s$, m/s, m, y grados sexagesimales respectivamente.
-        
-        \begin{table}[H]
-        \caption{Relaciones geométricas a sección circular parcialmente llena}
-        \label{tab:tab1}
-        \centering
-        $\begin{array}{ cc }
-        \toprule
-        \text{variable} & \text{expresion} \\
-        \midrule
-        \text{angulo central} & \theta^{\circ} = 2 \operatorname{arc cos} \left( 1 - \frac{2h}{D} \right) \\[0.35cm]
-        \text{radio hidraulico} & R_{h} =\frac{D}{4} \left( 1 - \frac{360 \sin{\theta^{\circ}}}{2 \pi \theta^{\circ}} \right)  \\[0.35cm]
-        \text{velocidad} & v = \frac{0.397 D^{2/3}}{n} \left( 1 - \frac{360 \sin{\theta^{\circ}}}{2 \pi \theta^{\circ}} \right)^{2/3} \cdot S^{1/2}  \\[0.35cm]
-        \text{caudal volumetrico} & q = \frac{D^{8/3}}{7257.15\cdot n\cdot (2\cdot\pi\cdot\theta^{\circ})^{2/3}}\cdot\left(2\pi\theta^{\circ}-360\sin\theta^{\circ}\right)^{5/3}\cdot S^{1/2}  \\[0.35cm]
-        \bottomrule
-        \end{array}$
-        \end{table}
-        
-        
-        \newpage
-        \subsubsection{Relaciones geometricas para seccion circular llena}
-        La Tabla \ref{tab:tab2} muestra las ecuaciones utilizadas para una seccion circular llena, las dimensiones del area, perimetro, radio hidraulico, velocidad y caudal volumetrico son $m^{2}$, m, m, m/s y $m^{3}/s$ respectivamente.
-        
-        \begin{table}[H]
-        \caption{Relaciones geométricas a sección circular llena}
-        \label{tab:tab2}
-        \centering
-        $\begin{array}{ cc }
-        \toprule
-        \text{variable} & \text{expresion} \\
-        \midrule
-        \text{area} & A = \frac{\pi D^2}{4} \\[0.35cm]
-        \text{perimetro} & P = \pi D  \\[0.35cm]
-        \text{radio hidraulico} & R_{h} = \frac{D}{4}  \\[0.35cm]
-        \text{velocidad} & V = \frac{0.397}{4} D^{\frac{2}{3}} S^{\frac{1}{2}}  \\[0.35cm]
-        \text{caudal volumetrico} & Q = \frac{0.312}{n} D^{\frac{8}{3}} S^{\frac{1}{2}}  \\[0.35cm]
-        \bottomrule
-        \end{array}$
-        \end{table}
-        
-        
-        \subsubsection{Relaciones de sección circular llena y parcialmente llena}
-        La Tabla \ref{tab:tab3} muestra las relaciones obtenidas a partir de las ecuaciones para conductos circulares de sección llena y parcialmente llena.
-        
-        \begin{table}[H]
-        \caption{Relaciones de sección llena y parcialmente llena}
-        \label{tab:tab3}
-        \centering
-        $\begin{array}{ cc }
-        \toprule
-        \text{variable} & \text{expresion} \\
-        \midrule
-        \text{lamina libre de agua } & \frac{h}{D} = \frac{1}{2} \left(1 - \cos \left(\frac{\theta^\circ}{2}\right)\right) \\[0.35cm]
-        \text{velocidad} & \frac{V}{v} = \left(1 - \frac{360 \sin \theta^\circ}{2 \pi \theta^\circ}\right)^{\frac{2}{3}}  \\[0.35cm]
-        \text{caudal volumetrico} & \frac{Q}{q} = \left(\frac{\theta^\circ}{360} - \frac{\sin \theta^\circ}{2 \pi}\right) \left(1 - \frac{360 \sin \theta^\circ}{2 \pi \theta^\circ}\right)^{\frac{2}{3}} \\[0.35cm]
-        \bottomrule
-        \end{array}$
-        \end{table}
-        
-        """
-            latex_source = latex_source.replace("seccion-teoria-circular", seccion_teoria_circular)
-        else:
-            latex_source = latex_source.replace("seccion-teoria-circular", "")
-
-        if "rectangular" in df_resultados["Seccion"].unique():
-            seccion_teoria_rectangular = r"""
-            \newpage
-            \subsection{Sección rectangular}
-            \subsubsection{Propiedades geométricas de la sección rectangular}
-            La figura \ref{fig2} muestra las propiedades geometricas usadas para describir las magnitudes fisicas de velocidad, lamina libre de agua, caudal volumetrico, area y perimetro morjado de una seccion rectnagular.
-            
-            \begin{figure}[ht]
-              \centering
-              \centerline{\includegraphics[width=0.4\textwidth]{rectangular_pipe.png}}
-              \caption{Relaciones geométricas de la sección rectangular}\label{fig2}
-            \end{figure}
-        
-            \noindent Donde: \newline
-            H	        \hspace{3mm} altura de la seccion rectangular [m] \newline
-            B	        \hspace{3mm} base de la seccion rectangular [m] \newline
-            h   	    \hspace{0mm} lamina libre de agua [m]
-            
-            \subsubsection{Relaciones geometricas para seccion rectangular parcialmente llena}
-            La Tabla \ref{tab:tab4} muestra las ecuaciones utilizadas para una seccion rectangular parcialmente llena, las dimensiones del area, perimetro mojado, radio hidraulico y base son $m^{2}$, m, m, m respectivamente.
-            
-            \begin{table}[H]
-            \caption{Relaciones geométricas a sección rectangular parcialmente llena}
-            \label{tab:tab4}
-            \centering
-            $\begin{array}{ cc }
-            \toprule
-            \text{variable} & \text{expresion} \\
-            \midrule
-            \text{area} & A = B \cdot h \\[0.35cm]
-            \text{perimetro mojado} & P = B + 2h  \\[0.35cm]
-            \text{radio hidraulico} & R_h = \frac{Bh}{2B + 2h}  \\[0.35cm]
-            \text{base*} & B =     \left(\frac{q^{\frac{3}{8}} \cdot n^{\frac{3}{8}}}{S^{\frac{3}{16}} \cdot 2^{\frac{1}{8}}}\right) \cdot 2  \\[0.35cm]
-            \bottomrule
-            \end{array}$
-            \end{table}
-            \small{*base eficiente con relacion al caudal que circula por la seccion rectangular, considerando que la seccion mas eficiente minimiza el perimetro mojado donde B = 2y}
-            
-
-        """
-            latex_source = latex_source.replace("seccion-teoria-rectangular", seccion_teoria_rectangular)
-        else:
-            latex_source = latex_source.replace("seccion-teoria-rectangular", "")
-
-        tabla_recomendacion_velocidad_maxima = {
-            "Tubería de Hormigón simple hasta 60 cm de diámetro": "4.0",
-            "Tubería de Hormigón armado de 60 cm de diámetro o mayores": "6.0",
-            "Hormigón armado en obra para grandes conducciones 210/240 kg/cm²": "6.0 -- 6.5",
-            "Hormigón armado en obra 280/350 kg/cm². Grandes conducciones": "7.0 -- 7.5",
-            "PEAD, PVC, PRFV": "3.0 -- 4.0",
-            "Acero*": "9.0 o mayor",
-            "Hierro dúctil o fundido*": "9.0 o mayor",
-        }
-
-        tabla_recomendacion_velocidad_maxima_df = pd.Series(tabla_recomendacion_velocidad_maxima).to_frame().reset_index()
-        tabla_recomendacion_velocidad_maxima_df.columns = ["Material", "Velocidad máxima"]
-
-        tabla_recomendacion_velocidad_maxima_latex = tabla_recomendacion_velocidad_maxima_df.to_latex(
-            longtable=False,
-            caption="Velocidades máximas admisibles según material de tubería",
-            label="tab:velmax",
-            index=False,
-            position="H",  # float_format=lambda x: '{:.3f}'.format(x) if isinstance(x, (float, int)) else x,
-            # column_format='cccc',  # Specify column alignment (c for centered, adjust as needed: c, l, r)
-            escape=False,  # Allow LaTeX special characters if needed (e.g., &)
-        )
-
-        latex_source = latex_source.replace("tabla-recomendacion-velocidad-maxima", tabla_recomendacion_velocidad_maxima_latex)
-
-        # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        hidrology_dict_paths = get_file_paths_latex(r"C:\Users\chelo\OneDrive\SANTA_ISABEL\PROYECTO_MUROS_MUTUALISTA\04_RESULTADOS\03_hidrologia")
-
-        cond_hidrologia = False
-
-        if cond_hidrologia:
-            resultados_hidrologicos = r"""
-                %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-                %\newpage
-                \chapter{Caudales de diseño}\label{caudal_diseño}
-                \thispagestyle{fancy}
-                Este capítulo presenta la metodología para obtener caudales de diseño para el proyecto. Pluviales (a partir de tormentas de diseño, curvas IDF y el método CN del SCS) y sanitarios (según demanda, población, factor de retorno y coeficiente de punta),
-                estableciendo las bases para dimensionar y evaluar las redes de alcantarillado.
-                
-                \section{Modelo hidrológico}
-                Esta sección caracteriza la hidrología del área mediante el análisis de precipitaciones, curvas IDF, definición de la tormenta de diseño y modelación de escorrentía superficial con el método CN del SCS,
-                Se detallan los registros históricos, los métodos para obtener las curvas IDF y el procedimiento para definir la tormenta de diseño y obtencion del numero de curva.
-                
-                \subsection{Precipitación histórica base} \label{precipitacionhistorica}
-                figprecipitacionidf
-                
-                % Cálculo del espacio restante en la página
-                \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-            
-                \begin{figure}[H]
-                  \centering
-                  \centerline{\includegraphics[height=0.8\espacioRestante, width=0.95\textwidth, keepaspectratio]{00_precipitacion_historica.png}}
-                  \caption{Serie de tiempo: precipitación del área de proyecto}\label{fig:precipitacionhistorica}
-                \end{figure}
-                
-                %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-                \newpage
-                \subsection{Período de retorno de diseño}
-                \label{subsec:periodo_diseno}
-                
-                El período de retorno para las aportaciones pluviales se estimó considerando la vida útil
-                del proyecto. Ademas, el ciclo de vida de los materiales manteniendo una estimacion conservadora.
-                Asi mismo, se asume que el evento de diseño debería ocurrir como máximo
-                una vez durante la vida útil del proyecto. De este modo, se determinó el período de retorno
-                mínimo mediante la Ecuación~\ref{eq:probfalla}.
-                
-                \begin{equation}
-                    A \;=\; 1 - \bigl(1 - p\bigr)^{N}
-                    \;=\; 1 \;-\; \Bigl(1 \;-\; \tfrac{1}{T}\Bigr)^{N}
-                    \label{eq:probfalla}
-                \end{equation}
-                
-                \vspace{1em}
-                
-                La Figura~\ref{fig:probfalla} muestra la relación entre la amenaza de un evento
-                hidrológico y su probabilidad de ocurrencia. Asi mismo, se estima la probabilidad de
-                ocurrencia mayor a 99 \% del evento de diseño durante la vida útil del proyecto.
-                
-                % Cálculo del espacio restante en la página
-                \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-                
-                \vspace{-3mm}
-                \begin{figure}[H]
-                    \setlength{\belowcaptionskip}{-10pt}
-                    \centering
-                    \subfigure[Relación entre la probabilidad de ocurrencia de un evento, el período de retorno]{
-                        \includegraphics[width=0.50\espacioRestante,keepaspectratio]{04_probabilidad_excedencia.png}%
-                    }\hfill % Espacio horizontal entre las subfiguras
-                    \subfigure[Probabilidad de excedencia para diferentes períodos de retorno.]{
-                        \includegraphics[width=0.50\espacioRestante,keepaspectratio]{05_probabilidad_fallo.png}%
-                    }
-                    \caption{Relación entre probabilidad de excedencia y períodos de retorno.}
-                    \label{fig:probfalla}
-                \end{figure}
-                
-                La Tabla \ref{tab:probfalla} muestra la probabilidad de fallo para diferentes periodos de retorno.
-                \begin{small}
-                probfallatablaresumenpypiper
-                \end{small}
-                
-                %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-                \newpage
-                \subsection{Hietograma para evento de diseño} \label{hietogramadiseño}
-                El hietograma se lo construirá con el método de bloques alternados con base a los valores obtenidos de las intensidades de las curvas de Intensidad - Duración - Frecuencia.
-                
-                \subsubsection{Curvas de intensidad-duración-frecuencia} \label{curvasidf}
-                Las curvas de intensidad-duración-frecuencia (IDF) constituyen la base hidrológica para la estimación de los caudales de diseño. Estas curvas sintetizan las características de los eventos extremos máximos de precipitación de una determinada
-                zona y definen la intensidad media de lluvia para diferentes duraciones de eventos de precipitación con períodos de retorno específicos.
-                
-                \vspace{1em} % Añade un espacio vertical de 1 em después de esta línea
-                
-                El desarrollo de las curvas IDF requiere que se realice un análisis de frecuencia para cada conjunto de máximos anuales, cada uno asociado con una duración de lluvia específica. El objetivo básico de cada análisis de frecuencia es determinar la
-                función de distribución de probabilidad de excedencia de la intensidad de lluvia para cada duración. Para el análisis de frecuencia, se ajusta una distribución teórica de Valor Extremo (EV) como Gumbel a las observaciones y luego se usa
-                la distribución teórica para estimar los eventos de lluvia asociados con probabilidades de excedencia.
-                
-                \subsubsection{Enfoque de Distribución Teórica de Valor Extremo} \label{valorextremo}
-                La distribución de Gumbel Tipo I tiene un parámetro de ubicación \(\mu\) y de escala \(\beta\), además del valor medio de las observaciones \(x\), como se muestra en la Ecuación~\ref{eq:gumbel}:
-                
-                \begin{equation}
-                G(x; \mu, \beta) = \frac{1}{\beta} e^{\frac{x - \mu\beta}{\beta}} e^{-e^{\frac{x - \mu}{\beta}}}
-                \label{eq:gumbel}
-                \end{equation}
-                \vspace{1em} % Añade un espacio vertical de 1 em después de esta línea
-                
-                En este sentido, el valor de la variable aleatoria \(x\) asociada a un período de retorno \(T\), se puede obtener con la expresión descrita en la Ecuación~\ref{eq:variable_retorno}, donde \(\bar{x}\) es el promedio y \(S\) es la desviación estándar de las observaciones.
-                
-                \begin{equation}
-                X_T = \bar{x} + K_T S
-                \label{eq:variable_retorno}
-                \end{equation}
-                \vspace{1em} % Añade un espacio vertical de 1 em después de esta línea
-                
-                Además, el factor de frecuencia \(K_T\) asociado a un período de retorno, puede obtenerse con la expresión descrita en la Ecuación~\ref{eq:factorfrecuencia}.
-                
-                \begin{equation}
-                K_T = -\frac{\sqrt{6}}{\pi} \left[ 0.5772 + \ln\left(\ln\left(\frac{T}{T-1}\right)\right) \right]
-                \label{eq:factorfrecuencia}
-                \end{equation}
-                
-                %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-                \newpage
-                \subsubsection{Ajuste de los datos empíricos a una ley de potencias} \label{leypotencias}
-                Con base a los valores obtenidos, es necesario realizar un ajuste de estos a una ecuación empírica. Dicha ecuación se basa en la ley de potencias para explicar cómo varía la intensidad de la precipitación en función de la duración y del período de retorno.
-                Para ello, utilizamos los datos discretos obtenidos de duración e intensidad y los integramos a la Ecuación~\ref{eq:idf}.
-                
-                \begin{equation}
-                I(t, T) = a \frac{T^m}{(t + b)^n}
-                \label{eq:idf}
-                \end{equation}
-                
-                Donde:
-
-                \begin{description}[itemsep=0pt, parsep=0pt, leftmargin=0pt]
-                    \item[$I$] Intensidad de lluvia, mm/h
-                    \item[$t$] Duración de la lluvia, min
-                    \item[$T$] Período de retorno de la lluvia
-                    \item[$a, b, m, n$] Coeficientes adimensionales de ajuste
-                \end{description}
-
-                
-                En la Figura \ref{fig:curvasidf}  se muestra las curvas de Intensidad-Duración-Frecuencia (IDF) para distintos periodos de retorno.
-                Cada curva representa la relación entre la duración de la precipitación, medida en minutos (eje horizontal) y la intensidad de la precipitación (eje vertical), expresada en milímetros por hora (mm/h).
-                
-                % Cálculo del espacio restante en la página
-                \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-            
-                \begin{figure}[H]
-                  \centering
-                  \centerline{\includegraphics[height=0.45\espacioRestante,keepaspectratio]{01_curvas_idf.png}}
-                  \caption{Serie de tiempo: Curvas de Intensidad, duración y frecuencia }\label{fig:curvasidf}
-                \end{figure}
-                
-                Con base a los resultados de los puntos discretos de la curva IDF se construyeron curvas con ley de potencias para aproximar los valores de la IDF para diferentes duraciones y periodo de retorno, como se observa en la Tabla \ref{tab:idftab}.
-                \begin{small}
-                precipitaciontablaresumenpypiper
-                \end{small}
-                
-                \newpage
-                La Figura \ref{fig:ajustecurvasidf} muestra la ecuacion y los datos construidos a partir de la distribución de Gumbel Tipo I y su bondad de ajuste representado por el coeficiente r2.
-                figajusteidf
-                
-                % Cálculo del espacio restante en la página
-                \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-            
-                \begin{figure}[H]
-                  \centering
-                  \centerline{\includegraphics[height=0.7\espacioRestante, width=0.95\textwidth, keepaspectratio]{02_ajuste_idf.png}}
-                  \caption{Ajuste a la ecuación de ley de potencias para las curvas IDF }\label{fig:ajustecurvasidf}
-                \end{figure}
-                
-                \newpage
-                La Figura \ref{fig:hietogramaidf: } y la Tabla \ref{tab:hietogramaidftab} muestra los hietogramas de diseño producto del método de bloques.
-                \begin{small}
-                hietogramatablaresumenpypiper
-                \end{small}
-                
-                
-                
-                % Cálculo del espacio restante en la página
-                \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-            
-                \begin{figure}[H]
-                  \centering
-                  \centerline{\includegraphics[height=0.7\espacioRestante, width=0.95\textwidth, keepaspectratio]{03_hietograma_idf.png}}
-                  \caption{Histograma: Hietograma de diseño para diferentes periodos de retorno}\label{fig:hietogramaidf: }
-                \end{figure}
-
-                %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-                \newpage
-                \subsection{Modelos de lluvia infiltración} \label{modeloinfiltracion}
-                
-                \subsubsection{Numero de curva}
-                El número de curva de escorrentía (también llamado número de curva o simplemente CN) es un parámetro empírico utilizado en hidrología para predecir la escorrentía directa o la infiltración a partir del exceso de lluvia.
-                El método del número de curva fue desarrollado por el Servicio de Conservación de Recursos Naturales del USDA, que anteriormente se llamaba Servicio de Conservación de Suelos o SCS.
-                
-                El número de curva de escorrentía se desarrolló
-                a partir de un análisis empírico de la escorrentía de pequeñas cuencas y parcelas de ladera monitoreadas por el USDA. Es ampliamente utilizado y es un método eficiente para determinar la cantidad aproximada de escorrentía directa de un evento
-                 de lluvia en un área particular.
-                 
-                 Es importante notar que la metodología del número de curva es un cálculo basado en eventos, y no debe usarse para un único valor anual de lluvia, ya que esto incorrectamente omitiría los efectos de la humedad
-                 antecedente y la necesidad de un umbral de abstracción inicial.
-                
-                \subsubsection{Definición}
-                El número de curva de escorrentía se basa en el grupo de suelo hidrológico del área, uso de tierra, tratamiento y condición hidrológica. Referencias, como las del USDA indican los números de curva de escorrentía para descripciones características de
-                 cobertura de tierra y un grupo de suelo hidrológico. La relación descrita en la Ecuación \ref{eq:runoff} (Fuente: National Engineering Handbook, Chapter 10 - Estimation of Direct Runoff from Storm Rainfall), permite que la profundidad de la escorrentía
-                 sea estimada a partir de la profundidad de la lluvia, dado el valor de la retención máxima potencial S. Esta retención máxima potencial representa principalmente la infiltración que ocurre después de que ha comenzado la escorrentía.
-
-                \begin{equation}
-                Q = \begin{cases}
-                0 & P \leq I_a \\
-                \frac{(P - I_a)^2}{P - I_a + S} & P > I_a
-                \end{cases}
-                \label{eq:runoff}
-                \end{equation}
-                
-                
-                Donde:
-                
-                \begin{description}[itemsep=0pt, parsep=0pt, leftmargin=0pt]
-                    \item[$Q$] Escorrentía (mm)
-                    \item[$P$] Precipitación (mm)
-                    \item[$S$] Retención máxima potencial de humedad del suelo
-                    \item[$I_a$] Abstracción inicial ($I_a \approx 0.2S$)
-                \end{description}
-                
-                La retención máxima potencial del suelo $S$ se calcula a partir del número de curva de escorrentía $CN$ con la Ecuación \ref{eq:retention} (Fuente: National Engineering Handbook, Chapter 10 - Estimation of Direct Runoff from Storm Rainfall).
-                $CN$ tiene un rango de 30 a 100: números más bajos indican bajo potencial de escorrentía mientras que números mayores son para un potencial de escorrentía creciente. Cuanto más bajo el número de curva, más permeable es el suelo.
-                
-                \begin{equation}
-                S = \frac{100}{CN} - 10
-                \label{eq:retention}
-                \end{equation}
- 
-                 Donde:
-                
-                \begin{description}[itemsep=0pt, parsep=0pt, leftmargin=0pt]
-                    \item[$CN$] Número de Curva (rango 30 - 100)
-                \end{description}
-                
-                \newpage
-                \subsubsection{Grupos de suelo hidrológicos}
-                \textbf{Grupo A} \newline Los suelos en este grupo tienen bajo potencial de escorrentía cuando están completamente secos. El agua se transmite libremente a través del suelo. Los suelos generalmente tienen menos del 10 por ciento de arcilla y más del 90
-                por ciento de arena o grava y tienen grava o arena texturada, arena arenosa, limo arenoso, loam o limo o suelos arenosos que pueden estar en este grupo si están bien agregados, de baja densidad en bloque, o contienen más del 35 por ciento de fragmentos de roca.
-                
-                Los límites de las características físicas diagnósticas del grupo A son los siguientes. La conductividad hidráulica saturada de todas las capas de suelo excede los 40 micrómetros por segundo (1.57 pulgadas por hora).
-                
-                La profundidad a cualquier capa impermeable
-                al agua es mayor a 50 centímetros (20 pulgadas). Los suelos que son más profundos que 100 centímetros (40 pulgadas) y tienen una mesa de agua controlable están en el grupo A si la conductividad hidráulica saturada de todas las capas de suelo excede los
-                10 micrómetros por segundo (0.57 pulgadas por hora).
-
-                \vspace{1em} % Añade un espacio vertical de 1 em después de esta línea
-                \textbf{Grupo B} \newline Los suelos en este grupo tienen moderadamente bajo potencial de escorrentía cuando están completamente mojados. La transmisión de agua a través del suelo es moderada. Los suelos generalmente tienen entre 10 por ciento y 20 por ciento de arcilla y 50
-                por ciento a 90 por ciento de arena y tienen arena limosa, limo o texturas arenosas. Algunos suelos pueden tener loam, limo arenoso, limo o texturas de arcilla arenosa y pueden estar en este grupo si están bien agregados, de baja densidad en bloque, o contienen más del
-                35 por ciento de fragmentos de roca.
-                
-                Los límites de las características físicas diagnósticas del grupo B son los siguientes. La conductividad hidráulica saturada de todas las capas de suelo excede los 10 micrómetros por segundo (0.57 pulgadas por hora) y es menor de
-                 40 micrómetros por segundo (1.57 pulgadas por hora).
-
-                \vspace{1em} % Añade un espacio vertical de 1 em después de esta línea
-                 \textbf{Grupo C}  \newline Los suelos en este grupo tienen un potencial de escorrentía moderadamente alto cuando están completamente mojados. La transmisión de agua a través del suelo es lenta. Los suelos generalmente tienen entre 20 por ciento y 40 por ciento de arcilla y
-                 menos del 50 por ciento de arena y loam, limo arenoso, arcilla arenosa, arcilla limosa y limo arcilloso o arcilla pueden estar en este grupo si tienen texturas de arcilla bien agregadas, pueden colocarse en este grupo si están bien agregados, de baja densidad
-                 en bloque, o contienen más del 35 por ciento de fragmentos de roca. Los límites de las características físicas diagnósticas del grupo C son los siguientes.
-                 
-                 La conductividad hidráulica saturada de todas las capas de suelo en la capa menos transmisiva entre la
-                 superficie y los 50 centímetros (20 pulgadas) es menor de 1.0 micrómetros por segundo (0.04 pulgadas por hora) y mayor de 0.10 micrómetros por segundo (0.004 pulgadas por hora).
-                 
-                 La profundidad a cualquier capa impermeable al agua es mayor a 50
-                 centímetros (20 pulgadas). Los suelos que son más profundos que 100 centímetros (40 pulgadas) y tienen una mesa de agua controlable están en el grupo C si la conductividad hidráulica saturada de todas las capas de suelo excede los 0.10 micrómetros por
-                 segundo (0.004 pulgadas por hora) y es menor de 0.40 micrómetros por segundo (0.016 pulgadas por hora).
-                 
-                 \vspace{1em} % Añade un espacio vertical de 1 em después de esta línea
-                \textbf{Grupo D} \newline Los suelos en este grupo tienen un potencial de escorrentía alto cuando están completamente mojados. La transmisión de agua a través del suelo está restringida o muy restringida. Los suelos del Grupo D generalmente tienen más del 40 por ciento de
-                arcilla, menos del 50 por ciento de arena y tienen texturas de arcilla limosa o arcilla.
-                
-                Todos los suelos con una profundidad desde una capa de suelo impermeable menor a 50 cm y todos los suelos con un nivel freático dentro de los 60 centímetros [24 pulgadas] de
-                la superficie están en este grupo. Los límites de las características físicas diagnósticas del grupo D son los siguientes.
-                
-                Para suelos con una capa impermeable al agua a una profundidad entre 50 centímetros y 100 centímetros [20 y 40 pulgadas], la conductividad
-                hidráulica saturada en la capa de suelo menos transmisiva es menor o igual a 1.0 micrómetros por segundo (0.14 pulgadas por hora). Para suelos que son más profundos que 100 centímetros [40 pulgadas] hasta una restricción o hasta la mesa de agua, la
-                conductividad hidráulica saturada de todas las capas de suelo dentro de los 100 centímetros [40 pulgadas] de la superficie es menor o igual a 0.40 micrómetros por segundo (0.06 pulgadas por hora).
-                
-                
-                \begin{small}
-               \begin{longtable}{lcccc}
-                \caption{Números de curva ($CN$) para diferentes usos de suelo y grupos hidrológicos del suelo} \label{tab:cn_uso_suelo} \\
-                \toprule
-                \textbf{Uso de Suelo} & \textbf{A} & \textbf{B} & \textbf{C} & \textbf{D} \\
-                \midrule
-                \endfirsthead
-                \caption[]{Números de curva ($CN$) para diferentes usos de suelo y grupos hidrológicos del suelo} \\
-                \toprule
-                \textbf{Uso de Suelo} & \textbf{A} & \textbf{B} & \textbf{C} & \textbf{D} \\
-                \midrule
-                \endhead
-                \midrule
-                \multicolumn{5}{r}{Continúa en la siguiente página} \\
-                \midrule
-                \endfoot
-                \bottomrule
-                \endlastfoot
-                Tierra cultivada sin tratamiento de conservación & 72 & 81 & 88 & 91 \\
-                Tierra cultivada con tratamiento de conservación & 62 & 71 & 78 & 81 \\
-                Pasto o tierra de pastoreo en mal estado & 68 & 79 & 86 & 89 \\
-                Pasto o tierra de pastoreo en buen estado & 39 & 61 & 74 & 80 \\
-                Pradera en buen estado & 30 & 58 & 71 & 78 \\
-                Bosque o tierra forestal con poca cobertura & 45 & 66 & 77 & 83 \\
-                Bosque o tierra forestal con buena cobertura & 49 & 69 & 79 & 84 \\
-                Espacios abiertos, césped parques en buenas condiciones & 39 & 61 & 74 & 80 \\
-                Espacios abiertos, césped parques en malas condiciones & 49 & 69 & 79 & 84 \\
-                Áreas comerciales y empresariales & 89 & 92 & 94 & 95 \\
-                Distritos industriales & 81 & 88 & 91 & 93 \\
-                Residencial Densidad Alta & 77 & 85 & 90 & 92 \\
-                Residencial Densidad Media & 61 & 75 & 83 & 86 \\
-                Residencial Densidad Baja & 54 & 70 & 80 & 85 \\
-                Estacionamientos pavimentados, techos y entrada de autos & 98 & 98 & 98 & 98 \\
-                Calles y carreteras pavimentadas con bordillos y alcantarillas & 98 & 98 & 98 & 98 \\
-                Calles y carreteras de gravilla & 76 & 85 & 89 & 91 \\
-                Calles y carreteras de tierra & 72 & 82 & 87 & 89 \\
-            \end{longtable}
-            \end{small}
-            
-    
-            %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-            \newpage
-            \subsection{Descripción de los parámetros hidrológicos del área de aporte}
-            areacnpypiper
-            areaimpervpypiper
-            areaslopepypiper
-            areadensitypypiper
-
-                """
-
-            # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-            precipitacion_series = pd.read_excel(hidrology_dict_paths["01_precip_resumem.xlsx"])
-
-            idf_resumen = pd.read_excel(hidrology_dict_paths["00_parameters_idf.xlsx"])
-            idf_resumen_latex = idf_resumen.to_latex(
-                longtable=True,
-                caption="Datos de ajuste de las curvas IDF",
-                label="tab:idftab",
-                index=False,
-                position="H",
-                float_format=lambda x: "{:.3f}".format(x)
-                if isinstance(x, (float, int))
-                else x,  # column_format='cccc',  # Specify column alignment (c for centered, adjust as needed: c, l, r)
-                escape=False,  # Allow LaTeX special characters if needed (e.g., &)
-            )
-
-            prompt_descripcion_precipitacion = f"""
-        
-            ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formato adicional). Este es el formato que debe seguir:
-
-            La serie de tiempo tiene una longitud desde {{inicio_serie}} hasta {{fin_serie}}. El valor máximo de la serie es {{valor_maximo}} y una longitud de serie de tiempo de {{count}} registros, con una resolución temporal de {{resolucion}}.
-            Se analizó las series de tiempo para completitud, relleno y datos anómalos.
-            
-            PROCESO:
-            El proceso para analizar la serie de tiempo es:
-            1. Identifica los años únicos en la serie.
-            2. Calcula el año de inicio y fin, el valor máximo de precipitación, la longitud total de registros (count), y la resolución temporal.
-            3. Rellena el formato provisto con los datos correspondientes de forma ESTRICTA.
-            
-            Este es un ejemplo para que te guíes:
-            Supongamos que la serie de tiempo tiene los siguientes datos:
-            - Años: 2011, 2012, 2013, 2014, 2015, 2016, 2017
-            - Precipitaciones (mm/h): 45.2, 38.5, 92.8, 143.7, 127.6, 89.4, 62.1
-            - Resolución: diaria
-            
-            Entonces, la descripción sería:
-            La serie de tiempo tiene una longitud desde 2011 hasta 2017. El valor máximo de la serie es 143.7 y una longitud de serie de tiempo de 7 registros, con una resolución temporal diaria.
-            
-            IMPORTANTE
-            -Por favor asegúrate de usar los valores exactos de los datos proporcionados.
-            - La respuesta debe estar en español.
-            - Por favor revisa que aunque la redacción esté en su mayoría en español, no se produzcan palabras en inglés u otro idioma.
-            - No te desvíes o modifiques el formato de la respuesta o el ejemplo que te di.
-            - No uses asteriscos ni markdown.
-            - No incluyas en tu respuesta la explicación de tu tren de pensamiento para llegar a la respuesta.
-            - No repitas la respuesta.
-            - No incluyas la palabra 'Answer:'.
-            - NO inventes números.
-            - NO incluyas la serie de tiempo que estás analizando.
-            - NO agregues información adicional.
-            - MANTÉN la lógica del texto proporcionado.
-            
-            La serie de tiempo a analizar es: {str(precipitacion_series)}
-            """
-            description_precipitacion = describer.describe_number_series(model="llama3", prompt=prompt_descripcion_precipitacion)
-            resultados_hidrologicos = resultados_hidrologicos.replace("figprecipitacionidf", description_precipitacion)
-            resultados_hidrologicos = resultados_hidrologicos.replace("precipitaciontablaresumenpypiper", idf_resumen_latex)
-
-            # -------------------------------------------------------------------------------------------------------------------------------------------------
-            adjust_idf_resumen = pd.read_excel(hidrology_dict_paths["03_ajusted_idf_r.xlsx"])
-            prompt_descripcion_ajusteIDF = f"""ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formato adicional). Este es el FORMATO que debe seguir:
-
-            "Con estos resultados se puede concluir que el modelo empleado para estimar las precipitaciones máximas para los períodos de retorno ({{periodo_1}}, {{periodo_2}}, …, {{periodo_n}} años) tiene capacidad explicativa, ya que los valores de R²
-            (entre {{r2_min}} y {{r2_max}}) indican que el ajuste es adecuado. Esto significa que la variabilidad de los datos observados se explica en gran medida con el modelo, lo que respalda la confiabilidad de los valores máximos de
-            precipitación ({{precip_1}}, {{precip_2}}, …, {{precip_n}}, respectivamente) para su uso en la construcción de curvas IDF."
-            
-            PROCESO:
-            1. Identifica todos los períodos de retorno en el resumen (identificados por T = años).
-            2. Determina el rango de coeficientes de determinación R² (mínimo y máximo) a partir de los valores proporcionados.
-            3. Extrae los valores máximos de precipitación correspondientes a cada período de retorno.
-            4. Rellena el formato provisto con todos los períodos de retorno, el rango de R², y todos los valores máximos de precipitación de forma ESTRICTA, sin añadir información adicional.
-            5. Asegúrate de listar todos los períodos de retorno y valores de precipitación en el orden proporcionado en el resumen.
-            
-            IMPORTANTE
-            -Por favor asegúrate de usar los valores exactos de los datos proporcionados en el resumen.
-            - La respuesta debe estar en español.
-            - No se permiten palabras en inglés u otro idioma.
-            - Entrega solo UNA respuesta en texto plano.
-            - No uses asteriscos ni markdown.
-            - No incluyas en tu respuesta la explicación de tu tren de pensamiento para llegar a la respuesta.
-            - No añadas conectores como 'Posteriormente,' 'Finalmente,' o 'Adicionalmente' a menos que estén en el formato proporcionado.
-            - No repitas la respuesta.
-            - No incluyas la palabra 'Answer:'.
-            - NO inventes números.
-            - NO incluyas la figura que estás analizando.
-            - NO agregues información adicional (como referencias a duración máxima o detalles no solicitados).
-            - MANTÉN la lógica y el formato del texto proporcionado exactamente como se especifica.
-            -La información para llenar los placeholders está en el resumen.
-            
-            ejemplo de resumen:
-                  T = 2       T = 5      T = 10    T = 25
-                      R    0.979     0.9836    0.9836  0.9856
-              valor_max  94.953296  139.961413  154.101512  209.9062
-            
-            ejemplo de resultado esperado:
-            "Con estos resultados se puede concluir que el modelo empleado para estimar las precipitaciones máximas para los períodos de retorno (2, 5, 10 y 25 años) tiene capacidad explicativa, ya que los valores de R² (entre 0.979 y 0.9856) i
-            ndican que el ajuste es adecuado. Esto significa que la variabilidad de los datos observados se explica en gran medida con el modelo, lo que respalda la confiabilidad de los valores máximos de precipitación (94.95, 139.96, 154.10 y 209.90, respectivamente)
-            para su uso en la construcción de curvas IDF."
-            
-            resumen: {str(adjust_idf_resumen)}"""
-
-            description_ajusteIDF = describer.describe_number_series(model="llama3", prompt=prompt_descripcion_ajusteIDF)
-            resultados_hidrologicos = resultados_hidrologicos.replace("figajusteidf", description_ajusteIDF)
-
-            # -------------------------------------------------------------------------------------------------------------------------------------------------
-
-            hietograma_resumen = pd.read_excel(hidrology_dict_paths["02_hyetographs_IDF.xlsx"])
-            hietograma_resumen_latex = hietograma_resumen.to_latex(
-                longtable=True,
-                caption="Intensidades resultado de metodo de bloques alternos para las curvas idf",
-                label="tab:hietogramaidftab",
-                index=False,
-                position="H",
-                float_format=lambda x: "{:.3f}".format(x)
-                if isinstance(x, (float, int))
-                else x,  # column_format='cccc',  # Specify column alignment (c for centered, adjust as needed: c, l, r)
-                escape=False,  # Allow LaTeX special characters if needed (e.g., &)
-            )
-            resultados_hidrologicos = resultados_hidrologicos.replace("hietogramatablaresumenpypiper", hietograma_resumen_latex)
-            # -------------------------------------------------------------------------------------------------------------------------------------------------
-            prob_fallo_resumen = pd.read_excel(hidrology_dict_paths["04_probabilidad_fallo.xlsx"])
-            prob_fallo_resumen_latex = prob_fallo_resumen.to_latex(
-                longtable=True,
-                caption="Probabilidad de fallo para diferentes periodos de retorno",
-                label="tab:probfalla",
-                index=False,
-                position="H",
-                column_format="cc",  # Specify column alignment (c for centered, adjust as needed: c, l, r)
-                escape=False,  # Allow LaTeX special characters if needed (e.g., &)
-            )
-            resultados_hidrologicos = resultados_hidrologicos.replace("probfallatablaresumenpypiper", prob_fallo_resumen_latex)
-            # -------------------------------------------------------------------------------------------------------------------------------------------------
-
-            resultados_hidrologicos = resultados_hidrologicos.replace(
-                "00_precipitacion_historica.png",
-                hidrology_dict_paths["00_precipitacion_historica.png"].replace(os.path.sep, "/"),
-            )
-            resultados_hidrologicos = resultados_hidrologicos.replace(
-                "01_curvas_idf.png",
-                hidrology_dict_paths["01_curvas_idf.png"].replace(os.path.sep, "/"),
-            )
-            resultados_hidrologicos = resultados_hidrologicos.replace(
-                "02_ajuste_idf.png",
-                hidrology_dict_paths["02_ajuste_idf.png"].replace(os.path.sep, "/"),
-            )
-            resultados_hidrologicos = resultados_hidrologicos.replace(
-                "03_hietograma_idf.png",
-                hidrology_dict_paths["03_hietograma_idf.png"].replace(os.path.sep, "/"),
-            )
-            resultados_hidrologicos = resultados_hidrologicos.replace(
-                "04_probabilidad_excedencia.png",
-                hidrology_dict_paths["04_probabilidad_excedencia.png"].replace(os.path.sep, "/"),
-            )
-            resultados_hidrologicos = resultados_hidrologicos.replace(
-                "05_probabilidad_fallo.png",
-                hidrology_dict_paths["05_probabilidad_fallo.png"].replace(os.path.sep, "/"),
-            )
-            latex_source = latex_source.replace("seccion-hidrologia", resultados_hidrologicos)
-
-            # ------------------------------------------------------------------------------------------------------------------------------------------------------
-            if "CN" in gdf_areas.columns:
-                section_numero_curva = r"""
-                \subsubsection{Número de curva}
-                El número de curva del sistema de alcantarillado typepypiper se presentan en la Figura \ref{fig3cn}.
-                 El Número de Curva (CN) es un valor adimensional que varía entre 30 y 98, y que indica la capacidad
-                 de un área para generar escorrentía, basada en factores como el uso del suelo, la cobertura vegetal y el nivel de impermeabilización.
-                 
-                 descripciónareacnpypiper
-            
-                % Cálculo del espacio restante en la página
-                \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-            
-                \begin{figure}[H]
-                  \centering
-                  \centerline{\includegraphics[height=0.6\espacioRestante, width=0.95\textwidth, keepaspectratio]{area_curve_number_planimetria.png}}
-                  \caption{Planimetría: número de curva del área de aporte del alcantarillado typepypiper}\label{fig3cn}
-                \end{figure}
-            
-                tablaareacnpypiper
-            
-                """
-
-                # Step 1: Calculate the weighted CN (CN * area) for each row
-                gdf_areas["weighted_CN"] = gdf_areas["CN"] * gdf_areas["area"]
-
-                # Step 2: Group by 'outfall' and calculate the sum of weighted CN and the sum of areas
-                grouped = gdf_areas.groupby("outfall").agg(
-                    {
-                        "weighted_CN": "sum",  # Sum of (CN * area)
-                        "area": "sum",  # Sum of areas
-                    }
-                )
-
-                # Step 3: Calculate the weighted average CN for each outfall
-                grouped["weighted_avg_CN"] = (grouped["weighted_CN"] / grouped["area"]).round(2)
-
-                cn_df = grouped[["area", "weighted_avg_CN"]]
-                cn_df.columns = ["area", "CN"]
-
-                latex_area_numero_curva = cn_df.to_latex(
-                    longtable=True,
-                    caption="Planimetría: número de curva del área de aporte typepypiper",
-                    label="tab:tabcnarea",
-                    index=True,
-                    position="H",  # float_format=lambda x: f"{int(x):d}"
-                )
-                section_numero_curva = section_numero_curva.replace("tablaareacnpypiper", latex_area_numero_curva)
-
-                try:
-                    prompt_area_numero_curva = """
-    
-                    ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formato adicional). Este es el formato que debe seguir:
-    
-                    
-                    La figura muestra que el número de curva máximo se estima en {max_valor} y el mínimo en {min_valor}. El número de curva {numero_curva_o_rango_CN} indica áreas {descripción_del_tipo_de_superficie_que_representa_ese_numero_de_curva_o_rango}.
-    
-                    PROCESO:
-                    El proceso para agrupar los valores de CN es:
-                    1. Compara los valores de número de curva presentes en la serie  con los rangos de CN de la tabla de rangos.
-                    2. Agrupa los valores de número de curva de la serie dentro de los cinco rangos brindados en la tabla de rangos.
-                    3. Inicia tu descripción con un único valor o un rango para cada rango de la tabla de rangos y su correspondiente descripción.
-                    4. Rellena el formato provisto con los anteriores datos de forma ESTRICTA para cada placeholder, como el ejemplo a continuacion.
-    
-                    Este es un ejemplo para que te guies.
-                    los valores detectados de los numeros de curva son  61, 70, 75,85,90,98.
-                    primero, agrupo segun la tabla de rangos , tenemos 61,70 y75 en el rango de  60 - 75. Luego, tenemos 85 en el rango 76 - 89 y finalmente 90y 98 en el rango 90 - 100.
-                    Ahora puedo describirlos,asi:
-    
-                    :inicio del ejemplo:
-                    La figura muestra que el número de curva máximo se estima en 98 y el mínimo en 61. El número de curva 61, 70, 75  indica áreas con cobertura mixta y moderada impermeabilización, como zonas periurbanas, pastizales degradados, cultivos agrícolas intensivos o sectores con caminos no pavimentados y suelos parcialmente permeables.
-                    Posteriormente, el número de curva de 85 se asocia con regiones con alta impermeabilización y uso urbano moderado, como barrios residenciales con céspedes, áreas industriales ligeras, o zonas con calles pavimentadas y suelos compactados.
-                    Finalmente, los números de curva 90 y 98, se encuntran en areas altamente urbanizadas o completamente impermeabilizadas, como centros urbanos densos, estacionamientos, tejados, calles principales y zonas industriales pesadas con mínima o nula infiltración de agua.'
-                    :fin del ejemplo:
-    
-    
-                    IMPORTANTE
-                    - La respuesta debe estar en español.
-                    -Por favor revisa que aunque la redaccion este en su mayoria en español, no se produzcan palabras en ingles u otro idioma.
-                    -No te desvies o modifiques el formato de la respuesta o el ejemplo que te di.
-                    - Debes describir todos los valores de CN que existan en la serie, sin repetir descripciones; puedes agrupar los valores que pertenezcan al mismo rango ubicado en la tabla de rangos.
-                    - Entrega solo UNA respuesta en texto plano.
-                    - No uses asteriscos ni markdown.
-                    -No incluyas en tu respuesta la explicacion de tu tren de pensamiento para llegar a la respuesta.
-                    -Utiliza palabras como 'posteriormente, finalmente, adicionalmente, en ese mismo sentido, etc para conectar las ideas y posbiles parraos nuevos.
-                    - No repitas la respuesta.
-                    - No incluyas la palabra 'Answer:'.
-                    - NO inventes números.
-                    -NO incluyas la serie que estas analizando
-                    - NO agregues información adicional.
-                    - MANTÉN la lógica del texto proporcionado.
-                    - tabla de rangos:
-                        0 - 30: Áreas con cobertura vegetal densa y excelente infiltración, como bosques primarios, humedales o praderas naturales con suelos muy permeables y poca o ninguna impermeabilización.
-                        31 - 59: Zonas con buena cobertura vegetal y moderada infiltración, incluyendo pastizales bien mantenidos, bosques secundarios o áreas agrícolas con suelos permeables y baja actividad humana.
-                        60 - 75: Áreas con cobertura mixta y moderada impermeabilización, como zonas periurbanas, pastizales degradados, cultivos agrícolas intensivos o sectores con caminos no pavimentados y suelos parcialmente permeables.
-                        76 - 89: Regiones con alta impermeabilización y uso urbano moderado, como barrios residenciales con céspedes, áreas industriales ligeras, o zonas con calles pavimentadas y suelos compactados.
-                        90 - 100: Áreas altamente urbanizadas o completamente impermeabilizadas, como centros urbanos densos, estacionamientos, tejados, calles principales y zonas industriales pesadas con mínima o nula infiltración de agua.
-    
-                    
-                    la serie a analizar es: """ + str(np.sort(gdf_areas["CN"].unique()))
-                    description_area_numero_curva = describer.describe_number_series(model="llama3", prompt=prompt_area_numero_curva)
-                    description_area_numero_curva = description_area_numero_curva.replace("*", "")
-
-                    section_numero_curva = section_numero_curva.replace("descripciónareacnpypiper", description_area_numero_curva)
-                    section_numero_curva = re.sub(r"(?<!\\)(?<!\s)%", r"\\%", section_numero_curva)
-
-                    latex_source = latex_source.replace("areacnpypiper", section_numero_curva)
-
-                except Exception as e:
-                    print(f"Error: {str(e)}")
-
-            else:
-                latex_source = latex_source.replace("areacnpypiper", "")
-
-            # -------------------------------------------------------------------------------------------------------------------------------------------------
-            if "%imperv" in gdf_areas.columns:
-                section_porcentaje_impermeabilidad = r"""
-                \newpage
-                \subsubsection{Porcentaje de impermeabilidad}
-                 La Figura \ref{fig3imperv} muestra los valores estimados de porcentaje de impermeabilización del área de aporte del alcantarillado typepypiper.
-                 Estos valores reflejan las condiciones hidrológicas de las subcuencas, desde áreas naturales con alta infiltración hasta zonas urbanas densas con mínima o nula capacidad de infiltración.
-                 
-                 descripciónareaimpervpypiper
-                
-                
-                % Cálculo del espacio restante en la página
-                \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-            
-                \begin{figure}[H]
-                  \centering
-                  \centerline{\includegraphics[height=0.6\espacioRestante, width=0.95\textwidth, keepaspectratio]{area_imperv_planimetria.png}}
-                  \caption{Planimetría: porcentaje de impermeabilizacion del área del alcantarillado typepypiper}\label{fig3imperv}
-                \end{figure}
-                
-                tablaareaimpervpypiper
-            
-                """
-                latex_area_imperv = (
-                    gdf_areas.groupby("outfall")["%imperv"]
-                    .describe()
-                    .round(0)
-                    .to_latex(
-                        longtable=True,
-                        caption="Planimetría: porcentaje de impermeabilizacion del área del alcantarillado typepypiper",
-                        label="tab:tabimpervarea",
-                        index=True,
-                        position="H",
-                        float_format=lambda x: f"{int(x):d}",
-                    )
-                )
-                section_porcentaje_impermeabilidad = section_porcentaje_impermeabilidad.replace("tablaareaimpervpypiper", latex_area_imperv)
-
-                try:
-                    prompt_area_imperv = """
-                    ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formato adicional). Sigue estrictamente este formato exacto, sin agregar explicaciones ni texto adicional fuera de él:
-                    
-                    La figura muestra que el porcentaje de impermeabilización máximo se estima en {max_valor}% y el mínimo en {min_valor}%. El porcentaje de impermeabilización {porcentaje_imperv_o_rango} indica áreas {descripción_del_tipo_de_superficie_que_representa_ese_porcentaje_o_rango}.
-                    
-                    INSTRUCCIONES CRÍTICAS:
-                    - No repitas información ni añadas detalles más allá de lo que se indica en el formato.
-                    - No incluyas introducciones, conclusiones ni texto que no encaje en el formato especificado.
-                    - Agrupa los valores de %Imperv según los rangos de la tabla y describe cada grupo exactamente una vez, usando las descripciones proporcionadas.
-                    - Proceso para agrupar:
-                      1. Compara los valores de %Imperv de la serie con los rangos de la tabla.
-                      2. Agrupa los valores en los cinco rangos de la tabla.
-                      3. Usa un único valor o rango por descripción, seguido de su texto correspondiente.
-                    - Usa conectores como 'posteriormente', 'adicionalmente', 'finalmente' para unir las ideas.
-                    - No inventes números ni modifiques las descripciones de la tabla.
-                    - Responde solo en español, con ortografía correcta y sin palabras en otros idiomas.
-                    
-                    Tabla de rangos:
-                    0% - 30%: Áreas con cobertura vegetal densa y excelente infiltración, como bosques primarios, praderas naturales o suelos muy permeables con poca o ninguna impermeabilización.
-                    31% - 59%: Zonas con buena cobertura vegetal y moderada infiltración, incluyendo pastizales bien mantenidos, bosques secundarios o áreas agrícolas con suelos permeables y baja actividad humana.
-                    60% - 75%: Áreas con alta impermeabilización y uso urbano moderado, como barrios residenciales con céspedes, áreas industriales ligeras o zonas con calles pavimentadas y suelos compactados.
-                    76% - 89%: Regiones con muy alta impermeabilización y uso urbano significativo, como zonas comerciales densas, áreas industriales medianas o sectores con pavimentos extensos y suelos altamente compactados.
-                    90% - 100%: Áreas altamente urbanizadas o completamente impermeabilizadas, como centros urbanos densos, estacionamientos, tejados, calles principales y zonas industriales pesadas con mínima o nula infiltración de agua.
-                    
-                    La serie a analizar es: """ + str(np.sort(gdf_areas["%imperv"].unique()))
-                    # description_area_imperv = describer.describe_number_series(model="qwen2.5vl:latest", prompt=prompt_area_imperv)
-                    description_area_imperv = describer.describe_number_series(model="llama3", prompt=prompt_area_imperv)
-                    description_area_imperv = description_area_imperv.replace("*", "")
-
-                    section_porcentaje_impermeabilidad = section_porcentaje_impermeabilidad.replace("descripciónareaimpervpypiper", description_area_imperv)
-                    section_porcentaje_impermeabilidad = re.sub(r"(?<!\\)(?<!\s)%", r"\\%", section_porcentaje_impermeabilidad)
-                    latex_source = latex_source.replace("areaimpervpypiper", section_porcentaje_impermeabilidad)
-
-                except Exception as e:
-                    print(f"Error: {str(e)}")
-
-            else:
-                latex_source = latex_source.replace("areaimpervpypiper", "")
-
-            # -------------------------------------------------------------------------------------------------------------------------------------------------
-            if "slope" in gdf_areas.columns:
-                section_slope = r"""    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-            \newpage
-            \subsubsection{Pendiente media}
-            Las  Figura \ref{fig3slope} muestra los valores estimados de la pendiente media del área de aporte del alcantarillado typepypiper.
-            
-            descripciónareaslopepypiper
-            
-            % Cálculo del espacio restante en la página
-            \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-            \begin{figure}[H]
-              \centering
-              \centerline{\includegraphics[height=0.6\espacioRestante, width=0.95\textwidth, keepaspectratio]{area_slope_planimetria.png}}
-              \caption{Planimetría: pendiente media area del alcantarillado typepypiper}\label{fig3slope}
-            \end{figure}
-            
-            
-            La tabla \ref{tab:tabslopearea} muestra la descripcción de la pendiente media para el área del sistema de alcantarillado.
-            tablaareaslopepypiper
-    
-                """
-                latex_area_slope = (
-                    gdf_areas.groupby("outfall")["slope"]
-                    .describe()
-                    .round(2)
-                    .to_latex(
-                        longtable=True,
-                        caption="Planimetría: pendinete media del área del alcantarillado typepypiper",
-                        label="tab:tabslopearea",
-                        index=True,
-                        position="H",
-                        float_format=lambda x: f"{float(x):1}",
-                    )
-                )
-                section_slope = section_slope.replace("tablaareaslopepypiper", latex_area_slope)
-
-                try:
-                    prompt_area_slope = """
-                    ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formato adicional). Este es el formato que debe seguir:
-    
-                    La figura muestra que la pendiente máxima se estima en {max_valor}% y la mínima en {min_valor}%. La pendiente {pendiente_o_rango} indica áreas {descripción_del_tipo_de_terreno_y_su_impacto_en_la_escorrentía}.
-    
-                    IMPORTANTE:
-                    El proceso para generar la descripción general es:
-                    1. Usa los valores estadísticos descriptivos de pendiente (mínimo, 25%, 50%, 75%, máximo) presentes en la serie provista.
-                    2. Compara cada valor estadístico (min, 25%, 50%, 75%, max) con los rangos de slope de la tabla de rangos para determinar el rango predominante o más representativo.
-                    3. Proporciona una descripción general basada en el rango del valor promedio (50% o media, si está disponible), mencionando cómo los valores mínimo, 25%, 75%, y máximo amplían o complementan esta descripción.
-                    4. Conecta las ideas con palabras como 'posteriormente, finalmente, adicionalmente, en ese mismo sentido, etc.'
-                    5. Rellena el formato provisto con los datos de forma estricta, siguiendo el ejemplo a continuación.
-    
-                    Este es un ejemplo para que te guíes.
-                    Los valores estadísticos detectados de slope son: count=237.0, mean=3.5, std=2.5, min=1.0, 25%=1.0, 50%=3.0, 75%=5.0, max=26.0.
-                    Primero, agrupo según la tabla de rangos: el mínimo 1.0% está en el rango 0% - 2%, el 25% (1.0%) está en el rango 0% - 2%, el 50% (3.0%) está en el rango 2% - 5%, el 75% (5.0%) está en el rango 5% - 10%, y el máximo (26.0%) está en el rango >20%.
-                    Ahora puedo describirlos, así:
-    
-                    :inicio del ejemplo:
-                    La figura muestra que la pendiente máxima se estima en 26.0% y la mínima en 1.0%. La pendiente 3.0% indica zonas con pendientes suaves, comunes en áreas agrícolas o suburbanas, donde el flujo de la escorrentía es moderado, con un balance entre infiltración y transporte de agua.
-                    Posteriormente, la pendiente 1.0% indica áreas planas o casi planas, como llanuras aluviales o deltas, donde el flujo de la escorrentía es lento, permitiendo alta infiltración y baja velocidad de respuesta hidrológica.
-                    Adicionalmente, la pendiente 5.0% indica áreas de pendientes moderadas, como colinas suaves o zonas periurbanas, donde el flujo de la escorrentía es más rápido, reduciendo el tiempo de concentración y aumentando el caudal superficial.
-                    Finalmente, la pendiente 26.0% se encuentra en áreas con pendientes muy pronunciadas, como acantilados o terrenos escarpados, donde el flujo de la escorrentía es extremadamente rápido, con alta erosión y mínima infiltración.
-                    :fin del ejemplo:
-    
-                    IMPORTANTE:
-                    - La respuesta debe estar en español.
-                    - Por favor revisa que aunque la redacción esté en su mayoría en español, no se produzcan palabras en inglés u otro idioma.
-                    - No te desvíes o modifiques el formato de la respuesta o el ejemplo que te di.
-                    - Debes describir todos los valores estadísticos de slope (min, 25%, 50%, 75%, max) que existan en la serie, sin repetir descripciones; puedes agrupar los valores que pertenezcan al mismo rango ubicado en la tabla de rangos.
-                    - Entrega solo UNA respuesta en texto plano.
-                    - No uses asteriscos ni markdown.
-                    - No incluyas en tu respuesta la explicación de tu tren de pensamiento para llegar a la respuesta.
-                    - Utiliza palabras como 'posteriormente, finalmente, adicionalmente, en ese mismo sentido, etc.' para conectar las ideas y posibles párrafos nuevos.
-                    - No repitas la respuesta.
-                    - No incluyas la palabra 'Answer:'.
-                    - NO inventes números.
-                    - NO incluyas los datos estadísticos o la serie que estás analizando.
-                    - NO agregues información adicional.
-                    - MANTÉN la lógica del texto proporcionado.
-                    - tabla de rangos:
-                        0% - 2%: Áreas planas o casi planas, como llanuras aluviales o deltas, donde el flujo de la escorrentía es lento, permitiendo alta infiltración y baja velocidad de respuesta hidrológica.
-                        2% - 5%: Zonas con pendientes suaves, comunes en áreas agrícolas o suburbanas, donde el flujo de la escorrentía es moderado, con un balance entre infiltración y transporte de agua.
-                        5% - 10%: Áreas de pendientes moderadas, como colinas suaves o zonas periurbanas, donde el flujo de la escorrentía es más rápido, reduciendo el tiempo de concentración y aumentando el caudal superficial.
-                        10% - 20%: Áreas con pendientes pronunciadas, típicas de terrenos montañosos, donde el flujo de la escorrentía es rápido, con alta velocidad y baja infiltración.
-                        >20%: Áreas con pendientes muy pronunciadas, como acantilados o terrenos escarpados, donde el flujo de la escorrentía es extremadamente rápido, con alta erosión y mínima infiltración.
-    
-                    La serie a analizar es: """ + str(gdf_areas.groupby("outfall")["slope"].describe().round(2))
-
-                    description_area_slope = describer.describe_number_series(model="llama3", prompt=prompt_area_slope)
-                    description_area_slope = description_area_slope.replace("*", "")
-
-                    section_slope = section_slope.replace("descripciónareaslopepypiper", description_area_slope)
-                    section_slope = re.sub(r"(?<!\\)(?<!\s)%", r"\\%", section_slope)
-                    latex_source = latex_source.replace("areaslopepypiper", section_slope)
-
-                except Exception as e:
-                    print(f"Error: {str(e)}")
-
-            else:
-                latex_source = latex_source.replace("areaslopepypiper", "")
-
-            # -------------------------------------------------------------------------------------------------------------------------------------------------
-            tabulacion_hidrologia = r"""
-            \section{Tabulación de resultados hidrológicos}
-            \subsection{Resultados  de numero de curva, área y porcentaje de impermeabilidad por cierre de área de aporte}
-            tablanumerocurvaareaimpermeabilidad
-            
-            """
-
-            latex6_area__hidrologia_resultados = (
-                gdf_areas.groupby("id_pozo")
-                .agg(
-                    {
-                        "area": "sum",
-                        "slope": "mean",
-                        "CN": lambda x: np.average(x, weights=gdf_areas.loc[x.index, "area"]),
-                        "%imperv": lambda x: np.average(x, weights=gdf_areas.loc[x.index, "area"]),
-                    }
-                )
-                .reset_index()
-            )
-            latex6_area__hidrologia_resultados = latex6_area__hidrologia_resultados.to_latex(
-                longtable=True,
-                caption="Parametros hidrologicos de área de aporte",
-                label="tab:tab" + str(contador_tabla + 5),
-                index=False,
-                position="H",
-                float_format=lambda x: "{:.3f}".format(x) if isinstance(x, (float, int)) else x,
-            )
-            latex6_area__hidrologia_resultados = latex6_area__hidrologia_resultados.replace("Continued on next page", "Continua en la siguiente página")
-            latex6_area__hidrologia_resultados = latex6_area__hidrologia_resultados.replace("_", "\\_")
-            latex6_area__hidrologia_resultados = latex6_area__hidrologia_resultados.replace("%", "\\%")
-
-            tabulacion_hidrologia = tabulacion_hidrologia.replace("tablanumerocurvaareaimpermeabilidad", latex6_area__hidrologia_resultados)
-            latex_source = latex_source.replace("tabulacionresultadoshidrologia", tabulacion_hidrologia)
-
-        else:
-            latex_source = latex_source.replace("tabulacionresultadoshidrologia", "")
-            latex_source = latex_source.replace("seccion-hidrologia", "")
-
-        # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        san_q_path = path_proy + '02_TXT' + os.path.sep + '00_EXCELL' + os.path.sep + 'q_' + project_name + '.xlsx'
-        
-        cond_sanitario = True
-        
-        if cond_sanitario:
-            tabulacion_caudales_sanitarios = r"""
-                \section{Tabulación de resultados de caudales}
-                    \subsection{Resumen de  caudales de infiltraccion, conexiones ilicitas, sanitario mayorado y caudal de diseño sanitario de redes y plantas de tratamiento}
-                    resumencaudalessanitariosredes
-                    resumencaudalessanitariosptar
-                    \subsection{Resultados de  area, poblacion, dotacion, densidad, coeficiente de retorno}
-                    tablaareacaudalsanitario
-                    \newpage
-                    \subsection{Resultados de  caudal sanitario, coeficiente de mayoracion y caudal sanitario mayorado}
-                    tablacaudalsanitarios
-                    \newpage
-                    \subsection{Resultados de  caudal  de infiltracción , material de tuberia, nivel freatico, coeficiente de infiltraccion}
-                    tablacaudalinfiltraccion
-                    \newpage
-                    \subsection{Resultados de  caudal  de conexiones ilicitas }
-                    tablacaudalilicitas
-                    \newpage
-                    \subsection{Resultados de  caudales de infiltraccion, conexiones ilicitas, sanitario mayorado y caudal de diseño sanitario}
-                    tablacaudaldiseno
-                    \newpage
-            
-            """
-            
-            dtype_dict = {
-                'pz': str,
-                'densidad': float,
-                'dotacion': int,
-                'coeficiente_retorno': float,
-                'area': float,
-                'poblacion_parcial': int,
-                'poblacion_acumulada': int,
-                'q_san_parcial': float,
-                'q_san_accu': float,
-                'M': float,
-                'q_san_mayorado': float,
-                'L_area_Km': float,
-                'L_redes_Kmm': float,
-                'slope': float,
-                'material': str,
-                'tipo_material':str,
-                'nivel_freatico':str,
-                'q_inf_L_Km': float,
-                'q_inf': float,
-                'q_ilicito': float,
-                'q_san': float,
-                'outfall': str
-            }
-            latex_caudal_sanitario = pd.read_excel(san_q_path, dtype=dtype_dict)
-            latex_caudal_sanitario['q_san'] = latex_caudal_sanitario['q_san'].round(3)
-            latex_caudal_sanitario['q_diseño'] = latex_caudal_sanitario['q_san'].round(3).copy()
-            latex_caudal_sanitario['q_ptar_diseño'] = latex_caudal_sanitario['q_san_parcial'].round(3).copy() + latex_caudal_sanitario['q_inf'].round(3).copy()
-            
-            # Dividir en tablas
-            cols_area_sanitario = [
-                'pz', 'densidad', 'dotacion', 'coeficiente_retorno',
-                'area', 'poblacion_parcial'
-            ]
-            
-            cols_q_sanitario = [
-                'pz', 'q_san_parcial', 'q_san_accu', 'M', 'q_san_mayorado', 'outfall'
-            ]
-            
-            cols_q_infiltraccion = [
-                'pz',
-                'L_area_Km',  'L_redes_Km', 'tipo_material', 'nivel_freatico',
-                'q_inf_L_Km', 'q_inf', 'outfall'
-            ]
-            
-            cols_q_iliictas = [
-                'pz', 'poblacion_parcial','q_ilicito_L_hab_dia',
-                'q_ilicito', 'outfall'
-            ]
-            
-            cols_diseno_sanitario = [
-                'pz', 'q_inf', 'q_ilicito', 'q_san_mayorado',  'q_diseño', 'outfall'
-            ]
-        
-            # -----------------------------------------------------------------------
-            float_format_sanit = lambda x: f"{x:.3f}" if isinstance(x, float) else f"{x:.0f}"
-        
-            latex_area_sanitario_resultados = (
-                latex_caudal_sanitario[cols_area_sanitario]
-                .to_latex(longtable=True,
-                          caption=" Area, poblacion, dotacion, densidad, coeficiente de retorno",
-                          label="tab:parametrosbasicosareasanitario",
-                          index=False, position="H",
-                          float_format=float_format_sanit,
-                          column_format='c' * len(cols_area_sanitario),
-                          escape=False)
-                
-            )
-            
-            latex_q_sanitario_resultados = (
-                latex_caudal_sanitario[cols_q_sanitario]
-                .to_latex(longtable=True,
-                          caption="Caudales sanitarios parciales y acumulados  [L/s]",
-                          label="tab:caudalessanitarios",
-                          index=False, position="H",
-                          float_format=float_format_sanit,
-                          column_format='c' * len(cols_q_sanitario),
-                          escape=False)
-        
-            )
-            
-            latex_infiltracion_sanitario_resultados = (
-                latex_caudal_sanitario[cols_q_infiltraccion]
-                .to_latex(longtable=True,
-                          caption="Caudales por infiltracion  [L/s]",
-                          label="tab:infiltracionsanit",
-                          index=False, position="H",
-                          float_format=float_format_sanit,
-                          column_format='c' * len(cols_q_infiltraccion),
-                          escape=False)
-        
-            )
-            
-            latex_ilicito_sanitario_resultados = (
-                latex_caudal_sanitario[cols_q_iliictas]
-                .to_latex(longtable=True,
-                          caption="Caudales por conexiones ilicitas  [L/s]",
-                          label="tab:ilicitossanit",
-                          index=False, position="H",
-                          float_format=float_format_sanit,
-                          column_format='c' * len(cols_q_iliictas),
-                          escape=False)
-        
-            )
-            
-            latex_diseno_sanitario_resultados = (
-                latex_caudal_sanitario[cols_diseno_sanitario]
-                .to_latex(longtable=True,
-                          caption="Caudal de diseno por descarga [L/s]",
-                          label="tab:disenototalsanit",
-                          index=False, position="H",
-                          float_format=lambda x: f"{x:.4f}" if isinstance(x, float) else f"{x:.0f}",
-                          column_format='c' * len(cols_diseno_sanitario),
-                          escape=False)
-        
-            )
-            
-            
-            # resumen caudales redes
-            resumen = latex_caudal_sanitario.groupby('outfall').agg({
-                # Área total
-                'area': 'sum',
-                
-                # Densidad ponderada por área
-                'densidad': lambda x: np.average(x, weights=latex_caudal_sanitario.loc[x.index, 'area']) if latex_caudal_sanitario.loc[x.index, 'area'].sum() > 0 else 0,
-                
-                # Dotación ponderada por área
-                'dotacion': lambda x: np.average(x, weights=latex_caudal_sanitario.loc[x.index, 'area']) if latex_caudal_sanitario.loc[x.index, 'area'].sum() > 0 else 0,
-                
-                # Caudales - todos son sumatoria
-                'q_inf': 'sum',           # Sumar infiltración
-                'q_ilicito': 'sum',       # Sumar ilícitas
-                'q_san_mayorado': 'sum',  # Sumar caudal mayorado
-                'q_san': 'sum'            # Sumar caudal de diseño total
-            }).round(6)
-            
-            # Renombrar columnas
-            resumen.columns = [
-                'area',
-                'densidad',
-                'dotacion',
-                'q_infiltracion',
-                'q_ilicitas',
-                'q_san_mayorado',
-                'q_diseño'
-            ]
-            
-            # Resetear índice para que outfall sea una columna
-            df_resumen = resumen.reset_index()
-            
-            # Generar LaTeX
-            latex_table_resumen_sanitario = df_resumen.to_latex(
-                  longtable=True,
-                  caption="Resumen de caudales sanitarios para redes de alcantarillado [L/s]",
-                  label="resumencaudalessanitariosredes",
-                  index=False, position="H",
-                  float_format=float_format_sanit,
-                  column_format='c' * len(df_resumen.columns),
-                  escape=False
-            )
-            
-            
-            #resumen caudales planta
-            resumen = latex_caudal_sanitario.groupby('outfall').agg({
-                # Área total
-                'area': 'sum',
-                
-                # Densidad ponderada por área
-                'densidad': lambda x: np.average(x, weights=latex_caudal_sanitario.loc[x.index, 'area']) if latex_caudal_sanitario.loc[x.index, 'area'].sum() > 0 else 0,
-                
-                # Dotación ponderada por área
-                'dotacion': lambda x: np.average(x, weights=latex_caudal_sanitario.loc[x.index, 'area']) if latex_caudal_sanitario.loc[x.index, 'area'].sum() > 0 else 0,
-                
-                # Caudales - todos son sumatoria
-                'poblacion_parcial': 'sum',
-                'q_inf': 'sum',           # Sumar infiltración
-                'q_san_parcial': 'sum',
-                'q_ptar_diseño': 'sum'            # Sumar caudal de diseño total
-            }).round(6)
-            
-            # Renombrar columnas
-            resumen.columns = [
-                'area',
-                'densidad',
-                'dotacion',
-                'poblacion',
-                'q_infiltracion',
-                'q_sanitario',
-                'q_diseño_ptar'
-            ]
-            
-            # Resetear índice para que outfall sea una columna
-            df_resumen = resumen.reset_index()
-            
-            # Generar LaTeX
-            latex_table_resumen_sanitario_ptar = df_resumen.to_latex(
-                  longtable=True,
-                  caption="Resumen de caudales sanitarios para plantas de tratamiento [L/s]",
-                  label="resumencaudalessanitariosptar",
-                  index=False, position="H",
-                  float_format=float_format_sanit,
-                  column_format='c' * len(df_resumen.columns),
-                  escape=False
-            )
-            
-            
-            tabulacion_caudales_sanitarios = tabulacion_caudales_sanitarios.replace("resumencaudalessanitariosredes", latex_table_resumen_sanitario)
-            tabulacion_caudales_sanitarios = tabulacion_caudales_sanitarios.replace("resumencaudalessanitariosptar", latex_table_resumen_sanitario_ptar)
-            tabulacion_caudales_sanitarios = tabulacion_caudales_sanitarios.replace("tablaareacaudalsanitario", latex_area_sanitario_resultados)
-            tabulacion_caudales_sanitarios = tabulacion_caudales_sanitarios.replace("tablacaudalsanitarios", latex_q_sanitario_resultados)
-            tabulacion_caudales_sanitarios = tabulacion_caudales_sanitarios.replace("tablacaudalinfiltraccion", latex_infiltracion_sanitario_resultados)
-            tabulacion_caudales_sanitarios = tabulacion_caudales_sanitarios.replace("tablacaudalilicitas", latex_ilicito_sanitario_resultados)
-            tabulacion_caudales_sanitarios = tabulacion_caudales_sanitarios.replace("tablacaudaldiseno", latex_diseno_sanitario_resultados)
-            
-            tabulacion_caudales_sanitarios = tabulacion_caudales_sanitarios.replace("Continued on next page", "Continua en la siguiente página").replace("_", "\\_").replace("%", "\\%")
-            latex_source = latex_source.replace("tabulacionresultadossanitario", tabulacion_caudales_sanitarios)
-            
-        else:
-            latex_source = latex_source.replace("tablaareacaudalessanitarios", "")
-            
-
-        # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        
-        
-        cond_suds = False
-        if cond_suds:
-            section_SUDS = r"""
-            
-            \newpage
-            \chapter{Sistemas Urbanos de Drenaje Sostenible (SUDS)}
-            \thispagestyle{fancy}
-
-            
-            
-            \section{Funciones básicas de los SUDS}
-            El objetivo de los SUDS es la reintroducción de los componentes del ciclo del agua
-            del proceso lluvia-escorrentía natural al medio urbano, en el marco conceptual
-            descrito en la  Tabla \ref{tab:funciones-SUDS}, considerando que es necesario que la intervención se integre
-            con los espacios públicos.
-            
-            \begin{scriptsize}
-            \begin{table}[H]
-            \small
-            \centering
-            \caption{Descripción de etapas en el flujo SUDS}
-            \label{tab:flujo_suds}
-            \begin{tabular}{p{3cm}p{11cm}}
-            \toprule
-            \textbf{Etapa} & \textbf{Descripción} \\
-            \midrule
-            \textbf{Filtración} &
-            Eliminación de partículas, sedimentos y contaminantes disueltos presentes en la escorrentía mediante medios filtrantes como superficies verdes,
-            pavimentos permeables o materiales granulares.
-            Este proceso reduce la carga de sólidos en suspensión y de arrastre \\[0.2em]
-            
-            \textbf{Detención} &
-            Almacenamiento temporal del agua de lluvia para reducir y desfasar el caudal maxino mitigando el riesgo de inundaciones  aguas abajo.
-            El agua se libera de manera controlada, protegiendo los sistemas de drenaje y reduciendo la erosión en cauces naturales. \\[0.2em]
-            
-            \textbf{Tratamiento} &
-            Mejora de la calidad del agua mediante la remoción de contaminantes, como metales pesados, nutrientes  y patógenos, a través de procesos naturales como la sedimentación,
-             y  filtración biológica . Este proceso ocurre en sistemas como humedales artificiales o estanques \\[0.2em]
-            
-            \textbf{Retención} &
-            Almacenamiento prolongado (> 24 horas) del agua de lluvia en el sitio para promover su infiltración al subsuelo o su evaporación, reduciendo el volumen de escorrentía que
-            producido.
-            Se emplean sistemas como estanques de retención,
-             humedales artificiales o depósitos subterráneos, contribuyendoa la disminucion de caudales maximos. \\[0.2em]
-            
-            \textbf{Infiltración} &
-            Facilitación de la recarga de acuíferos y reducción del volumen de escorrentía superficial mediante la percolación del agua al subsuelo. Se utilizan estructuras como
-            zanjas de infiltración, pozos de infiltración,
-            pavimentos permeables y alcorques estructurales. \\
-            \bottomrule
-            \label{tab:funciones-SUDS}
-            \end{tabular}
-            \end{table}
-            \end{scriptsize}
-            
-            
-            Los SUDS son un conjunto de técnicas que reproducen los procesos hidrológicos
-            naturales, y que complementan al drenaje tradicional para la gestión de las escorrentías.
-            Existen varias formas de clasificar los SUDS, pudiendo hacerse según su función
-            principal, el tipo de actuación, el tipo de sistema empleado o su lugar de aplicación,
-            como se muestra en la \ref{fig:implementacion-SUDS}.
-            
-            
-            \begin{center}
-            \captionof{figure}{Proceso de implementación de SUDS }
-            \begin{tikzpicture}[
-                % Usamos una fuente más pequeña:
-                font=\footnotesize\sffamily,
-                % Ajustamos el grosor de línea:
-                line width=0.7pt,
-                % Controlamos la distancia por defecto entre nodos:
-                node distance=1cm,
-                % Flechas con estilo de triángulo:
-                >=Stealth,
-                arrowstyle/.style={-{Triangle[angle=60:2pt 3]}, thick},
-                % Estilo de cada "etapa":
-                stage/.style={
-                    rectangle,
-                    rounded corners,
-                    draw=black,
-                    fill=blue!10,
-                    minimum width=2.2cm,
-                    minimum height=1.0cm,
-                    text width=2.2cm,
-                    align=center
-                }
-            ]
-            
-            % -- Nodos (etapas) en horizontal --
-            \node[stage] (filt) {%
-              \textbf{Filtración}\\
-              \footnotesize Remoción\\ de partículas
-            };
-            
-            \node[stage, right=of filt] (det) {%
-              \textbf{Detención}\\
-              \footnotesize Almacenar\\ temporalmente
-            };
-            
-            \node[stage, right=of det] (trat) {%
-              \textbf{Tratamiento}\\
-              \footnotesize Mejora de\\ calidad
-            };
-            
-            \node[stage, right=of trat] (reten) {%
-              \textbf{Retención}\\
-              \footnotesize Control\\ de caudal
-            };
-            
-            \node[stage, right=of reten] (inf) {%
-              \textbf{Infiltración}\\
-              \footnotesize Recarga\\ subterránea
-            };
-            
-            % -- Flechas --
-            \draw[arrowstyle] (filt.east) -- (det.west);
-            \draw[arrowstyle] (det.east) -- (trat.west);
-            \draw[arrowstyle] (trat.east) -- (reten.west);
-            \draw[arrowstyle] (reten.east) -- (inf.west);
-            
-            \label{fig:implementacion-SUDS}
-            \end{tikzpicture}
-            \end{center}
-            
-            
-            
-            
-            
-            
-            \begin{figure}[H]
-            \centering
-            \resizebox{0.9\textwidth}{!}{ % Scale to 90% of text width for better centering
-            \begin{tabular}{>{\centering\arraybackslash}m{1cm} >{\raggedright\arraybackslash}m{2.8cm} >{\centering\arraybackslash}m{2cm} >{\centering\arraybackslash}m{2cm} >{\centering\arraybackslash}m{2cm} >{\centering\arraybackslash}m{2cm} >{\centering\arraybackslash}m{2cm}}
-            \toprule
-            \multicolumn{2}{c}{\textbf{Tipología SUDS}}
-              & \textbf{Filtración}
-              & \textbf{Detención}
-              & \textbf{Tratamiento}
-              & \textbf{Retención}
-              & \textbf{Infiltración} \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/cubiertas_vegetadas.png}\end{adjustbox}
-            & Cubiertas vegetadas
-            &
-            & \cellcolor{lightgreen}S
-            &
-            & \cellcolor{lightblue}P
-            &
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/parterres_inundables.png}\end{adjustbox}
-            & Parterres inundables
-            &
-            &
-            & \cellcolor{lightblue}P
-            & \cellcolor{lightgreen}S
-            &
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/detencion_infiltraccion.png}\end{adjustbox} % Corrected spelling
-            & Detención infiltración
-            & \cellcolor{lightblue}P
-            &
-            &
-            & \cellcolor{lightgreen}S
-            &
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/cunetas_verdes.png}\end{adjustbox}
-            & Cunetas vegetadas
-            &
-            & \cellcolor{lightblue}P
-            &
-            & \cellcolor{lightgreen}S
-            &
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/alcorques_estructurales.png}\end{adjustbox}
-            & Alcorques estructurales
-            & \cellcolor{lightgreen}S
-            &
-            &
-            &
-            & \cellcolor{lightblue}P
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/pavimento_permeable.png}\end{adjustbox}
-            & Pavimento permeable
-            & \cellcolor{lightblue}P
-            &
-            &
-            & \cellcolor{lightgreen}S
-            &
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/drenes_filtrantes.png}\end{adjustbox}
-            & Drenes filtrantes
-            & \cellcolor{lightblue}P
-            & \cellcolor{lightgreen}S
-            &
-            &
-            &
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/pozo_infiltraccion.png}\end{adjustbox} % Corrected spelling
-            & Pozo infiltración
-            & \cellcolor{lightgreen}S
-            &
-            &
-            & \cellcolor{lightblue}P
-            &
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/deposito_subterraneo.png}\end{adjustbox}
-            & Depósito subterráneo
-            &
-            & \cellcolor{lightgreen}S
-            &
-            & \cellcolor{lightblue}P
-            &
-            \\
-            \midrule
-            \begin{adjustbox}{valign=c}\includegraphics[width=0.8cm]{generated_images/humedal_artificial.png}\end{adjustbox}
-            & Humedal artificial
-            & \cellcolor{lightgreen}S
-            & \cellcolor{lightblue}P
-            &
-            &
-            &
-            \\
-            \bottomrule
-            \end{tabular}
-            }
-            \caption{Tipología de SUDS. Note: P = función primaria, S = función secundaria.}
-            \label{fig:tipologia_suds}
-            \end{figure}
-            
-            
-            
-            \subsubsection{Medidas no estructurales o control en origen}
-            Las medidas no estructurales son intervenciones de bajo costo y alto impacto que se aplican directamente en la superficie de la cuenca para gestionar la escorrentía. Incluyen
-             pavimentos permeables, almacenamiento de agua en cubiertas y techos, cunetas verdes, etc. Se usan con el fin de infiltrar o retardar la escorrentía antes de que alcance la
-              red de alcantarillado existente o cauces cercanos. De esta forma, permiten reducir el caudal maximo
-              del hidrograma de escorrentıa y aumentar la infiltracion del agua pluvial en el terreno.
-            
-            
-            \subsubsection{Medidas estructurales o control de vertidos aguas abajo}
-            Son intervenciones de mayor inversión que se aplican directamente en la red de alcantarillado. Incluyen tanques o túneles de retención para las primeras aguas de lluvia
-            (first flush) o  aliviaderos. Su objetivo es gestionar el caudal y la contaminación una vez que el agua ha ingresado en el sistema de alcantarillado, mitigando vertidos de
-            contaminantes e inundaciones urbanas.
-            
-            
-            
-            
-            
-            
-            \newpage
-            \section{Procesos de detención}
-            \subsection{Depósito de detención}
-            En el contexto de los Sistemas Urbanos de Drenaje Sostenible (SUDS), detención se refiere al almacenamiento temporal de las escorrentías de lluvia para controlar la velocidad y caudal de salida del agua. Es decir, consiste en ralentizar de forma
-            temporal el flujo superficial acumulando el agua por unas horas y liberándola gradualmente. Un deposito o estanque de detención suele estar seco en condiciones normales (no mantiene agua permanentemente) y sólo se llena durante y después de eventos de
-            lluvia intensos. Su función principal es laminar o atenuar las puntas de caudal de tormenta, reduciendo los picos de flujo que llegan al alcantarillado o cauces naturales y, con ello, disminuir el riesgo de inundaciones y erosión de cauces aguas abajo. Durante este almacenamiento
-            breve también se facilita la sedimentación de sólidos suspendidos y contaminantes gruesos, mejorando parcialmente la calidad del agua antes de su descarga. La detención en SUDS imita el comportamiento natural del terreno mediante infraestructuras para retener momentáneamente el agua de lluvia y luego evacuarla de forma controlada.
-            
-            \subsubsection{Tipos de infraestructura de detencion}
-            
-            \textbf{Estanques o depresiones  de detención}: Depresiones en el terreno similares a pequeñas lagunas secas. Durante una lluvia fuerte, estas depresiones almacenan el excedente de escorrentía y la van
-            descargando lentamente mediante controles de nivel y  reboses que generan una salida controlada que limita el caudal. Suelen construirse en superficie sobre suelos impermeables y se vacían por completo
-            dentro de las 6- 24 horas posteriores al evento, quedando secos hasta la próxima tormenta.
-            
-            
-            \textbf{Zanjas de detención/infiltración)}: Son canales poco profundos longitudinales paralelos a vías o áreas impermeables, diseñadas para ralentizar el escurrimiento y favorecer su infiltración parcial en el terreno.
-            Están rellenas de material granular o vegetación que ayuda a retener el agua momentáneamente y filtrar sedimentos. Durante la lluvia, el agua se acumula dentro de la zanja y es infiltrada gradualmente
-            al subsuelo o es entregada lentamente hacia la red de alcantarillado existente. Estas zanjas demoran la llegada del caudal a la red, y ademas de infiltrar parcialmente el volumen captado,
-            
-            \textbf{Cámaras de detención subterráneas (tanques de tormenta)}: Estructuras cerradas bajo tierra que almacenan temporalmente el agua de lluvia y luego la liberan de forma controlada al alcantarillado o cauce.
-            Se usan en entornos urbanos densos donde no se dispone de espacio en superficie. Durante una tormenta, estas cámaras acumulan y regulan un volumen de agua  en calles, parques o estacionamientos.
-            
-            
-            \subsubsection{Tipologia de detenciones}
-            
-            \begin{enumerate}[label=\alph*)]
-            
-            \item Retención en lınea (o en serie). Son aquellos por los que siempre pasa el agua procedente
-             de aguas arriba del sistema, dondel flujo sigue la direccion logica del colector.
-            
-            \item Retención fuera de lınea (en paralelo). Entran en funcionamiento cuando en un punto prefijado de la red se supere un  umbral de caudal. En ese instante parte del agua es
-             conducida al deposito fuera de lınea. Despues del evento de lluvia, esta cantidad de agua se dirige, de nuevo, a la red de alcantarillado situada aguas abajo.
-            
-            \end{enumerate}
-            
-             La eleccion de una tipologıa u otra depende de la importancia volumen a retener y la disposicion de area.
-             
-             
-            
-            
-            \newpage
-            \subsubsection{Consideraciones de diseño y aplicación en entornos urbanos}
-            
-            Para que un sistema de detención funcione adecuadamente en áreas urbanas, es necesario
-            tener en cuenta diversos aspectos:
-            
-            \begin{enumerate}[label=\alph*)]
-            
-            \item \textbf{Dimensionamiento de volumen:} El diseño de un sistema de detención (o retención) debe mitigar los efectos de la urbanizacion
-            sobre la hidrología natural de la cuenca. La diferencia de volumen y caudal generada por la impermeabilización
-            (en comparación con el estado natural) sea mitigada por medio de la detencíon  para reestablecer la dinámica
-            hidrológica original. Al retener temporalmente  volúmenes de agua
-              durante tormentas, los sistemas de detención laminan los caudales maximos que llegan a los
-              cauces o redes de alcantarillados nuevas o existentes, evitando desbordamientos, inundaciones y erosion de cauce.
-            
-            
-              \item \textbf{Control de salida, rebose e infiltracción:}   Son mecanismos para laminar el hidrograma de escorrentía urbanizada y aproximarlo al régimen hidrológico natural.
-              Se regula el caudal de salida a través de orificios o vertederos calibrados, de manera que el caudal de descarga no supere la capacidad de la red o cauces aguas abajo.
-              
-            
-              \item \textbf{Mantenimiento y accesibilidad:} Las infraestructuras de detención acumulan
-              sedimentos y basuras con el tiempo, por lo que deben diseñarse rampas, caminos de servicio
-              o bocas de acceso para limpieza. En estanques abiertos, se recomiendan taludes (3:1) para
-              facilitar el mantenimiento y la seguridad.
-            
-              \item \textbf{Consideraciones de seguridad :} En áreas de retención de agua con tránsito de personas, se instalan barreras físicas para restringir accesos no supervisados,
-               en especial en zonas de llenado inicial. Se habilitan accesos y salidas de emergencia señalizadas, con previsiones para usuarios con movilidad reducida.
-               Se define un calado máximo de 0.5m (riesgo aceptable para niños y ancianos)y se incorporan reboses redundantes, conectados a la red de alcantarillado en al menos dos puntos.
-
-              \item \textbf{Espacio, estética y co-uso del terreno:} En ciudades con poco espacio
-              disponible, se buscan soluciones de detención que puedan utilizarse para otros fines
-              cuando no llueve (parques, zonas deportivas).
-            
-              \item \textbf{Ubicación en el sistema de drenaje:} La ubicación de la infraestructura de detención se define segun la distribución de la escorrentía y la disponibilidad de espacio. Se coloca cerca de la fuente
-              de generación para reducir los volúmenes que avanzan hacia tramos aguas abajo de la red de alcantarillado o cauces. Cuando no es factible, puede situarse en puntos de consolidación
-               de flujo con el fin de controlar descargas en zonas críticas y proteger áreas propensas a inundaciones.
-            
-            \end{enumerate}
-            
-            
-            
-            
-            %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-            \subsubsection{Proceso de dimensionamiento de una detencion}
-
-            \begin{figure}[H]
-            \centering
-            \resizebox{0.85\textwidth}{!}{ % Parámetro de escala ajustable (por ejemplo, 0.85)
-            \begin{tikzpicture}[
-                font=\normalsize\sffamily, % Fuente para legibilidad
-                line width=0.8pt,
-                >=Stealth,
-                arrowstyle/.style={-{Triangle[angle=60:2pt 3]}, thick},
-                decision/.style={
-                    ellipse,
-                    draw,
-                    fill=cyan!20,
-                    minimum width=2.5cm,
-                    minimum height=1.5cm,
-                    align=center
-                },
-                process/.style={
-                    rectangle,
-                    rounded corners,
-                    draw,
-                    fill=white,
-                    minimum width=2.0cm,
-                    minimum height=1cm,
-                    align=center
-                },
-                node distance=2.cm % Distancia vertical/horizontal por defecto
-            ]
-            
-            % -- NUEVO PASO (arriba) para estimar escorrentía pre- y post-urbanización
-            \node[process] (calc_esc) {escorrentía natural [en]  y escorrentía urbanizada [eu] \\ calcular volumen de escorrentía a almacenar (Ve =  eu -en)};
-            
-            % -- Pasos principales en columna central --
-            
-            \node[process, below of=calc_esc] (vol_suds) {determinar volumen de almacenamiento en SUDS (Vsuds)};
-            \node[decision, below of=vol_suds] (comp_vol) {Vsuds $\geq$ Ve?};
-            \node[process, below of=comp_vol] (tiempo_vac) {evaluar tiempo de vaciado (6--24 horas)};
-            \node[decision, below of=tiempo_vac] (tiempo_ok) {tiempo de vaciado $\leq$ 24 horas?};
-            \node[process, below of=tiempo_ok] (dim_rebose) {dimensionar sistema de rebose o infiltraccion};
-            \node[process, below of=dim_rebose] (model_red) {modelar capacidad de la red pública};
-            \node[decision, below of=model_red] (red_ok) {capacidad suficiente  \\y sin problemas hidráulicos?};
-            \node[process, below of=red_ok] (suds_dim) {SUDS dimensionado};
-            
-            % -- Nodos "No" a la derecha --
-            \node[process, right=2.2cm of comp_vol] (aum_vol) {aumentar volumen\\ SUDS};
-            \node[process, right=1.cm of tiempo_ok] (mod_dims) {modificar dimensiones \\ SUDS o rebose};
-            \node[process, right=3.2cm of red_ok] (reiterar) {reiterar dimensionamiento \\ (ajustar Vsuds)};
-            
-            
-            % -- Flechas principales (verticales, "Sí") --
-            
-            \draw[arrowstyle] (calc_esc) -- (vol_suds);
-            \draw[arrowstyle] (vol_suds) -- (comp_vol);
-            \draw[arrowstyle] (comp_vol) -- node[midway, right]{Sí} (tiempo_vac);
-            \draw[arrowstyle] (tiempo_vac) -- (tiempo_ok);
-            \draw[arrowstyle] (tiempo_ok) -- node[midway, right]{Sí} (dim_rebose);
-            \draw[arrowstyle] (dim_rebose) -- (model_red);
-            \draw[arrowstyle] (model_red) -- (red_ok);
-            \draw[arrowstyle] (red_ok) -- node[midway, right]{Sí} (suds_dim);
-            
-            % -- Flechas "No" a la derecha --
-            \draw[arrowstyle] (comp_vol.east) -- node[midway, above]{No} (aum_vol.west);
-            \draw[arrowstyle] (aum_vol.north) |- (vol_suds.east);
-            
-            \draw[arrowstyle] (tiempo_ok.east) -- node[midway, above]{No} (mod_dims.west);
-            \draw[arrowstyle] (mod_dims.south) |- (dim_rebose.east);
-            
-            \draw[arrowstyle] (red_ok.east) -- node[midway, above]{No} (reiterar.west);
-            \draw[arrowstyle] (reiterar.north) |- (vol_suds.east);
-            
-            \end{tikzpicture}
-            }
-            \caption{Proceso de dimensionamiento de SUDS}
-            \label{fig:flujo_dimensionamiento}
-            \end{figure}
-            
-            
-            
-            El diagrama de flujo presenta el proceso de dimensionamiento de una retencion para gestionar la escorrentía en áreas urbanizadas. Inicia con la estimación de la escorrentía natural y urbanizada,
-            calculando el volumen a almacenar (Ve) como la diferencia entre ambas (eu - en). Sin embargo, este volumen no depende únicamente de esta diferencia, también se ve influenciado por la
-            capacidad hidraulica de las redes de drenaje existentes, restricciones economicas o ambientales; lo razonable es que Ve mantenga la dinámica de la escorrentia natural y mitigue el cambio de uso de suelo.
-            
-            Posteriormente, se determina el volumen en SUDS (Vsuds), evaluando si es suficiente comparado con Ve, y se ajusta si es necesario. Se verifica el tiempo de vaciado (6-24 horas)
-            y se dimensionan sistemas de rebose o infiltración, modelando la capacidad de la red pública. Si esta capacidad es insuficiente, se reitera el dimensionamiento.
-            
-            
-            \newpage
-            \section{Resultados de la detencion en el proyecto}
-            En la Figura \ref{fig:caudal-suds} se muestran los diferentes caudales obtenidos para la conexión a la calle del Perejil en el proyecto. El caudal en estado natural se estima en 40,95 L/s, mientras que el caudal en
-            condiciones urbanizadas alcanza los 72,41 L/s. Asi mismo, al implementar un jardín de lluvia (para detención), el caudal máximo desciende a 43,84 L/s, un valor muy cercano al régimen natural del área intervenida.
-            
-            Además, en la misma figura se presenta la serie temporal de la detención de volumen y de la profundidad hidráulica en el jardín de lluvia. Se observa que la profundidad máxima estimada es de 50 cm
-            (en el momento en que entran en funcionamiento los reboses) y que el volumen máximo de retención asciende a 30,5 m\textsuperscript{3}. La retención se prolonga durante 92 minutos, lo que retrasa el
-            pico del hidrograma de salida en 8 minutos con respecto al hidrograma máximo del área urbanizada.
-
-            
-            
-            \vspace{-3mm}
-            \begin{figure}[H]
-                \setlength{\belowcaptionskip}{-10pt}
-                \centering
-                % Subfigura (a)
-                \subfigure[ caudales (natural, urbanizado y con detención)]{
-                    \includegraphics[height=0.6\espacioRestante, width=0.95\textwidth, keepaspectratio]{C:/Users/chelo/OneDrive/SANTA_ISABEL/PROYECTO_MUROS_MUTUALISTA/04_RESULTADOS/02_DOCUMENTO/generated_images/00_caudal.png}
-                }
-                \hfill
-                % Subfigura (b)
-                \subfigure[profundidad y volumen en el jardín de lluvia]{
-                    \includegraphics[height=0.6\espacioRestante, width=0.95\textwidth, keepaspectratio]{C:/Users/chelo/OneDrive/SANTA_ISABEL/PROYECTO_MUROS_MUTUALISTA/04_RESULTADOS/02_DOCUMENTO/generated_images/01_profunidad_volumen.png}
-                }
-                \caption{(a) Serie de tiempo de los caudales natural, urbanizado y con detención; (b) profundidad y el volumen retenido en el jardín de lluvia.}
-                \label{fig:caudal-suds}
-            \end{figure}
-
-
-            
-            
-    
-            """
-            latex_source = latex_source.replace("seccion-SUDS", section_SUDS)
-
-            # ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-            series_suds = pd.read_excel(r"C:\Users\chelo\OneDrive\SANTA_ISABEL\PROYECTO_MUROS_MUTUALISTA\05_FIGS\00_retencion_caudal.xlsx")
-            series_suds_latex = series_suds.to_latex(
-                longtable=True,
-                caption="serie de tiempo de la detencion para el proyecto",
-                label="tab:series-suds-ramales",
-                index=False,
-                position="H",
-                float_format=lambda x: "{:.3f}".format(x)
-                if isinstance(x, (float, int))
-                else x,  # column_format='cccc',  # Specify column alignment (c for centered, adjust as needed: c, l, r)
-                escape=False,  # Allow LaTeX special characters if needed (e.g., &)
-            )
-            tabulacion_suds = r"""
-            \newpage
-            \section{Tabulación de resultados SUDS}
-            \subsection{Resultados series de tiempo detencion en jardin de lluvia}
-            serie-tiempo-suds
-            
-            """
-
-            tabulacion_suds = tabulacion_suds.replace("serie-tiempo-suds", series_suds_latex)
-            latex_source = latex_source.replace("tabulacionresultadossuds", tabulacion_suds)
-
-        else:
-            latex_source = latex_source.replace("seccion-SUDS", "")
-
-        # distribuccion areas--------------------------------------------------------------------------------------------------------------------------------------
-        seccion_distribuccion_areas = r"""
-        \subsection{Distribución de áreas de colectores}
-        Las áreas resultantes del alcantarillado typepypiper se muestran en la Figura \ref{fig:distribuccion-areas}. descripccionareaspypiper
-        
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-        \begin{figure}[H]
-          \centering
-          \centerline{\includegraphics[height=0.6\espacioRestante, width=0.95\textwidth, keepaspectratio]{area_aporte_planimetria.png}}
-          \caption{Planimetría: área de aporte typepypiper}\label{fig:distribuccion-areas}
-        \end{figure}
-        
-        La tabla \ref{tab:tab10A} muestra las caracteristicas de caudal y área para cada descarga para el sistema de alcantarillado.
-        tablaresumenareaspypiper
-        """
-
-        try:
-            if os.path.exists(san_q_path):
-                prompt_areas = (
-                """
-                ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin ningún otro formato)
-    
-                formato:
-                'Se identifican {numero_de_areas} áreas de descargas. El área {color_area} tiene una extensión de {area_en_Ha} Ha y descarga en el punto {punto_descarga} con un caudal estimado de {caudal_en_litros_por_segundo} L/s.'
-                
-                PROCEDIMIENTO:
-                
-                Cuenta las filas de la tabla LaTeX (cada fila corresponde a un área) y obtén {numero_de_areas}.
-                
-                Para cada fila extrae:
-                a) {punto_descarga}: valor de la columna outfall.
-                b) {area_en_Ha}: valor de la columna area (respeta el número de decimales tal cual aparece).
-                c) {caudal_en_litros_por_segundo}: valor de la columna q_diseño; si esa columna no existe usa q_san_mayorado.
-                d) {color_area}: toma el color exacto indicado en la leyenda de la imagen; si la leyenda no muestra color para esa fila, omite esa área.
-                
-                Concatena la frase resultante de cada área siguiendo estrictamente el formato indicado, separándolas con un punto y un espacio.
-                
-                No añadas encabezados, saltos de línea ni explicaciones adicionales.
-                
-                IMPORTANTE:
-                
-                Entrega solo UNA respuesta en texto plano
-                
-                No uses markdown ni símbolos especiales
-                
-                No repitas la respuesta
-                
-                No incluyas la palabra “Answer:”
-                
-                Usa exclusivamente los datos numéricos presentes en la tabla LaTeX
-                
-                No inventes números ni colores
-                
-                No agregues información adicional
-                
-                Mantén exactamente la puntuación y el orden del formato
-                
-                No incluyas comentarios finales
-                
-                Te doy un ejemplo:
-                
-                :inicio ejemplo
-                el resumen (en formato latex):
-                                #begin{longtable}[H]{cccccccc}
-                                #caption{Resumen de caudales sanitarios para redes de alcantarillado [L/s]} label{resumencaudalessanitariosredes}
-                                #toprule
-                                #outfall & area & densidad & dotacion & q_infiltracion & q_ilicitas & q_san_mayorado & q_diseño
-                                #midrule
-                                #endfirsthead
-                                #caption[]{Resumen de caudales sanitarios para redes de alcantarillado [L/s]}
-                                #toprule
-                                #outfall & area & densidad & dotacion & q_infiltracion & q_ilicitas & q_san_mayorado & q_diseño
-                                #midrule
-                                #endhead
-                                #midrule
-                                #multicolumn{8}{r}{Continued on next page}
-                                #midrule
-                                #endfoot
-                                #bottomrule
-                                #endlastfoot
-                                #0 & 204.323 & 30.321 & 199.890 & 1.783 & 3.579 & 36.168 & 41.545
-                                #end{longtable}
-                                
-                'Se identifican 1 áreas de descargas. El área azul tiene una extensión de 204.323 Ha y descarga en el punto 0 con un caudal estimado de 41.545 L/s.'
-                
-                IMPORTANTE:
-                - Entrega solo UNA respuesta en texto plano
-                - No uses asteriscos ni markdown
-                - No repitas la respuesta
-                - No incluyas la palabra 'Answer:'
-                - Usa SOLO los datos numéricos del Resumen en formato latex
-                - NO inventes números
-                - Solo identifica los colores de cada numero o descarga
-                - NO agregues información adicional
-                - MANTÉN el formato exacto del texto proporcionado
-                -NO agregues notas o comentario finales
-                
-                Resumen en formato latex:"""
-                +  latex_table_resumen_sanitario
-                )
-                
-                seccion_distribuccion_areas = seccion_distribuccion_areas.replace("tablaresumenareaspypiper", latex_table_resumen_sanitario.replace("_", "\\_").replace("%", "\\%").replace("resumencaudalessanitariosredes", "tab:tab10A"))
-                
-            else:
-                prompt_areas = (
-                    """
-                
-                ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formatting) en este formato exacto:
-                
-                formato:
-                'Se se identifican {numero_de_areas} áreas de descargas. El área {color_area} tiene una extensión de {area_en_Ha} Ha y descarga en el punto {punto_descarga} con un caudal estimado de {caudal_en_litros_por_segundo} L/s.'
-                
-                PROCEDIMIENTO:
-                1. Identifica color del area,  area en Ha y puntos de descarga y caudal en litros por segundo  para cada area que se encuentran en la leyenda de la imagen.
-                2. Rellena el formato provisto con los anteriores datos de forma EXACTA, para cada una de las areas descritas en la leyenda de la imagen.
-                
-                Te doy un ejemplo:
-                
-                :inicio ejemplo
-                el resumen (en formato latex):
-                                    # begin{longtable}[H]{llll}
-                                    # caption{Planimetría: área de aporte typepypiper} label{tab:tab10A}
-                                    # toprule
-                                    # outfall.1 & area & CN & caudal
-                                    # midrule
-                                    # endfirsthead
-                                    # caption[]{Planimetría: área de aporte typepypiper}
-                                    # toprule
-                                    # outfall.1 & area & CN & caudal
-                                    # midrule
-                                    # endhead
-                                    # midrule
-                                    # multicolumn{4}{r}{Continued on next page}
-                                    # midrule
-                                    # endfoot
-                                    # bottomrule
-                                    # endlastfoot
-                                    # E0 & 4.452000 & 79.910000 & 739.150000
-                                    # 8.110000 & 0.510000 & 88.490000 & 73.510000
-                                    # end{longtable}
-                
-                
-                Se identifican 2 areas de descargas. El area azul tiene una extension de 3,9Ha y descargaen el punto0-E0 con una caudal estimado de 739.15 L/s. El area roja tiene una extension de 0,5Ha y descarga  en el punto 1-8.10, con un caudal conducido estimado de 73.51 L/s.
-                fin ejemplo:
-                
-                IMPORTANTE:
-                - Entrega solo UNA respuesta en texto plano
-                - No uses asteriscos ni markdown
-                - No repitas la respuesta
-                - No incluyas la palabra 'Answer:'
-                - Usa SOLO los datos numéricos del Resumen en formato latex
-                - NO inventes números
-                - Solo identifica los colores de cada numero o descarga
-                - NO agregues información adicional
-                - MANTÉN el formato exacto del texto proporcionado
-                -NO agregues notas o comentario finales
-                
-                Resumen en formato latex:"""
-                    + latex_table_resumen_areas
-                )
-                
-                seccion_distribuccion_areas = seccion_distribuccion_areas.replace("tablaresumenareaspypiper", latex_table_resumen_areas)
-            
-            description_area = describer.describe_image(
-                model="qwen2.5vl:latest",
-                image_path=dict_path_figuras["area_aporte_planimetria.png"],
-                prompt=prompt_areas,
-            )
-            description_area = description_area.replace("*", "")
-            seccion_distribuccion_areas = seccion_distribuccion_areas.replace("descripccionareaspypiper", description_area)
-            latex_source = latex_source.replace("seccion-distribuccion-areas", seccion_distribuccion_areas)
-            
-
-        except Exception as e:
-            print(f"Error: {str(e)}")
-
-        # cierra areas--------------------------------------------------------------------------------------------------------------------------------------
-        if "Ramal" in gdf_areas.columns:
-            section_ramal = r"""    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        \newpage
-        \subsection{Cierre de areas de aporte}
-        Las  Figura \ref{fig3ramal} muestra los cierres individuales de las areas de aporte para el sistema de alcantarillado typepypiper.
-        
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-        \begin{figure}[H]
-          \centering
-          \centerline{\includegraphics[height=0.6\espacioRestante, width=0.95\textwidth, keepaspectratio]{area_ramal_planimetria.png}}
-          \caption{Planimetría: Cierre de area de aporte del alcantarillado typepypiper}\label{fig3ramal}
-        \end{figure}
-        
-            """
-            latex_source = latex_source.replace("seccion-area-ramales", section_ramal)
-        else:
-            latex_source = latex_source.replace("seccion-area-ramales", "")
-
-        # estado------------------------------------------------------------------------------------------------------------------------------------------------------
-        seccion_estado_ramales = r"""
-        \subsection{Estado}
-        En la Figura \ref{fig:estado-ramales} se muestra la distribuccion espacial del estado de la tuberia. figuraestadopypiper
-        
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-    
-        \begin{figure}[H]
-          \centering
-          \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{estado_planimetria.png}}
-          \caption{Planimetria del estado del sistema de alcantarillado}\label{fig:estado-ramales}
-        \end{figure}
-        
-        \begin{small}
-        estadotablaresumenpypiper
-        \end{small}
-        
-        """
-
-        estado_resumen = gpd_df.groupby(["D_ext", "Material", "Estado"])["L"].sum().reset_index()
-        estado_resumen.groupby("Material")["L"].sum()
-
-        estado_resumen_latex = generate_tabla_resumen_latex(
-            gpd_df=gpd_df,
-            group_by_list=["D_ext", "Material", "Estado"],
-            sum_by_column="L",
-            caption="Resumen del estado del alcantarillado pluvial segmentado por diámetros",
-            label="tab:estado-ramales",
-            rows_per_page=8,  # Forzar two-column layout para probar
-            column_separator="line",
-        )
-
-        prompt_descripcion_estado = f"""
-        
-        ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formato adicional). Este es el formato que debe seguir:
-        
-        La tabla muestra que el diámetro externo máximo es {{max_diameter}} y el mínimo es {{min_diameter}}, con una longitud total de {{total_length}} metros. Para el material {{material1}}, se utilizan diámetros desde {{min_diameter1}} hasta {{max_diameter1}}, en estados {{states1}}, sumando una longitud de {{length1}} metros. {{connector}}
-        
-        PROCESO:
-        El proceso para analizar la tabla es:
-        1. Identifica los materiales únicos en la tabla.
-        2. Para cada material, calcula el diámetro mínimo y máximo, los estados únicos, y la longitud total.
-        3. Inicia la descripción con el diámetro máximo y mínimo global, y la longitud total global.
-        4. Luego, para cada material, describe el rango de diámetros, los estados, y la longitud total, utilizando conectores como 'Posteriormente,' 'Adicionalmente,' 'Finalmente,' etc., para enlazar las descripciones.
-        5. Rellena el formato provisto con los datos correspondientes de forma ESTRICTA.
-        
-        Este es un ejemplo para que te guíes:
-        Supongamos que la tabla tiene los siguientes datos:
-        - Material: HS, diámetros: 0.200, 0.300, 0.500, estados: existente, longitudes: 182.420, 163.010, 180.290
-        - Material: PEAD, diámetro: 0.200, estado: nuevo, longitud: 209.550
-        - Material: PVC, diámetros: 0.315, 0.440, 0.540, estados: existente, nuevo, longitudes: 107.010, 6.930, 122.730
-        
-        Entonces, la descripción sería:
-        La tabla muestra que el diámetro externo máximo es 0.540 y el mínimo es 0.200, con una longitud total de 972.960 metros. Para el material HS, se utilizan diámetros desde 0.200 hasta 0.500, en estado existente, sumando una longitud de 525.720 metros. Posteriormente, para PEAD, el diámetro es 0.200, en estado nuevo, con una longitud de 209.550 metros. Finalmente, para PVC, los diámetros varían desde 0.315 hasta 0.540, en estados existente y nuevo, y una longitud total de 237.670 metros.
-        
-        IMPORTANTE
-        -Por favor asegurante de sumar bien las longitudes cuando presentes los valores
-        - La respuesta debe estar en español.
-        - Por favor revisa que aunque la redacción esté en su mayoría en español, no se produzcan palabras en inglés u otro idioma.
-        - No te desvíes o modifiques el formato de la respuesta o el ejemplo que te di.
-        - Debes describir todos los materiales presentes en la tabla, sin repetir descripciones.
-        - Entrega solo UNA respuesta en texto plano.
-        - No uses asteriscos ni markdown.
-        - No incluyas en tu respuesta la explicación de tu tren de pensamiento para llegar a la respuesta.
-        - Utiliza palabras como 'posteriormente', 'finalmente', 'adicionalmente', 'en ese mismo sentido', etc., para conectar las ideas.
-        - No repitas la respuesta.
-        - No incluyas la palabra 'Answer:'.
-        - NO inventes números.
-        - NO incluyas la tabla que estás analizando.
-        - NO agregues información adicional.
-        - MANTÉN la lógica del texto proporcionado.
-        
-        La tabla a analizar es: {str(estado_resumen_latex)}
-        La suma de longitudes por material es:{str(estado_resumen.groupby("Material")["L"].sum())}
-        La suma total de alcantarillado:{str(estado_resumen["L"].sum())}
-        """
-        description_estado = describer.describe_number_series(model="llama3:latest", prompt=prompt_descripcion_estado)
-
-        seccion_estado_ramales = seccion_estado_ramales.replace("figuraestadopypiper", description_estado)
-        seccion_estado_ramales = seccion_estado_ramales.replace("estadotablaresumenpypiper", estado_resumen_latex)
-
-        latex_source = latex_source.replace("seccion-estado-ramales", seccion_estado_ramales)
-
-        # metodo constructivo-------------------------------------------------------------------------------------------------------------------------------------
-        if len(gpd_df.loc[gpd_df["metodo_constructivo"] != "existente"]["metodo_constructivo"].unique()) > 1:
-            seccion_metodo_constructivo = r"""
-            \newpage
-            \subsection{Metodo Constructivo}
-            En la Figura \ref{fig3B} se muestra la distribuccion espacial del metodo constructivo para el proyecto de alcantarillado typepypiper. figurametodo_constructivopypiper.
-            
-            % Cálculo del espacio restante en la página
-            \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-            
-            \begin{figure}[H]
-              \centering
-              \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{metodo_constructivo_planimetria.png}}
-              \caption{Planimetría: metodología de construcción para alcantarillado }\label{fig3B}
-            \end{figure}
-            
-            La Tabla \ref{tab:metodoconstructivo} muestra el resumen de los metodos constructivos utilizados en el proyecto.
-            \begin{small}
-            metodo_constructivotablaresumenpypiper
-            \end{small}
-            
-            """
-            metodo_constructivo_resumen = gpd_df[gpd_df["metodo_constructivo"] != "existente"].groupby(["D_ext", "metodo_constructivo"])["L"].sum().reset_index()
-            metodo_constructivo_resumen_latex = generate_tabla_resumen_latex(
-                gpd_df=gpd_df[gpd_df["metodo_constructivo"] != "existente"],
-                group_by_list=["D_ext", "metodo_constructivo"],
-                sum_by_column="L",
-                caption="Resumen del sistema de alcantarillado y su metodo constructivo",
-                label="tab:metodoconstructivo",
-                rows_per_page=8,  # Si es mas de 8 row, entonces forza two row style
-                column_separator="line",
-            )
-
-            metodo_constructivo_resumen_latex = metodo_constructivo_resumen_latex.replace("_", "\\_")
-            lista_metodos_constructivos = [method for method in gpd_df["metodo_constructivo"].unique() if method != "existente"]
-            prompt_metodos_constructivos = """
-                ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formato adicional). Este es el formato que debe seguir:
-                La figura muestra que el proyecto contempla los métodos constructivos: {lista_metodos}. El método {metodo_o_grupo1} indica {descripcion_del_metodo1}.
-                
-                PROCESO:
-                1. Enumera solo los métodos de la lista proporcionada: [zanja abierta, existente]. No incluyas ningún otro método fuera de esta lista, como zanja manual, microtunelación o CIPP.
-                
-                2. Describe cada método constructivo de forma breve y clara, usando únicamente las descripciones exactas de la tabla de métodos que se proporciona abajo. No modifiques ni añadas nada a las descripciones.
-                
-                3. Usa palabras como "posteriormente", "finalmente", "adicionalmente" o "en ese mismo sentido" para conectar las descripciones de los métodos de manera fluida.
-                
-                4. Mantén la lógica del texto y no añadas información extra más allá de lo especificado.
-                
-                IMPORTANTE:
-                -Responde en español.
-                -No te desvíes del formato indicado.
-                -Describe solo los métodos de la lista: [zanja abierta, existente].
-                -No inventes métodos ni descripciones.
-                -Entrega una sola respuesta en texto plano, sin encabezados ni formatos adicionales.
-    
-                Zanja abierta
-                Excavación a cielo abierto con maquinaria, retirando el terreno en todo el tramo de la tubería. Implica cortes de tráfico y escombros, pero agiliza la instalación. Se aplica en zonas amplias o con poca restricción a estructuras cercanas.
-                
-                Zanja manual
-                Excavación a cielo abierto con herramientas manuales, idónea para áreas con acceso limitado a maquinaria o riesgo para edificaciones. Permite mayor control y precisión, aunque demanda más tiempo y mano de obra.
-                
-                Túnel
-                Paso subterráneo construido de forma manual o con equipos de menor escala, minimizando la afectación en superficie.
-                
-                Microtunelación
-                Método sin zanja que emplea una tuneladora de diámetro reducido, guiada desde pozos de trabajo. Coloca la tubería al avanzar y genera escasa perturbación en la vía, siendo apropiado para entornos urbanos de alto tránsito.
-                
-                Perforación horizontal dirigida
-                Técnica sin zanja que perfora y ensancha un conducto guiado desde la superficie, cruzando carreteras o ríos con mínima alteración. Requiere maquinaria especializada y estudios geotécnicos.
-                
-                CIPP (Cured in Place Pipe)
-                Rehabilitación de tuberías sin excavación extensa, introduciendo una manga impregnada con resina que se cura y forma una conducción nueva dentro de la original. Reduce cierres de vía y demoliciones.
-                
-                lista_metodos: """ + str(lista_metodos_constructivos)
-            description_metodos_constructivos = describer.describe_number_series(model="llama3", prompt=prompt_metodos_constructivos)
-
-            seccion_metodo_constructivo = seccion_metodo_constructivo.replace("figurametodo_constructivopypiper", description_metodos_constructivos)
-            seccion_metodo_constructivo = seccion_metodo_constructivo.replace("metodo_constructivotablaresumenpypiper", metodo_constructivo_resumen_latex)
-            seccion_metodo_constructivo = seccion_metodo_constructivo.replace(
-                "metodo_constructivo.png",
-                dict_path_figuras["metodo_constructivo.png"].replace(os.path.sep, "/"),
-            )
-
-            latex_source = latex_source.replace("seccion-metodoconstructivo", seccion_metodo_constructivo)
-        else:
-            latex_source = latex_source.replace("seccion-metodoconstructivo", "")
-
-        # superficie intervenida--------------------------------------------------------------------------------------------------------------------------
-        seccion_superficie_intervenccion = r"""
-        \newpage
-        \subsection{Superficie de intervenccion}
-        La Figura \ref{fig:superficie-intervenccion} muestra la distribuccion espacial de las superficies de intervenccion en el sistema de alcantarillado typepypiper. figurasuperficiepypiper
-        
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-        \vspace{-3mm}
-        \begin{figure}[H]
-        \setlength{\belowcaptionskip}{-10pt}
-        \centering
-         \subfigure[planimetria]{
-         \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{superficie_intervenccion_planimetria.png}}
-         }
-         \subfigure[histograma de ocurrencias]{
-         \centerline{\includegraphics[height=0.30\espacioRestante,keepaspectratio]{superficie_intervenccion_bar_chart.png}}
-         }
-         \caption{Planimetria e histograma de ocurrencias de las superficies de intervenccion}\label{fig:superficie-intervenccion}
-        \end{figure}
-        """
-        latex_source = latex_source.replace("seccion-superficie-intervenccion", seccion_superficie_intervenccion)
-
-        # fases proyecto-----------------------------------------------------------------------------------------------------------------------------------
-        seccion_fases = r"""
-            \newpage
-            \subsection{Fases del proyecto} \label{fases_proyecto}
-            La Figura \ref{fig:fases-ramales} muestra las fases de construccion para el proyecto. De forma general, la fase 0 esta formada por infraestructura existente del sistema de alcantarillado typepypiper y la fases siguientes
-            se refieren al orden de implementacion del proyecto de las redes de alcantarillado.
-            
-            % Cálculo del espacio restante en la página
-            \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-            
-            \begin{figure}[H]
-            \centering
-            \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{fases_planimetria.png}}
-            \caption{Planimetria de las fases de construccion del proyecto del sistema de alcantarillado typepypiper }\label{fig:fases-ramales}
-            \end{figure}
-            
-            Asi mismo, se presenta un resumen de la implemetacion de las fases de construccion del sistema del alcantarillado typepypiper.
-            latex_resumen_fases
-        """
-        latex_source = latex_source.replace("seccion-fases-ramales", seccion_fases)
-
-        # diametro-------------------------------------------------------------------------------------------------------------------------------------------
-        seccion_diametro = r"""
-        \subsection{Diametro}
-        En la Figura \ref{fig:diametro-ramales} se presenta la distribución espacial de las secciones y su cantidad en metros. El diametro minimo es de diametrominimopypiper m
-        y el maximo de diametromaximopypiper m, con el diametro mas usado de diametromodapypiper m.
-        
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-        \vspace{-3mm}
-        \begin{figure}[H]
-        \setlength{\belowcaptionskip}{-10pt}
-        \centering
-             \subfigure[planimetria]{
-             \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{diametro_planimetria.png}}
-             }
-             \subfigure[histograma de ocurrencias]{
-             \centerline{\includegraphics[height=0.30\espacioRestante,keepaspectratio]{diametro_bar_chart.png}}
-             }
-             \caption{Planimetria e histograma de ocurrencias de los diametros del sistema}\label{fig:diametro-ramales}
-        \end{figure}
-        """
-        latex_source = latex_source.replace("seccion-diametro-ramales", seccion_diametro)
-
-        # profundidad---------------------------------------------------------------------------------------------------------------------------------------
-        seccion_profundidad = r"""
-        \newpage
-        \subsection{Profundidad media de instalacion}
-        En la Figura \ref{fig:profundidad-ramales} se presenta la distribución espacial e histograma de frecuencias de la profunidad de instalacion. La profunidad minima y maxima  es de profunidadminimapypiperm y profundidadmaximapypiperm respectivamente.
-        La profunidad mas observado en el sistema es de profundidadmodapypiperm y la profundidad media del sistema es de profundidadmediapypierm.
-    
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-    
-        \vspace{-3mm}
-        \begin{figure}[H]
-        \setlength{\belowcaptionskip}{-10pt}
-        \centering
-             \subfigure[planimetria]{
-             \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{profundidad_media_planimetria.png}}
-             }
-             \subfigure[histograma de frecuencia]{
-             \centerline{\includegraphics[width=0.50\espacioRestante,height=0.50\espacioRestante,keepaspectratio]{profundidad_media_hist.png}}
-             }
-             \caption{Planimetria e histograma de frecuencias de profunidad de instalacion}\label{fig:profundidad-ramales}
-        \end{figure}
-    """
-        latex_source = latex_source.replace("seccion-profundidad-ramales", seccion_profundidad)
-
-        # pendiente------------------------------------------------------------------------------------------------------------------------------------------
-        seccion_pendiente = r"""
-        \newpage
-        \subsection{Pendiente}
-        En la Figura \ref{fig:pendiente-ramales} se presenta la distribución espacial e histograma de frecuencias de la pendiente. El promedio de las pendientes del proyecto se estima en pendientemediapypier \%,
-        con un mínimo y máximo de pendienteminimapypiper \% y pendientemaximapypiper \% respectivamente. La pendiente mas observada en las tuberias del sistema es de pendientemodapypiper \%.
-        
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-        \vspace{-3mm}
-        \begin{figure}[H]
-        \setlength{\belowcaptionskip}{-10pt}
-        \centering
-             \subfigure[planimetria]{
-             \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{pendiente_planimetria.png}}
-             }
-             \subfigure[histograma de frecuencia]{
-             \centerline{\includegraphics[height=0.30\espacioRestante,keepaspectratio]{pendiente_hist.png}}
-             }
-             \caption{Planimetria e histograma de frecuencias de la pendiente del sistema}\label{fig:pendiente-ramales}
-        \end{figure}
-        """
-        latex_source = latex_source.replace("seccion-pendiente-ramales", seccion_pendiente)
-
-        # material---------------------------------------------------------------------------------------------------------------------------------------------
-        seccion_material = r"""
-        \newpage
-        \subsection{Material}
-        La Figura \ref{fig:material-ramales} muestra la distribuccion espacial del material del sistema de alcantarillado typepypiper, figmaterialpypiper
-        
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-        \vspace{-3mm}
-        \begin{figure}[H]
-         \centering
-         \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{material_planimetria.png}}
-         \caption{Planimetria: distribuccion espacial del material  del sistema}\label{fig:material-ramales}
-         \end{figure}
-         
-         La Tabla \ref{tab:material-ramales} muestra el resumen de la longitud de materiales del proyecto.
-        resumen-material-ramales
-        """
-        material_resumen = gpd_df.groupby(["Material", "D_ext"])["L"].sum().reset_index()
-        material_resumen["porcentaje"] = np.round((material_resumen["L"] / material_resumen["L"].sum()) * 100, 2)
-
-        material_resumen_latex = generate_tabla_resumen_latex(
-            gpd_df=gpd_df,
-            group_by_list=["Material"],
-            sum_by_column="L",
-            caption="Resumen del material del sistema de alcantarillado",
-            label="tab:material-ramales",
-            rows_per_page=8,  # Si es mas de 8 row, entonces forza two row style
-            column_separator="line",
-            porcentaje=True,
-        )
-
-        prompt_material = f"""
-        ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formato adicional). Este es el formato que debe seguir:
-        
-        La longitud total de alcantarillado es {{total_length}} metros. Para el material {{material1}}, se registra una longitud de {{length1}} metros. {{connector}}
-        
-        PROCESO:
-        El proceso para analizar la tabla es:
-        1. Identifica los materiales únicos en la tabla.
-        2. Para cada material, calcula la longitud total.
-        3. Inicia la descripción con la longitud total global.
-        4. Luego, para cada material, describe la longitud total, utilizando conectores como 'Asi mismo, ,' 'Adicionalmente,' 'Finalmente,' etc., para enlazar las descripciones.
-        5. Rellena el formato provisto con los datos correspondientes de forma ESTRICTA.
-        
-        Este es un ejemplo para que te guíes:
-        Supongamos que la tabla tiene los siguientes datos:
-        - Material: HS, longitudes: 182.420, 163.010, 180.290
-        - Material: PEAD, longitud: 209.550
-        - Material: PVC, longitudes: 107.010, 6.930, 122.730
-        
-        Entonces, la descripción sería:
-        La longitud total de alcantarillado es 972.960 metros. Para el material HS, se registra una longitud de 525.720 metros. Posteriormente, para PEAD, se registra una longitud de 209.550 metros. Finalmente, para PVC, se registra una longitud de 237.670 metros.
-        
-        IMPORTANTE
-        - No insertes ** en los placeholders, porque esto rompe el formato que te di
-        - Asegúrate de sumar bien las longitudes cuando presentes los valores.
-        -NO REPITAS TUS RESPUESTAS
-        - La respuesta debe estar en español.
-        - No te desvíes ni modifiques el formato de la respuesta ni el ejemplo que se te dio.
-        - Debes describir todos los materiales presentes en la tabla, sin repetir descripciones.
-        - Entrega solo UNA respuesta en texto plano.
-        - No uses asteriscos ni markdown.
-        - No incluyas en tu respuesta la explicación de tu tren de pensamiento.
-        - Utiliza palabras como 'posteriormente', 'finalmente', 'adicionalmente', 'en ese mismo sentido', etc., para conectar las ideas.
-        - No repitas la respuesta.
-        - No incluyas la palabra 'Answer:'.
-        - NO inventes números.
-        - NO incluyas la tabla que estás analizando.
-        - NO agregues información adicional.
-        - MANTÉN la lógica del texto proporcionado.
-        
-        La tabla a analizar es: {material_resumen}
-        La suma de longitudes por material es: {material_resumen.groupby("Material")["L"].sum()}
-        La suma total de alcantarillado: {material_resumen["L"].sum()}
-        """
-
-        description_material = describer.describe_number_series(model="llama3", prompt=prompt_material)
-        seccion_material = seccion_material.replace("figmaterialpypiper", description_material)
-        seccion_material = seccion_material.replace("resumen-material-ramales", material_resumen_latex)
-
-        latex_source = latex_source.replace("seccion-material-ramales", seccion_material)
-
-        # seccion --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        if len(df_resultados["Seccion"].unique()) > 1:
-            seccion_resumen = gpd_df.groupby(["Seccion"])["L"].sum().reset_index()
-            seccion_resumen["porcentaje"] = np.round((material_resumen["L"] / material_resumen["L"].sum()) * 100, 2)
-            seccion_resumen_latex = generate_tabla_resumen_latex(
-                gpd_df=gpd_df,
-                group_by_list=["Seccion"],
-                sum_by_column="L",
-                caption="Resumen del secciones del sistema de alcantarillado",
-                label="tab:seccion-ramales",
-                rows_per_page=8,  # Si es mas de 8 row, entonces forza two row style
-                column_separator="line",
-                porcentaje=True,
-            )
-
-            seccion_seccion = r"""
-                \newpage
-                \subsection{Seccion}
-                En la Figura \ref{fig:seccion-ramales} se presenta la distribución espacial  de la seccion de los colectores. figseccionpypiper
-                
-            
-               % Cálculo del espacio restante en la página
-                \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-                
-                \vspace{-3mm}
-                \begin{figure}[H]
-                 \centering
-                 \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{seccion_planimetria.png}}
-                 \caption{Planimetria: distribuccion espacial de la secciones del sistema}\label{fig:seccion-ramales}
-                 \end{figure}
-                 
-                 resumen-seccion-ramales
-         
-            """
-
-            description_seccion =generar_resumen_secciones(seccion_resumen)
-            description_seccion = description_seccion.replace("%", r"\%")
-          
-            seccion_seccion = seccion_seccion.replace("figseccionpypiper", description_seccion)
-            seccion_seccion = seccion_seccion.replace("resumen-seccion-ramales", seccion_resumen_latex)
-            
-            latex_source = latex_source.replace("seccion-seccion-ramales", seccion_seccion)
-        else:
-            latex_source = latex_source.replace("seccion-seccion-ramales", "")
-            
-            
-
-        # calado------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        seccion_calado = r"""
-            \subsection{Calado}
-            En la Figura \ref{fig6} se presenta la distribución espacial e histograma de frecuencias del calado. El calado minimo y maximo  es de caladominimapypiper y caladomaximapypiper respectivamente.
-            El calado mas observado en el sistema es de caladomodapypiper y el calado medio del sistema es de caladomediapypier con un coeficiente de seguridad estimado de caladocoefseguridadpypiper.
-        
-            % Cálculo del espacio restante en la página
-            \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-            \vspace{-3mm}
-            \begin{figure}[H]
-            \setlength{\belowcaptionskip}{-10pt}
-            \centering
-                 \subfigure[planimetria]{
-                 \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{calado_planimetria.png}}
-                 }
-                 \subfigure[histograma de ocurrencias]{
-                 \centerline{\includegraphics[height=0.30\espacioRestante,keepaspectratio]{calado_hist.png}}
-                 }
-                 \caption{Planimetria e histograma de frecuencias de calado del sistema}\label{fig6}
-            \end{figure}
-        """
-        latex_source = latex_source.replace("seccion-calado-ramales", seccion_calado)
-
-        # velocidad------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        seccion_velocidad = r"""
-        \newpage
-        \subsection{Velocidad}
-        En la Figura \ref{fig5} se presenta la distribución espacial e histograma de frecuencias de la velocidad del sistema de alcantarillado. La velocidad minima y maxima  es de velocidadminimapypiper m/s y velocidadmaximapypiper m/s respectivamente.
-        La velocidad mas observada en el sistema es de velocidadmodapypiper m/s y la velocidad media del sistema es de velocidadmediapypier m/s con una desviacion estandar de velocidaddesviacionpypiper m/s y un coeficiente de variacion de velocidadcoeficientevariacionpypiper \%.
-    
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-    
-        \vspace{-3mm}
-        \begin{figure}[H]
-        \setlength{\belowcaptionskip}{-10pt}
-        \centering
-             \subfigure[planimetria]{
-             \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{velocidad_planimetria.png}}
-             }
-             \subfigure[histograma de ocurrencias]{
-             \centerline{\includegraphics[height=0.30\espacioRestante,keepaspectratio]{velocidad_hist.png}}
-             }
-             \caption{Planimetria e histograma de frecuencias de velocidad del sistema}\label{fig5}
-        \end{figure}
-       """
-        latex_source = latex_source.replace("seccion-velocidad-ramales", seccion_velocidad)
-
-        # caudal------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        seccion_caudal = r"""
-         \newpage
-         \subsection{Caudal}
-         La Figura \ref{fig:caudal} muestra la distribucción espacial del caudal en el proyecto.
-        
-         % Cálculo del espacio restante en la página
-         \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-    
-         \begin{figure}[H]
-         \centering
-         \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{caudal_planimetria.png}}
-         \caption{Planimetria:caudal del sistema de alcantarillado}\label{fig:caudal}
-         \end{figure}
-       """
-        latex_source = latex_source.replace("seccion-caudal-ramales", seccion_caudal)
-
-        # abrasion------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        seccion_abrasion = r"""
-        \newpage
-        \subsection{Indice de abrasion}
-        El índice de abrasion medio del sistema se estima en abrasionmediapypier el cual indica un sistema de abrasionclasepypier, con un valor maximo de abrasionmaximapypiper.
-        Como se muestra en la Figura \ref{fig10}  el indice de abrasion mas observada en las tuberias del sistema es de abrasionmodapypiper.
-       
-        % Cálculo del espacio restante en la página
-        \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-       
-        \vspace{-3mm}
-        \begin{figure}[H]
-        \setlength{\belowcaptionskip}{-10pt}
-        \centering
-             \subfigure[planimetria]{
-             \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{indice_abrasion_planimetria.png}}
-             }
-             \subfigure[histograma de frecuencia]{
-             \centerline{\includegraphics[height=0.30\espacioRestante,keepaspectratio]{indice_abrasion_hist.png}}
-             }
-             \caption{Planimetria e histograma de frecuencias de la abrasion del sistema}\label{fig10}
-        \end{figure}
-        """
-        latex_source = latex_source.replace("seccion-abrasion-ramales", seccion_abrasion)
-
-        # seccion --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-        if "densidad" in gdf_areas.columns:
-            section_densidad = r"""    %---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-            \newpage
-            \subsubsection{Densidad del área de aporte}
-            Las áreas resultantes del sistema de alcantarillado typepypiper se presentan en la Figura \ref{fig3densidad}, en la cual se ilustran los valores de densidad del área de proyecto.
-            descripccionareadensidadpypiper
-
-            % Cálculo del espacio restante en la página
-            \setlength{\espacioRestante}{\dimexpr\textheight - \pagetotal - 3\baselineskip\relax}
-        
-            \begin{figure}[H]
-              \centering
-              \centerline{\includegraphics[height=0.5\espacioRestante, keepaspectratio]{area_densidad_planimetria.png}}
-              \caption{Planimetría: densidad del área de aporte para el  alcantarillado typepypiper}\label{fig3densidad}
-            \end{figure}
-            
-            La Tabla \ref{tab:tabdensidadarea} presenta una descripción de los valores de densidad para el área de aporte del sistema de alcantarillado.
-            tablaareadensidadpypiper
-        
-            """
-            latex_area_densidad = (
-                gdf_areas.groupby("outfall")["densidad"]
-                .describe()
-                .round(0)
-                .to_latex(
-                    longtable=True,
-                    caption="Planimetría: densidad del área de aporte typepypiper",
-                    label="tab:tabdensidadarea",
-                    index=True,
-                    position="H",
-                    float_format=lambda x: f"{float(x):2}",
-                )
-            )
-            section_densidad = section_densidad.replace("tablaareadensidadpypiper", latex_area_densidad)
-            section_densidad = re.sub(r"(?<!\\)(?<!\s)%", r"\\%", section_densidad)
-            latex_source = latex_source.replace("areadensitypypiper", section_densidad)
-            try:
-                prompt_area_densidad = (
-                    """Analiza esta imagen exactamente como un plano técnico de alcantarillado.
-    
-                ENTREGA UNA ÚNICA RESPUESTA EN TEXTO PLANO (sin markdown, sin asteriscos, sin formatting), discute los valores maximo, minimo, medio. explica la unidad de densidad Hab/Ha.
-                explicame que significa los colores y que esta describiendo, por ejemplo una densidad alta puede representar edificios de vivienda popular o un centro poblado consolidado, mientras que una de baja densidad puede representar
-                sectores periurbanos o rurales.
-
-                IMPORTANTE:
-                - Entrega solo UNA respuesta en texto plano
-                - No uses asteriscos ni markdown
-                - No repitas la respuesta
-                - No incluyas la palabra 'Answer:'
-                - Usa SOLO los datos numéricos del resumen
-                - NO inventes números
-                - Solo identifica los colores de cada numero o descarga
-                - NO agregues información adicional
-                - MANTÉN la logica del texto proporcionado
-    
-                Resumen:"""
-                    + latex_area_densidad
-                )
-                
-                description_area_densidad = describer.describe_image(image_path=dict_path_figuras["area_densidad_planimetria.png"], prompt=prompt_area_densidad)
-                description_area_densidad = description_area_densidad.replace("*", "")
-                latex_source = latex_source.replace("descripccionareadensidadpypiper", description_area_densidad)
-            except Exception as e:
-                print(f"Error: {str(e)}")
-
-        else:
-            latex_source = latex_source.replace("areadensitypypiper", "")
-
-        try:
-            # close ollama
-            describer.kill_ollama()
-        except:
-            pass
-
-    # Replace values
-    latex_source = latex_source.replace(
-        "rectangular_pipe.png",
-        dict_path_figuras["rectangular_pipe.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "circular_pipe.png",
-        dict_path_figuras["circular_pipe.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "estado_planimetria.png",
-        dict_path_figuras["estado_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "area_aporte_planimetria.png",
-        dict_path_figuras["area_aporte_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "area_curve_number_planimetria.png",
-        dict_path_figuras["area_curve_number_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "area_imperv_planimetria.png",
-        dict_path_figuras["area_imperv_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "area_slope_planimetria.png",
-        dict_path_figuras["area_slope_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "area_ramal_planimetria.png",
-        dict_path_figuras["area_ramal_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "area_densidad_planimetria.png",
-        dict_path_figuras["area_densidad_planimetria.png"].replace(os.path.sep, "/"),
-    )
-
-    latex_source = latex_source.replace(
-        "diametro_planimetria.png",
-        dict_path_figuras["diametro_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "diametro_bar_chart.png",
-        dict_path_figuras["diametro_bar_chart.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "velocidad_planimetria.png",
-        dict_path_figuras["velocidad_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "velocidad_hist.png",
-        dict_path_figuras["velocidad_hist.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "calado_planimetria.png",
-        dict_path_figuras["calado_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "calado_hist.png",
-        dict_path_figuras["calado_hist.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "profundidad_media_planimetria.png",
-        dict_path_figuras["profundidad_media_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "profundidad_media_hist.png",
-        dict_path_figuras["profundidad_media_hist.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "caudal_planimetria.png",
-        dict_path_figuras["caudal_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    # latex_source = latex_source.replace("caudal_hist.png", dict_path_figuras["caudal_hist.png"].replace(os.path.sep, "/"), )
-    latex_source = latex_source.replace(
-        "pendiente_planimetria.png",
-        dict_path_figuras["pendiente_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "pendiente_hist.png",
-        dict_path_figuras["pendiente_hist.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "indice_abrasion_planimetria.png",
-        dict_path_figuras["indice_abrasion_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "indice_abrasion_hist.png",
-        dict_path_figuras["indice_abrasion_hist.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "material_planimetria.png",
-        dict_path_figuras["material_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "seccion_planimetria.png",
-        dict_path_figuras["seccion_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "superficie_intervenccion_planimetria.png",
-        dict_path_figuras["superficie_intervenccion_planimetria.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "superficie_intervenccion_bar_chart.png",
-        dict_path_figuras["superficie_intervenccion_bar_chart.png"].replace(os.path.sep, "/"),
-    )
-    latex_source = latex_source.replace(
-        "fases_planimetria.png",
-        dict_path_figuras["fases_planimetria.png"].replace(os.path.sep, "/"),
-    )
-
-    latex_source = latex_source.replace(
-        "tablavelocidadpendienterugosidadpypiper",
-        latex_table_velocidad_pendiente_rugosidad,
-    )
-
-
-    latex_source = latex_source.replace("latex_resumen_fases", latex_resumen_fases)
-    latex_source = latex_source.replace("latex_m_ramales_resultados", latex_m_ramales_resultados)
-    latex_source = latex_source.replace("latex1_m_ramales_resultados", latex1_m_ramales_resultados)
-    latex_source = latex_source.replace("latex2_m_ramales_resultados", latex2_m_ramales_resultados)
-    latex_source = latex_source.replace("latex3_m_ramales_resultados", latex3_m_ramales_resultados)
-    latex_source = latex_source.replace("latex4_m_ramales_resultados", latex4_m_ramales_resultados)
-    latex_source = latex_source.replace("latex5_m_ramales_resultados", latex5_m_ramales_resultados)
-
-    latex_source = latex_source.replace("tabladiametrointernoexternopypiper", latex_table_diametro)
-    latex_source = latex_source.replace("profunidadminimapypiper", str(par_basicos(h_min=1)))
-
-    # Creamos la lista de líneas
-    lines = []
-    for condicion, valor in map_calado_dict.items():
-        if condicion == "":
-            # lines.append("(maximo): {:.2f}".format(valor))
-            pass
-        else:
-            lines.append("{}: {:.2f}".format(condicion, valor))
-    h_D_rule = r"\shortstack[l]{" + " \\\\ ".join(lines) + "}"
-
-    latex_source = latex_source.replace("hDpypiper", h_D_rule)
-    latex_source = latex_source.replace("seccionminimacircularpypiper", str(par_basicos(D_min=1)))
-    latex_source = latex_source.replace("seccionminimarectangularpypiper", str(par_basicos(seccion_min=1)))
-
-    latex_source = latex_source.replace("tablaresumendiametrospypiper", latex_table_resumen)
-    latex_source = latex_source.replace("estadoporcentajelongitudpypiper", latex_estado)
-    latex_source = latex_source.replace("longitudtotalpypiper", str(longitud_total))
-
-    latex_source = latex_source.replace("materialporcentajelongitudpypiper", latex_material)
-    latex_source = latex_source.replace("seccionporcentajelongitudpypiper", latex_seccion)
-
-    latex_source = latex_source.replace("tablaresumenvariablesfisicaspypiper", latex_resumen_variables_fisicas)
-
-    latex_source = latex_source.replace("figurasuperficiepypiper", latex_superficie_intervenccion)
-
-    latex_source = latex_source.replace("diametrominimopypiper", diametro_minimo_resultados)
-    latex_source = latex_source.replace("diametromaximopypiper", diametro_maximo_resultados)
-    latex_source = latex_source.replace("diametromodapypiper", diametro_moda_resultados)
-
-    latex_source = latex_source.replace("velocidadminimapypiper", velocidad_minimo_resultados)
-    latex_source = latex_source.replace("velocidadmaximapypiper", velocidad_maximo_resultados)
-    latex_source = latex_source.replace("velocidadmodapypiper", velocidad_moda_resultados)
-    latex_source = latex_source.replace("velocidadmediapypier", velocidad_media_resultados)
-    latex_source = latex_source.replace("velocidaddesviacionpypiper", velocidad_desviacion_resultados)
-    latex_source = latex_source.replace("velocidadcoeficientevariacionpypiper", velocidad_coefvar_resultados)
-
-    latex_source = latex_source.replace("caladominimapypiper", calado_minimo_resultados)
-    latex_source = latex_source.replace("caladomaximapypiper", calado_maximo_resultados)
-    latex_source = latex_source.replace("caladomodapypiper", calado_moda_resultados)
-    latex_source = latex_source.replace("caladomediapypier", calado_media_resultados)
-    latex_source = latex_source.replace("caladocoefseguridadpypiper", calado_coefseguridad_resultados)
-
-    latex_source = latex_source.replace("profundidadminimapypiper", profunidad_minimo_resultados)
-    latex_source = latex_source.replace("profundidadmaximapypiper", profunidad_maximo_resultados)
-    latex_source = latex_source.replace("profundidadmodapypiper", profunidad_moda_resultados)
-    latex_source = latex_source.replace("profundidadmediapypier", profundidad_media_resultados)
-
-    latex_source = latex_source.replace("caudalminimapypiper", caudal_minimo_resultados)
-    latex_source = latex_source.replace("caudalmaximapypiper", caudal_maximo_resultados)
-    latex_source = latex_source.replace("caudalmodapypiper", caudal_moda_resultados)
-    latex_source = latex_source.replace("caudalmediapypier", caudal_media_resultados)
-
-    latex_source = latex_source.replace("pendienteminimapypiper", pendiente_minimo_resultados)
-    latex_source = latex_source.replace("pendientemaximapypiper", pendiente_maximo_resultados)
-    latex_source = latex_source.replace("pendientemodapypiper", pendiente_moda_resultados)
-    latex_source = latex_source.replace("pendientemediapypier", pendiente_media_resultados)
-
-    latex_source = latex_source.replace("abrasionminimapypiper", abrasion_minimo_resultados)
-    latex_source = latex_source.replace("abrasionmaximapypiper", abrasion_maximo_resultados)
-    latex_source = latex_source.replace("abrasionmodapypiper", abrasion_moda_resultados)
-    latex_source = latex_source.replace("abrasionmediapypier", str(abrasion_media_resultados))
-    latex_source = latex_source.replace("abrasionclasepypier", clasificaicon_abrasion_resultados)
-
-    project_name = project_name.replace(r"_", r" \,").lower().title()
-    latex_source = latex_source.replace("projectnamepypiper", project_name)
-    project_type = project_type.lower().title()
-    latex_source = latex_source.replace("typepypiper", project_type.lower())
-    project_town = project_town.lower().title()
-    latex_source = latex_source.replace("projecttownpypiper", project_town)
-    project_state = project_state.lower().title()
-    latex_source = latex_source.replace("projectstatepypiper", project_state)
-    latex_source = latex_source.replace("projectboundariepypiper", boundaries)
-    project_country = project_country.lower().title()
-    latex_source = latex_source.replace("projectcountrypypiper", project_country)
-
-    latex_source = latex_source.replace(r"\textbackslash", r"\"")
-    latex_source = latex_source.replace("D_ext", "$D_{ext}$")
-    latex_source = latex_source.replace("Continued on next page", "Continua en la siguiente página")
-
-    # # Write the LaTeX source to a file
-    latex_filename = "document.tex"
-    tex_path = os.path.join(path_latex, latex_filename)
-
-    # Write the LaTeX source to a .tex file
-    with open(tex_path, "w", encoding="utf-8") as f:
-        f.write(latex_source)
-
-    # pdflatex_path = r"C:\Users\chelo\AppData\Local\Programs\texlive\2024\bin\windows\latex.exe"
-    # # # Run pdflatex from within path_latex, referencing document.tex
-    # subprocess.run([pdflatex_path, latex_filename], cwd=path_latex)
-    pdflatex_path = r"C:\Users\chelo\AppData\Local\Programs\texlive\2024\bin\windows\pdflatex.exe"
-    makeglossaries_path = r"C:\Users\chelo\AppData\Local\Programs\texlive\2024\bin\windows\makeglossaries.exe"
-
-    # Compile document first run (generates aux, acronyms)
-    subprocess.run([pdflatex_path, latex_filename], cwd=path_latex)
-
-    # Generate glossaries/acronyms
-    subprocess.run([makeglossaries_path, "document"], cwd=path_latex)
-
-    # Compile document second run (incorporates glossary/acronyms)
-    subprocess.run([pdflatex_path, latex_filename], cwd=path_latex)
-
-    # Third run ensures all references are fully resolved
-    subprocess.run([pdflatex_path, latex_filename], cwd=path_latex)
-
-    from pdf2docx import Converter
-
-    docx_file = path_latex + os.path.sep + r"document.docx"
-    pdf_file = path_latex + os.path.sep + "document.pdf"
-    # Crear un objeto Converter y especificar el PDF de entrada
-    cv = Converter(pdf_file)
-
-    # Convertir el PDF a DOCX (puedes especificar páginas o rangos)
-    cv.convert(docx_file, start=0, end=None)  # Convierte todas las páginas
-    cv.close()
 
 
 def get_xyz_lidar(m_ramales_shp, path_lidar_in):
@@ -27044,96 +23037,6 @@ def get_outfall(m_ramales, crs_utm_epsg):
     for index, s in df.groupby("Ramal")["outfall"]:
         m_ramales[index]["outfall"] = s.to_numpy()
 
-    try:
-        gdf_area = gpd.read_file(area_shape, engine="pyogrio")
-
-        ramales = gdf_area["id_pozo"].str.split(".", expand=True).iloc[:, 0].astype(str)
-
-        map_outfall_dict = dict(zip(df["Ramal"].astype(str), df["outfall"]))
-        gdf_area["outfall"] = ramales.map(map_outfall_dict)
-
-        path_out = os.path.dirname(area_shape)
-        name_out = os.path.basename(area_shape).split(".")[0] + "_outfall.gpkg"
-        try:
-            gdf_area.drop("fid", axis=1, inplace=True)
-        except Exception as e:
-            pass
-        gdf_area.to_file(path_out + os.path.sep + name_out)
-
-        # Assuming gdf_area is your initial GeoDataFrame and area_shape is your file path
-        name_out = os.path.basename(area_shape).split(".")[0] + "_outfall_diss.gpkg"
-
-        # Buffer the geometries in the GeoDataFrame to create a new GeoDataFrame
-        gdf_area_buff = gpd.GeoDataFrame(gdf_area["outfall"], geometry=gdf_area.buffer(1))
-
-        # Set 'outfall' as the index to retain it during dissolve
-        gdf_area_buff.set_index("outfall", inplace=True)
-
-        # Dissolve the buffered geometries by 'outfall' which is now the index
-        gdf_area_diss = gdf_area_buff.dissolve(by="outfall")
-
-        # Reset index to turn 'outfall' back into a column
-        gdf_area_diss.reset_index(inplace=True)
-
-        # Buffer the dissolved geometries by -1 to shrink them back
-        gdf_area_buff_neg = gdf_area_diss.buffer(-1)
-
-        # Update the geometry of gdf_area_diss with the negative buffer
-        gdf_area_diss["geometry"] = gdf_area_buff_neg
-        gdf_area_diss["area"] = np.round(gdf_area_diss.geometry.area / 10000, 3)
-
-        # # Group by 'outfall' and apply unary_union to combine all geometries, even if they are not contiguous
-        # combined = gdf_area_diss.groupby('outfall')['geometry'].agg(lambda x: x.unary_union).reset_index()
-        #
-        # # Convert back to a GeoDataFrame
-        # gdf_area_diss = gpd.GeoDataFrame(combined, geometry='geometry')
-
-        gdf_area_diss.index = gdf_area_diss["outfall"]
-
-        try:
-            gdf_area_diss["CN"] = [np.nan] * len(gdf_area_diss.index)
-            columns = ["CN"]
-            cn_list = pd.Series(index=gdf_area_diss.index)
-            for outfall in gdf_area_diss["outfall"]:
-                filtro_outfall = gdf_area["outfall"] == outfall
-                new_df = gdf_area[filtro_outfall]
-                values_cn = np.sum(new_df.geometry.area.to_numpy() * new_df[columns].to_numpy().T[0]) / np.sum(new_df.geometry.area.to_numpy())
-                cn_list[outfall] = round(values_cn, 2)
-
-            gdf_area_diss.loc[cn_list.index, "CN"] = cn_list
-        except Exception as e:
-            print(e)
-            
-
-        gdf_area_diss.set_index("outfall", inplace=True)
-        gdf_area_diss.reset_index(inplace=True)
-
-        gdf_area_diss["geometry"] = gdf_area_diss["geometry"].apply(remove_holes)
-
-        # Construct the full output path
-        full_output_path = os.path.join(path_out, name_out)
-
-        # Save to file
-        try:
-            gdf_area_diss.set_crs(crs_utm_epsg, inplace=True)
-        except:
-            gdf_area_diss.to_crs(crs_utm_epsg, inplace=True)
-
-        gdf_area_diss.to_file(full_output_path, driver="GPKG")
-        gdf_area_diss.index = gdf_area_diss["outfall"]
-
-        gdf_area_diss["caudal"] = np.nan
-        filtro_outfall = df["Ramal"].isin(gdf_area_diss["outfall"])
-        df_outfall = df[filtro_outfall]
-        for outfall_, s_ in df_outfall.groupby("Ramal"):
-            gdf_area_diss.loc[outfall_, "caudal"] = round(s_["q_accu"].max(), 2)
-
-        gdf_area_diss.to_excel(os.path.join(path_out, name_out.replace("gpkg", "xlsx")))
-
-    except Exception as e:
-        print(e)
-        return m_ramales
-
     return m_ramales
 
 
@@ -27143,12 +23046,12 @@ class cls_Guardar:
             "circular": {
                 "cobertura_minima": 1.2,
                 "seccion_minima": 0.284,
-                "calado_maximo": 0.82,
+                "calado_maximo": 0.65,
             },
             "rectangular": {
                 "cobertura_minima": 1.2,
                 "seccion_minima": 0.6,
-                "calado_maximo": 0.8,
+                "calado_maximo": 0.65,
             },
         }
 
@@ -27524,32 +23427,8 @@ def convert_utm_to_ellipsoidal(
     Returns:
     - results (list of tuples): List containing tuples with latitude, longitude, geoid offset, and ellipsoidal elevation.
     """
-    crs_utm_epsg = CRS("""PROJCRS["SIRES-DMQ",
-BASEGEOGCRS["WGS 84",
-    DATUM["World Geodetic System 1984",
-        ELLIPSOID["WGS 84",6378137,298.257223563,
-        LENGTHUNIT["metre",1]],ID["EPSG",6326]],
-    PRIMEM["Greenwich",0,
-        ANGLEUNIT["Degree",0.0174532925199433]]],
-CONVERSION["unnamed",
-    METHOD["Transverse Mercator",ID["EPSG",9807]],
-    PARAMETER["Latitude of natural origin",0,
-        ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8801]],
-    PARAMETER["Longitude of natural origin",-78.5,
-        ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8802]],
-    PARAMETER["Scale factor at natural origin",1.0004584,
-        SCALEUNIT["unity",1],ID["EPSG",8805]],
-    PARAMETER["False easting",500000,
-        LENGTHUNIT["metre",1],ID["EPSG",8806]],
-    PARAMETER["False northing",10000000,
-        LENGTHUNIT["metre",1],ID["EPSG",8807]]],
-CS[Cartesian,3],
-AXIS["(E)",east,ORDER[1],
-    LENGTHUNIT["metre",1,ID["EPSG",9001]]],
-AXIS["(N)",north,ORDER[2],
-    LENGTHUNIT["metre",1,ID["EPSG",9001]]],
-AXIS["ellipsoidal height (h)",up,ORDER[3],
-LENGTHUNIT["metre",1,ID["EPSG",9001]]]]""")
+    # Hardcoded CRS removed to allow dynamic argument usage
+    # The crs_utm_epsg argument will be used directly
     # Initialize a transformer from UTM to geographic (WGS84)
     # crs_utm = CRS.from_epsg(crs_utm_epsg)
     crs_wgs84 = CRS.from_epsg(4326)
@@ -27603,6 +23482,116 @@ def translate_geoidal_elevation(m_ramales):
     return m_ramales
 
 
+def classify_pz(diameters, salto, secciones, pozo_inicial, pozo_final):
+    tolerance = 0.06
+    classifications = np.full(diameters.shape, 'pz-esp', dtype='<U10')
+
+    # Define boundary values in meters
+    boundaries = [0.2, 0.6, 0.8, 1.0, 1.3]
+    # Apply tolerances to boundaries
+    adjusted_boundaries = [b * (1 - tolerance) for b in boundaries[:-1]] + [boundaries[-1]]
+
+    # Classify based on diameters
+    for i, (lower, upper) in enumerate(zip(adjusted_boundaries[:-1], adjusted_boundaries[1:]), 1):
+        condition = (diameters >= lower) & (diameters < upper)
+        classifications[condition] = f'pz-b{i}'
+
+    # Propagate larger classifications backwards
+    for i in range(1, len(classifications)):
+        if classifications[i].startswith('pz-b'):
+            current_class = int(classifications[i][4:]) if classifications[i][4:].isdigit() else 0
+            prev_class = int(classifications[i - 1][4:]) if classifications[i - 1].startswith('pz-b') and \
+                                                            classifications[i - 1][4:].isdigit() else 0
+            if current_class > prev_class:
+                classifications[i - 1] = classifications[i]
+
+    # Apply 'salto' classifications to the previous row
+    salto_s1 = 0.7
+    salto_s2 = 1.2
+    salto_especial = 2.5
+
+    salto_conditions = [(salto > salto_s1) & (salto <= salto_s2), (salto > salto_s2) & (salto <= salto_especial),
+                        salto > salto_especial]
+
+    for i, condition in enumerate(salto_conditions, 1):
+        classifications[:-1][condition[1:]] = f'pz-s{i}'
+
+    # remover pozos de canales superficiales abiertos
+    # -------------------------------------------------------------------------------------------------------------
+    filtro_rectangular = secciones == 'rectangular'
+    if len(filtro_rectangular.nonzero()[0]) > 0:
+        # smaller depth from each trench
+        h_min = np.min([pozo_inicial[filtro_rectangular], pozo_final[filtro_rectangular]], axis=0)
+        # altura seccion
+        h_seccion = diameters[filtro_rectangular]
+
+        # canal abierto
+        filtro_canal_abierto = np.isclose(h_seccion, h_min, atol=0.4)
+        try:
+            if len(filtro_canal_abierto.nonzero()[0]) > 0:
+                classifications[filtro_canal_abierto] = ''
+        except:
+            pass
+
+    return classifications
+
+
+def get_pz_class(m_ramales):
+    # remover metodos constructivos porque ya se pone esto en los datos hidraulicos
+    metodos_lista = ["mejorar suelo", "Perforacion Horizontal Dirigida", "Tunel", "Reparacion", "Colector",
+                     "Zanja Mano", ]
+    metodos_lista = [_.lower() for _ in metodos_lista]
+    metodos_pattern = '|'.join(r'\b{}\b'.format(re.escape(word)) for word in metodos_lista)
+
+    pz_list = ['pz-b1', 'pz-b2', 'pz-b3', 'pz-b4', 'pz-esp', 'pz-s1', 'pz-s2', 'pz-s3']
+    pz_list = '|'.join(r'\b{}\b'.format(re.escape(word)) for word in pz_list)
+
+    for ramal in m_ramales.keys():
+        diametros = seccion_str2float(m_ramales[ramal]['D_ext'], return_b=True)
+        saltos = m_ramales[ramal]['SALTO']
+        secciones = m_ramales[ramal]['Seccion']
+        pozo_inicial = m_ramales[ramal]['HI']
+        pozo_final = m_ramales[ramal]['HF']
+
+        if 'nuevo' in m_ramales[ramal]['Estado']:
+            m_ramales[ramal]['pz_class'] = classify_pz(diametros, saltos, secciones, pozo_inicial, pozo_final)
+            obs = pd.Series(m_ramales[ramal]['Obs'])
+            obs = obs.str.replace(pz_list, ' ', regex=True)
+            obs = pd.Series(m_ramales[ramal]['pz_class']) + ' ' + obs
+            obs = obs.str.replace(metodos_pattern, ' ', regex=True)
+            m_ramales[ramal]['Obs'] = obs.to_numpy()
+        else:
+            m_ramales[ramal]['pz_class'] = np.full(diametros.shape, '', dtype=object)
+
+    return m_ramales
+
+
+def create_q_dict_from_flows(m_ramales, ramal, flows_dict):
+    # 1. Generar estructura idéntica a q_v_Func original
+    pz = np.concatenate([m_ramales[_]["Pozo"] for _ in ramal.keys()])
+
+    # Inicializar caudales en cero
+    q_san = np.zeros(len(pz))
+    q_pluvial = np.zeros(len(pz))
+
+    # Crear DataFrame
+    df = pd.DataFrame(np.array([pz, q_san, q_pluvial]).T, columns=["pz", "q_san", "q_pluvial"])
+    df.index = df["pz"]
+
+    # 2. Asignar valores directamente usando la key de flows_dict como índice
+    for key, flow in flows_dict.items():
+
+        # Aseguramos que la key sea string para coincidir con el índice pz
+        if key in df.index:
+            df.at[key, "q_pluvial"] = flow * 1000.0
+
+    # 3. Convertir columnas a numérico (igual que en tu flujo original)
+    df["q_pluvial"] = pd.to_numeric(df["q_pluvial"])
+    df["q_san"] = pd.to_numeric(df["q_san"])
+
+    return df
+
+
 #####################################################################
 
 class SewerPipeline:
@@ -27612,529 +23601,255 @@ class SewerPipeline:
     • El método `.run()` ejecuta TODO el flujo original.
     """
 
-    def __init__(self, project_name: str, pozo_hmin_arg: float, q:float, proj_to: int):
+    def __init__(self, elev_file_path:str, vector_file_path:str, project_name: str, pozo_hmin_dict: dict, flows_dict: dict, proj_to: str, path_out: str = None):
+        self.elev_file_path = elev_file_path
+        self.vector_file_path = vector_file_path
         self.project_name = project_name
-        self.pozo_hmin_arg = pozo_hmin_arg
-        self.q = q
+        self.pozo_hmin_dict = pozo_hmin_dict
+        self.flows_dict = flows_dict
         self.proj_to = proj_to
-        
-        
+        self.path_out = path_out
 
-    # --------------------------------------------------------------------------
     def run(self):
         """
-        Copia literal del bloque que estaba bajo `if __name__ == "__main__":`,
-        con los valores reemplazados por los atributos de la instancia.
+        Executes the sewer design pipeline.
+        Updated to handle multiple flows (one per ramal start).
         """
-        print("###########################################")
-        t0 = time.time()
+        tqdm.write("-----------------------------------------------")
 
-        # DATOS DE ENTRADA Y PATH ARCHIVOS
+        # Input Data
+        elev_file_path = self.elev_file_path
+        vector_file_path = self.vector_file_path
         project_name = self.project_name
-        Pozo_hmin_arg = self.pozo_hmin_arg
-        q_diseño = self.q
+        pozo_hmin_dict = self.pozo_hmin_dict
         proj_to = self.proj_to
+        flows_dict = self.flows_dict
+        
         scale_viewport = 1.0
 
-        print("###########################################")
         t0 = time.time()
         
         path_proy = "PROYECTO_" + str(project_name) + os.path.sep
-        print(project_name)
-
-        # archivo de tipos de superficie de calles
-        sup_type = r"C:\Users\chelo\OneDrive\SANTA_ISABEL\PROYECTO_FACTIBILIDAD_PLUVIAL_SAN_SEBASTIAN\08_sup_road\sup_road.shp"
-        elev_file = [ r"C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\gis\01_raster\elev.tif"]
-    
-        # distancia maxima de
-        dmax = 0.5  # distancia maxima entre nudos para merge both
-        d_min = 0.1  # diametro minimo para dibujar
-    
-        # redes nuevas-
-        new_shp = path_proy + "00_GIS" + os.path.sep + r"00_IN" + os.path.sep + r"00_NEW" + os.path.sep + r"PROYECTO_" + project_name + ".gpkg"
-        new_dxf = path_proy + "01_DXF" + os.path.sep + r"00_IN" + os.path.sep + r"00_NEW" + os.path.sep + r"PROYECTO_" + project_name + ".dxf"
-    
-        # reddes existentes
-        existing_dxf = path_proy + "01_DXF" + os.path.sep + r"00_IN" + os.path.sep + r"01_EXISTING" + os.path.sep + r"PROYECTO_" + project_name + ".dxf"
-        existing_shp = path_proy + "00_GIS" + os.path.sep + r"00_IN" + os.path.sep + r"01_EXISTING" + os.path.sep + r"PROYECTO_" + project_name + ".gpkg"
-    
-
         
-        
-        additional_profile_list = []
+        # Street Surface File
+        elev_file = [elev_file_path]
     
-        if os.path.exists(new_shp):
-            shp_name = project_name
-            dxf_name = None
-            existing_dxf = None
-            existing_shp = None
-            source_in = new_shp
-            source_type = "new"
+        dmax = 0.5
+
+
+        # Initialize Progress Bar
+        total_steps = 24
+        with tqdm(total=total_steps, desc=f"Designing {project_name}", unit="step") as pbar:
     
-        elif os.path.exists(new_dxf):
-            dxf_name = project_name
-            shp_name = None
-            existing_dxf = None
-            existing_shp = None
-            source_in = new_dxf
-            source_type = "new"
+            # 1. Leer Geometria
+            m_ramales, ramal = get_geometry_pypiper_GIS([vector_file_path], dmax=dmax)
+            pbar.set_description("Reading Geometry (GIS)...")
+            pbar.update(1)
     
-        elif os.path.exists(existing_dxf):
-            existing_dxf_name = project_name
-            dxf_name = None
-            shp_name = None
-            existing_shp = None
-            source_in = existing_dxf
-            source_type = "existing"
-    
-        elif os.path.exists(existing_shp):
-            existing_shp_name = project_name
-            dxf_name = None
-            shp_name = None
-            existing_dxf = None
-            source_in = existing_shp
-            source_type = "existing"
-    
-        else:
-            sys.exit('casey')
-    
-        n_ramal_max = 500
-    
-        "##################################################################################################################"
-        "leer geometria desde shp y autocad"
-        "##################################################################################################################"
-        t100 = time.time()
-        if shp_name:
-            # m_ramales, ramal = get_geometry_GIS([source_in], 3)
-            m_ramales, ramal = get_geometry_GIS_V1([source_in], 3)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "get_geometry_GIS")
-    
-        elif dxf_name:
-            m_ramales, ramal = get_geometry_DXF(dxf_name=source_in)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "get_geometry_DXF")
-    
-        elif existing_dxf:
-            m_ramales, ramal = get_geometry_pypiper_dxf(source_in, elev_file, n_ramal_max)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "get_geometry_pypiper_dxf")
-    
-        elif existing_shp:
-            m_ramales, ramal = get_geometry_pypiper_GIS([source_in], dmax=dmax)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "get_geometry_pypiper_shp")
-    
-        print("source: ", source_in)
-    
-        "##################################################################################################################"
-        "preparar datos de elevacion "
-        "##################################################################################################################"
-        t100 = time.time()
-        ges = ElevationSource(path_proy, proj_to)
-        elevation_shift = 0
-        tree = ges.get_elev_source(elev_file, check_unique_values=False, ellipsoidal2orthometric=False, m_ramales=None, elevation_shift=elevation_shift)
-        elev_source = ElevationGetter(tree=tree, m_ramales=m_ramales, threshold_distance=0.7)
-        print("get tree...done")
-    
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_elevation source")
-    
-        "##################################################################################################################"
-        "insertar pozos en cambios de pendiente de perfil"
-        "##################################################################################################################"
-        t100 = time.time()
-        shape_file = source_in
-        skip_ramal = []
-        # m_ramales, ramal = opt_vertical_profile(
-        #     m_ramales=m_ramales, ramal=ramal, elev_source=elev_source, step=5, shape_file=shape_file, epsilon=0.6, min_distance=15, skip_ramal=skip_ramal
-        # )
-        elev_source.m_ramales = m_ramales
-    
-        t101 = time.time()
-        print(round(t101 - t100, 3), "opt_vertical_profile")
-    
-        "##################################################################################################################"
-        "simplificar geometria"
-        "##################################################################################################################"
-        t100 = time.time()
-        n_max_ramal = 5000
-        if len(ramal) > n_max_ramal:
-            n_cpu = int(max(2.0, round(len(ramal) / n_max_ramal, 0) + 1))
-            m_ramales, ramal, xy_inter = simple_geometry_MP(m_ramales, ramal, n_cpu, dmax=dmax)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "simple_geometry_MP")
-        else:
+            # 2. Preparar Datos Elevacion (Source)
+            ges = ElevationSource(path_proy, proj_to)
+            elevation_shift = 0
+            tree = ges.get_elev_source(elev_file, check_unique_values=False, ellipsoidal2orthometric=False, m_ramales=None, elevation_shift=elevation_shift)
+            pbar.set_description("Processing Elevation Source...")
+            pbar.update(1)
+            
+            # 3. Elevation Getter
+            elev_source = ElevationGetter(tree=tree, m_ramales=m_ramales, threshold_distance=0.7)
+            shape_file = vector_file_path
+            skip_ramal = []
+            elev_source.m_ramales = m_ramales
+            # (Step opt_vertical_profile skipped as in original code)
+            
+            # 4. Simplificar Geometria
             m_ramales, ramal, xy_inter = simple_geometryV3(m_ramales, ramal, dmax=dmax)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "simple_geometry")
-    
-        "##################################################################################################################"
-        "asignar elevaciones"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales = elev_source.get_elevation_m_ramales()
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_elev")
-    
-        "##################################################################################################################"
-        "asignar comentarios"
-        "##################################################################################################################"
-        pz_conditions = {
-            f"{project_name}": {
-                "0.0": {"Pozo_hmin": Pozo_hmin_arg},
-                
-        }
-        }
-    
-        if project_name in list(pz_conditions.keys()):
-            m_ramales = get_conditions(pz_conditions[project_name], m_ramales)
-    
-        "##################################################################################################################"
-        "longitudes"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_len(m_ramales, ramal)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_len")
-    
-        "##################################################################################################################"
-        "asignar pendiente natural del terreno"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_slope(m_ramales, ramal)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_slope")
-    
-        "##################################################################################################################"
-        "asignar rugosidades"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_roughness(m_ramales, ramal)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_roughness")
-    
-        "##################################################################################################################"
-        "agregar metodologia constructiva"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales = get_add_metodologia_constructiva(m_ramales)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_metodologia_constructiva")
-    
-        "##################################################################################################################"
-        "generar outfall"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales = get_outfall(m_ramales, proj_to)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get outfalls")
-    
-        "##################################################################################################################"
-        "caudales"
-        "##################################################################################################################"
-        t100 = time.time()
-    
-        def q_v_Func(m_ramales, ramal):
-            pz = np.concatenate([m_ramales[_]["Pozo"] for _ in ramal.keys()])
-            np.random.seed(0)
-            q_san = np.random.randint(0, 50, size=len(pz)) / 100
-            # q_pluvial = np.random.randint(0, 50, size=len(pz)) / 100
-            q_pluvial = np.zeros_like(q_san)
-    
-            df = pd.DataFrame(np.array([pz, q_san, q_pluvial]).T, columns=["pz", "q_san", "q_pluvial"])
-            df.index = df["pz"]
-            return df
-    
-        q_dict = q_v_Func(m_ramales, ramal)
-        q_dict['q_pluvial'] = len(q_dict['q_pluvial']) * [0]
-        q_dict['q_san'] = len(q_dict['q_san']) * [0]
-        q_dict['q_pluvial'].loc['0.0'] = q_diseño
-    
-    
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_flow")
-    
-        "##################################################################################################################"
-        "sumatoria de caudales"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_flowsum(m_ramales, ramal, q_v=q_dict)
-        print("Caudal Pluvial Sistema:", np.round(np.sum([np.sum(_["q_pluvial"]) for _ in m_ramales.values()]), 2), )
-        print("Caudal Sanitario Sistema:", np.round(np.sum([np.sum(_["q_san"]) for _ in m_ramales.values()]), 2), )
-    
-    
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_flowsum")
-    
-    
-        "##################################################################################################################"
-        "dimensionamiento diametro interno"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_sizing_int(m_ramales, ramal, xy_inter)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_sizing_int")
-    
-        "##################################################################################################################"
-        "asignacion diametro externo"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_sizing_ext(m_ramales, ramal)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_sizing_ext")
-    
-        "##################################################################################################################"
-        "seccion llena"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_SLL(m_ramales, ramal)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_SLL")
-    
-        "##################################################################################################################"
-        "seccion parcialmente llena"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_SPLL(m_ramales, ramal)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_SPLL")
-    
-        "##################################################################################################################"
-        "dimensionar tuberias"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_sizing_SPLL(m_ramales, ramal, xy_inter)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_sizing_SPLL")
-    
-        "##################################################################################################################"
-        "elevaciones y alturas de pozo iniciales "
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = get_pz_init(m_ramales, ramal)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get_pz_init")
-    
-        "##################################################################################################################"
-        "optimizar altuas de pozos"
-        "##################################################################################################################"
-        t100 = time.time()
-        n_max_ramal = 50000
-        if len(ramal) > n_max_ramal:
-            n_cpu = int(os.cpu_count() * 0.8)
-            m_ramales, ramal = get_opt_S_MP(m_ramales, ramal, xy_inter, n_cpu)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "get_opt_S_MP")
-        else:
+            pbar.set_description("Simplifying Geometry...")
+            pbar.update(1)
+        
+            # 5. Asignar Elevaciones
+            m_ramales = elev_source.get_elevation_m_ramales()
+            pbar.set_description("Assigning Elevations...")
+            pbar.update(1)
+
+            # (Asignar Comentarios skipped as in original)
+        
+            # 6. Longitudes
+            m_ramales, ramal = get_len(m_ramales, ramal)
+            pbar.set_description("Calculating Lengths...")
+            pbar.update(1)
+
+            # 7. Asignar Pendiente Natural
+            m_ramales, ramal = get_slope(m_ramales, ramal)
+            pbar.set_description("Assigning Natural Slopes...")
+            pbar.update(1)
+
+            # 8. Asignar Rugosidades
+            m_ramales, ramal = get_roughness(m_ramales, ramal)
+            pbar.set_description("Assigning Roughness...")
+            pbar.update(1)
+        
+            # 9. Agregar Metodologia Constructiva
+            m_ramales = get_add_metodologia_constructiva(m_ramales)
+            pbar.set_description("Adding Construction Methods...")
+            pbar.update(1)
+
+            # 10. Generar Outfall (1)
+            m_ramales = get_outfall(m_ramales, proj_to)
+            pbar.set_description("Identifying Outfalls...")
+            pbar.update(1)
+        
+            # 11. Caudales Dict
+            q_dict = create_q_dict_from_flows(m_ramales, ramal, flows_dict)
+            q_dict['q_pluvial'] = pd.to_numeric(q_dict['q_pluvial'])
+            q_dict['q_san'] = pd.to_numeric(q_dict['q_san'])
+            pbar.set_description("Processing Flows...")
+            pbar.update(1)
+
+            # 12. Sumatoria Caudales
+            m_ramales, ramal = get_flowsum(m_ramales, ramal, q_v=q_dict)
+            # tqdm.write(f"Caudal Pluvial Sistema: {np.round(np.sum([np.sum(_['q_pluvial']) for _ in m_ramales.values()]), 2)}")
+            # tqdm.write(f"Caudal Sanitario Sistema: {np.round(np.sum([np.sum(_['q_san']) for _ in m_ramales.values()]), 2)}")
+            pbar.set_description("Summing Flows...")
+            pbar.update(1)
+
+            # 13. Dimensionamiento Diametro Interno
+            m_ramales, ramal = get_sizing_int(m_ramales, ramal, xy_inter)
+            pbar.set_description("Sizing Internal Diameters...")
+            pbar.update(1)
+        
+            # 14. Asignacion Diametro Externo
+            m_ramales, ramal = get_sizing_ext(m_ramales, ramal)
+            pbar.set_description("Sizing External Diameters...")
+            pbar.update(1)
+
+            # 15. Seccion Llena
+            m_ramales, ramal = get_SLL(m_ramales, ramal)
+            pbar.set_description("Checking Full Section...")
+            pbar.update(1)
+
+            # 16. Seccion Parcialmente Llena
+            m_ramales, ramal = get_SPLL(m_ramales, ramal)
+            pbar.set_description("Checking Partial Section...")
+            pbar.update(1)
+
+            # 17. Dimensionar Tuberias
+            m_ramales, ramal = get_sizing_SPLL(m_ramales, ramal, xy_inter)
+            pbar.set_description("Finalizing Pipe Sizing...")
+            pbar.update(1)
+        
+            # 18. Elevaciones y Alturas Pozo Iniciales
+            m_ramales, ramal = get_pz_init(m_ramales, ramal)
+            pbar.set_description("Initializing Manholes...")
+            pbar.update(1)
+
+            # 19. Optimizar Alturas Pozos
             m_ramales, ramal = get_opt_S(m_ramales, ramal, xy_inter)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "get_opt_S")
-    
-        "##################################################################################################################"
-        "revision de elevacion de llegada y salida de pozos"
-        "##################################################################################################################"
-    
-        t100 = time.time()
-        m_ramales, ramal = check_pz(m_ramales, ramal, xy_inter)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "check_pz")
-    
-        "##################################################################################################################"
-        "optimizar velocidad de tramo"
-        "##################################################################################################################"
-        t100 = time.time()
-        n_max_ramal = 5000
-        if len(ramal) > n_max_ramal:
-            n_cpu = int(os.cpu_count() * 0.8)
-            m_ramales, ramal = get_opt_V_MP(m_ramales, ramal, xy_inter, n_cpu)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "get_opt_V_MP")
-        else:
+            pbar.set_description("Optimizing Slopes & Depths...")
+            pbar.update(1)
+
+            # 20. Revision Elevacion Llegada/Salida
+            m_ramales, ramal = check_pz(m_ramales, ramal, xy_inter)
+            pbar.set_description("Verifying Manhole Connections...")
+            pbar.update(1)
+
+            # 21. Optimizar Velocidad Tramo
             m_ramales, ramal = get_opt_V(m_ramales, ramal, xy_inter)
-            t101 = time.time()
-            print(round(t101 - t100, 3), "get_opt_V")
-    
-    
-        "##################################################################################################################"
-        "condiciones hidraulicas"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales, ramal = hydraulic_conditions(m_ramales, ramal)
-        m_ramales, ramal = force_format_diameter(m_ramales, ramal)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "condiciones hidraulicas")
-    
-        t1 = time.time()
-    
-        "##################################################################################################################"
-        "generar outfall"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales = get_outfall(m_ramales, proj_to)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get outfalls")
-    
-    
-        "##################################################################################################################"
-        "segmentacion de pozos epmaps"
-        "##################################################################################################################"
-        t100 = time.time()
-        def classify_pz(diameters, salto, secciones, pozo_inicial, pozo_final):
-            tolerance = 0.06
-            classifications = np.full(diameters.shape, 'pz-esp', dtype='<U10')
-    
-            # Define boundary values in meters
-            boundaries = [0.2, 0.6, 0.8, 1.0, 1.3]
-            # Apply tolerances to boundaries
-            adjusted_boundaries = [b * (1 - tolerance) for b in boundaries[:-1]] + [boundaries[-1]]
-    
-            # Classify based on diameters
-            for i, (lower, upper) in enumerate(zip(adjusted_boundaries[:-1], adjusted_boundaries[1:]), 1):
-                condition = (diameters >= lower) & (diameters < upper)
-                classifications[condition] = f'pz-b{i}'
-    
-            # Propagate larger classifications backwards
-            for i in range(1, len(classifications)):
-                if classifications[i].startswith('pz-b'):
-                    current_class = int(classifications[i][4:]) if classifications[i][4:].isdigit() else 0
-                    prev_class = int(classifications[i - 1][4:]) if classifications[i - 1].startswith('pz-b') and classifications[i - 1][4:].isdigit() else 0
-                    if current_class > prev_class:
-                        classifications[i - 1] = classifications[i]
-    
-            # Apply 'salto' classifications to the previous row
-            salto_s1 = 0.7
-            salto_s2 = 1.2
-            salto_especial = 2.5
-    
-            salto_conditions = [(salto > salto_s1) & (salto <= salto_s2), (salto > salto_s2) & (salto <= salto_especial), salto > salto_especial]
-    
-            for i, condition in enumerate(salto_conditions, 1):
-                classifications[:-1][condition[1:]] = f'pz-s{i}'
-    
-            # remover pozos de canales superficiales abiertos
-            # -------------------------------------------------------------------------------------------------------------
-            filtro_rectangular = secciones == 'rectangular'
-            if len(filtro_rectangular.nonzero()[0]) > 0:
-                # smaller depth from each trench
-                h_min = np.min([pozo_inicial[filtro_rectangular], pozo_final[filtro_rectangular]], axis=0)
-                # altura seccion
-                h_seccion = diameters[filtro_rectangular]
-    
-                # canal abierto
-                filtro_canal_abierto = np.isclose(h_seccion, h_min, atol=0.4)
-                try:
-                    if len(filtro_canal_abierto.nonzero()[0]) > 0:
-                        classifications[filtro_canal_abierto] = ''
-                except:
-                    pass
-    
-            return classifications
-    
-    
-        def get_pz_class(m_ramales):
-            # remover metodos constructivos porque ya se pone esto en los datos hidraulicos
-            metodos_lista = ["mejorar suelo", "Perforacion Horizontal Dirigida", "Tunel", "Reparacion", "Colector", "Zanja Mano", ]
-            metodos_lista = [_.lower() for _ in metodos_lista]
-            metodos_pattern = '|'.join(r'\b{}\b'.format(re.escape(word)) for word in metodos_lista)
-    
-            pz_list = ['pz-b1', 'pz-b2', 'pz-b3', 'pz-b4', 'pz-esp', 'pz-s1', 'pz-s2', 'pz-s3']
-            pz_list = '|'.join(r'\b{}\b'.format(re.escape(word)) for word in pz_list)
-    
-            for ramal in m_ramales.keys():
-                diametros = seccion_str2float(m_ramales[ramal]['D_ext'], return_b=True)
-                saltos = m_ramales[ramal]['SALTO']
-                secciones = m_ramales[ramal]['Seccion']
-                pozo_inicial = m_ramales[ramal]['HI']
-                pozo_final = m_ramales[ramal]['HF']
-    
-                if 'nuevo' in m_ramales[ramal]['Estado']:
-                    m_ramales[ramal]['pz_class'] = classify_pz(diametros, saltos, secciones, pozo_inicial, pozo_final)
-                    obs = pd.Series(m_ramales[ramal]['Obs'])
-                    obs = obs.str.replace(pz_list, ' ', regex=True)
-                    obs = pd.Series(m_ramales[ramal]['pz_class']) + ' ' + obs
-                    obs = obs.str.replace(metodos_pattern, ' ', regex=True)
-                    m_ramales[ramal]['Obs'] = obs.to_numpy()
-                else:
-                    m_ramales[ramal]['pz_class'] = np.full(diametros.shape, '', dtype=object)
-    
-            return m_ramales
-    
-    
-        m_ramales = get_pz_class(m_ramales)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "borrar")
-    
-        t1 = time.time()
-        print("###########################################")
-    
-        "##################################################################################################################"
-        "generar dxf perfil"
-        "##################################################################################################################"
-    
-        t2 = time.time()
-        t100 = time.time()
-        cad_profile_out(m_ramales, ramal,project_name,elev_source, step=5, additional_profile_list=additional_profile_list, fromEPSG=proj_to)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "perfil_dxf")
-    
-    
-        "##################################################################################################################"
-        "generar dxf planta"
-        "##################################################################################################################"
-        t100 = time.time()
-        cad_plane_out(m_ramales, ramal, scale=scale_viewport, project_name=project_name)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "planta_dxf")
-        t3 = time.time()
-   
-        "##################################################################################################################"
-        "identificar tipos de superficies donde se cavan las zanjas"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales = get_street_surface(m_ramales, sup_type, 'Surface', project_name)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "get surfaces")
-    
-    
-        "##################################################################################################################"
-        "generar vector out"
-        "##################################################################################################################"
-        t100 = time.time()
-        m_ramales_gdf = shp_out(m_ramales, ramal, project_name, EPSG=proj_to)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "vector_out")
-    
-    
-        "##################################################################################################################"
-        "generar xls file"
-        "##################################################################################################################"
-        t100 = time.time()
-        to_excell(m_ramales, path_proy + '02_TXT' + os.path.sep + '00_EXCELL', project_name)
-        t101 = time.time()
-        print(round(t101 - t100, 3), "to_excell")
-    
+            pbar.set_description("Optimizing Velocities...")
+            pbar.update(1)
         
-        print("###########################################")
-        if len(ramal) < n_max_ramal:
-            print("numero de ramales:", len(ramal), " - proceso serial")
-        else:
-            print("numero de ramales:", len(ramal), " - proceso en paralelo")
-        
+            # 22. Condiciones Hidraulicas
+            m_ramales, ramal = hydraulic_conditions(m_ramales, ramal)
+            m_ramales, ramal = force_format_diameter(m_ramales, ramal)
+            pbar.set_description("Checking Hydraulic Conditions...")
+            pbar.update(1)
+
+            # 23. Generar Outfall (2)
+            m_ramales = get_outfall(m_ramales, proj_to)
+            pbar.set_description("Updating Outfalls...")
+            pbar.update(1)
+
+            # 24. Segmentacion Pozos EPMAPS
+            m_ramales = get_pz_class(m_ramales)
+            pbar.set_description("Classifying Manholes...")
+            pbar.update(1)
+
+            # 25. Generar Vector Out
+            m_ramales_gdf = shp_out(m_ramales, project_name, EPSG=proj_to, path_out=self.path_out)
+            pbar.set_description("Saving Output Vector...")
+            pbar.update(1)
+            
+
+
+        t1 = time.time()
+        tqdm.write(f"Numero de ramales: {len(ramal)}")
+
         L_total = 0
         P_total = 0
         for i in ramal.values():
             L_total = np.sum(m_ramales[i]["L"]) + L_total
             P_total = np.sum(len(m_ramales[i]["L"])) + P_total
-        print(np.round(np.asarray(L_total / 1000.0), 3), "longitud total", "(km)")
-    
-        print(round(t1 - t0, 3), "duracion simulacion(s)")
-        print(round(t3 - t2, 3), "preparacion dxf (s)")
-    
-        print(round((t1 - t0) / P_total, 3), "(s)/pozo")
-        print(round((t1 - t0) / len(ramal), 3), "(s)/ramal")
 
-        print("###########################################")
-        print("Fin de la ejecución.")
-        print("Fin de negocios de la casima.")
+        tqdm.write(f"{np.round(np.asarray(L_total / 1000.0), 3)} longitud total (km)")
+        tqdm.write(f"{round(t1 - t0, 3)} duracion simulacion(s)")
+        tqdm.write(f"{round((t1 - t0) / len(ramal), 3)} (s)/ramal")
+        tqdm.write("Fin de la ejecución.")
+        tqdm.write("-----------------------------------------------")
+
+
+
+
+
+if __name__ == "__main__":
+
+    # definir sistema de coordenadas del proyecto
+    source_crs = CRS("""PROJCRS["SIRES-DMQ",
+       BASEGEOGCRS["WGS 84",
+           DATUM["World Geodetic System 1984",
+               ELLIPSOID["WGS 84",6378137,298.257223563,
+               LENGTHUNIT["metre",1]],ID["EPSG",6326]],
+           PRIMEM["Greenwich",0,
+               ANGLEUNIT["Degree",0.0174532925199433]]],
+       CONVERSION["unnamed",
+           METHOD["Transverse Mercator",ID["EPSG",9807]],
+           PARAMETER["Latitude of natural origin",0,
+               ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8801]],
+           PARAMETER["Longitude of natural origin",-78.5,
+               ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8802]],
+           PARAMETER["Scale factor at natural origin",1.0004584,
+               SCALEUNIT["unity",1],ID["EPSG",8805]],
+           PARAMETER["False easting",500000,
+               LENGTHUNIT["metre",1],ID["EPSG",8806]],
+           PARAMETER["False northing",10000000,
+               LENGTHUNIT["metre",1],ID["EPSG",8807]]],
+       CS[Cartesian,3],
+       AXIS["(E)",east,ORDER[1],
+           LENGTHUNIT["metre",1,ID["EPSG",9001]]],
+       AXIS["(N)",north,ORDER[2],
+           LENGTHUNIT["metre",1,ID["EPSG",9001]]],
+       AXIS["ellipsoidal height (h)",up,ORDER[3],
+       LENGTHUNIT["metre",1,ID["EPSG",9001]]]]""")
+    proj_to = source_crs.to_2d()
+
+    # Se asume ejecución desde carpeta codigos: root = parent dir
+    project_root = Path(os.getcwd()).parent
+    elev_file = project_root / r"gis\01_raster\elev_10_dmq_reprojected.tif"
+
+    flows_dict = {}
+    pozo_hmin_dict = {}
+    for i, pair in enumerate([7.12, 1.658, 0.49, 0.9, 0.86, 0.5, 0.153]):
+        ramal_name = str(i)
+        flows_dict[ramal_name + '.0'] = pair
+        pozo_hmin_dict[ramal_name + '.0'] = 1.5
+
+    pipeline = SewerPipeline(
+        elev_file_path=str(elev_file),
+        vector_file_path=r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Case_0001\input_routes.gpkg',
+        project_name='Case_0001',
+        pozo_hmin_dict=pozo_hmin_dict,
+        flows_dict=flows_dict,
+        proj_to=str(proj_to),
+        path_out=r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Case_0001'
+    )
+
+    pipeline.run()
+
 
