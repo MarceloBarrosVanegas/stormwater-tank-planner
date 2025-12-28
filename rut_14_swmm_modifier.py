@@ -213,6 +213,50 @@ class SWMMModifier:
             # Insert if not found
             self.lines.insert(header_idx + 1, f"REPORT_STEP          {time_step}\n")
 
+    def set_end_time(self, end_time="03:30:00"):
+        """
+        Updates the END_TIME in the [OPTIONS] section.
+        Controls simulation duration.
+        
+        Parameters
+        ----------
+        end_time : str
+            The end time in HH:MM:SS format.
+        """
+        section = "[OPTIONS]"
+        header_idx = -1
+        
+        # Find section
+        for i, line in enumerate(self.lines):
+            if line.strip().upper() == section:
+                header_idx = i
+                break
+        
+        if header_idx == -1:
+            print("Warning: [OPTIONS] section not found.")
+            return
+
+        # Scan for END_TIME
+        found = False
+        current_idx = header_idx + 1
+        while current_idx < len(self.lines):
+            line = self.lines[current_idx]
+            if line.strip().startswith("["):
+                break # New section
+                
+            parts = line.split()
+            if len(parts) > 1 and parts[0].upper() == "END_TIME":
+                # Replace line
+                self.lines[current_idx] = f"END_TIME             {end_time}\n"
+                print(f"  [Info] Updated END_TIME to {end_time}")
+                found = True
+                break
+            current_idx += 1
+            
+        if not found:
+            # Insert if not found
+            self.lines.insert(header_idx + 1, f"END_TIME             {end_time}\n")
+
     def add_storage_unit(self, name, area, max_depth, terrain_elev=None, node_invert=None, invert_elev=None):
         """
         Adds a FUNCTIONAL storage unit (Constant Area) to the SWMM model.

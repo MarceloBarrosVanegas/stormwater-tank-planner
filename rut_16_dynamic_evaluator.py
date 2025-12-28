@@ -277,6 +277,99 @@ class DynamicSolutionEvaluator:
         except:
              return 200.0
 
+    def _get_pipe_vertical_dim(self, link_id: str) -> float:
+        """
+        Get the vertical dimension (diameter or height) of a pipe in meters.
+        Returns the vertical dimension, not the full geometry.
+        """
+        try:
+            links = self.swmm_model.links()
+            if link_id in links.index:
+                row = links.loc[link_id]
+                geom1 = row.get('Geom1', 0.0)
+                shape = str(row.get('Shape', 'CIRCULAR')).upper()
+                
+                # For circular pipes, Geom1 is diameter
+                # For rectangular, Geom1 is height
+                if pd.notna(geom1) and geom1 > 0:
+                    return float(geom1)
+        except Exception as e:
+            pass
+        return 0.5  # Default 0.5m if not found
+    
+    def _get_node_min_pipe_depth(self, node_id: str) -> float:
+        """
+        Get the minimum vertical dimension of pipes connected to a node.
+        Checks both inlet (upstream) and outlet (downstream) pipes.
+        Returns the minimum 0.7 * vertical_dim of all connected pipes.
+        
+        This is used to set the weir crest height - the weir should activate
+        when water exceeds 70% of the pipe capacity.
+        """
+        try:
+            import swmmio
+            model = swmmio.Model(str(self.inp_file))  # Convert Path to string
+            links = model.links.dataframe
+            xsections = model.inp.xsections
+            
+            min_vertical = float('inf')
+            
+            for link_id, row in links.iterrows():
+                inlet = str(row.get('InletNode', ''))
+                outlet = str(row.get('OutletNode', ''))
+                
+                # Check if this link is connected to our node
+                if inlet == node_id or outlet == node_id:
+                    # Get geometry from xsections
+                    if link_id in xsections.index:
+                        geom1 = xsections.loc[link_id, 'Geom1']
+                        if pd.notna(geom1) and float(geom1) > 0:
+                            vertical_dim = float(geom1)
+                            if vertical_dim < min_vertical:
+                                min_vertical = vertical_dim
+            
+            if min_vertical == float('inf'):
+                return 0.35  # Default: 0.7 * 0.5m = 0.35m
+            
+            return 0.7 * min_vertical  # Return 0.7 * minimum vertical dimension
+            
+        except Exception as e:
+            print(f"  [Warning] Could not get pipe dimensions for {node_id}: {e}")
+            return 0.35  # Default
+    
+    def _design_weir_hydraulic(self, node_id: str, tank_volume: float) -> dict:
+        """
+        Design weir based on hydraulic principles.
+        
+        Crest height = min(0.7*D_inlet, 0.7*D_outlet) 
+        Width calculated from weir equation: Q = Cd * L * H^1.5
+        
+        Returns dict with: crest_height, width, design_flow
+        """
+        # Get minimum 0.7D from connected pipes
+        crest_height = self._get_node_min_pipe_depth(node_id)
+        crest_height = max(0.10, min(crest_height, 0.50))  # Clamp 0.10m to 0.50m
+        
+        # Estimate storm duration to calculate required flow
+        STORM_PEAK_DURATION_HOURS = 2.0
+        target_flow = tank_volume / (STORM_PEAK_DURATION_HOURS * 3600.0)  # m³/s
+        
+        # Weir equation: Q = Cd * L * H^1.5
+        Cd = 1.84  # Rectangular weir discharge coefficient
+        H_design = 0.25  # Design head above crest (m)
+        
+        # Calculate required weir length
+        weir_width = target_flow / (Cd * (H_design ** 1.5))
+        weir_width = max(1.0, min(30.0, weir_width))  # Clamp 1m to 30m
+        
+        return {
+            'crest_height': crest_height,
+            'width': weir_width,
+            'design_flow': target_flow,
+            'Cd': Cd
+        }
+
+
     def _run_baseline(self) -> SystemMetrics:
         """Runs the base INP file once to establish baseline metrics."""
         # FIX: Ensure baseline uses a distinct output file to avoid overlap with solution runs
@@ -699,8 +792,15 @@ class DynamicSolutionEvaluator:
         temp_inp = case_dir / "model.inp"
         modifier = SWMMModifier(self.inp_file)
         
-        # FIX: Force high-resolution reporting to capture flash flood peaks
-        modifier.set_report_step("00:01:00")
+        # FIX: Apply simulation timing from config
+        report_step = f"00:{config.REPORT_STEP_MINUTES:02d}:00"
+        modifier.set_report_step(report_step)
+        
+        # Set simulation duration from config
+        hours = int(config.ITZI_SIMULATION_DURATION_HOURS)
+        minutes = int((config.ITZI_SIMULATION_DURATION_HOURS - hours) * 60)
+        end_time = f"{hours:02d}:{minutes:02d}:00"
+        modifier.set_end_time(end_time)
         
         # Calculate Construction Cost based on DESIGNED gdf
         total_cost = 0.0
@@ -793,51 +893,27 @@ class DynamicSolutionEvaluator:
         
         # --- ADD DIVERSION WEIRS (AFTER pipeline so junctions exist) ---
         # Create weirs to divert flow from flooding nodes to the derivation pipes
-        # IMPORTANT: Weir is sized based on TANK VOLUME, not flooding flow
+        # IMPORTANT: Weir crest height = min(0.7*D_inlet, 0.7*D_outlet) - hydraulic design
         for i, pair in enumerate(active_pairs):
             weir_name = f"WR_{pair.node_id}_{i}"
             diversion_node = f"{i}.0"  # First node of the derivation pipe (was just created)
             
-            # --- WEIR DESIGN BASED ON TANK VOLUME ---
-            # Clamp tank volume to limits (1000 - 10000 m³)
+            # --- HYDRAULIC WEIR DESIGN ---
+            # Get tank volume (clamped)
             MIN_TANK_VOL = 1000.0
             MAX_TANK_VOL = 10000.0
             raw_volume = pair.volume if pair.volume > 0 else 3000.0
             tank_volume_m3 = max(MIN_TANK_VOL, min(raw_volume, MAX_TANK_VOL))
             
-            # Estimate storm duration (TR25 typically peaks over ~2-3 hours)
-            STORM_PEAK_DURATION_HOURS = 2.0
+            # Calculate weir dimensions using hydraulic equations
+            weir_design = self._design_weir_hydraulic(pair.node_id, tank_volume_m3)
             
-            # Calculate target flow rate to fill tank
-            # Q_target = Volume / Duration
-            target_q = tank_volume_m3 / (STORM_PEAK_DURATION_HOURS * 3600.0)  # m³/s
+            crest_height = weir_design['crest_height']
+            weir_width = weir_design['width']
+            target_q = weir_design['design_flow']
+            Cd = weir_design['Cd']
             
-            # Weir equation: Q = Cd * L * H^1.5
-            # Where:
-            #   Q = target flow to divert (m³/s)
-            #   Cd = 1.84 (discharge coefficient for rectangular weir)
-            #   H = design head above crest (m)
-            #   L = weir crest length (m)
-            
-            Cd = 1.84
-            H_design = 0.25  # Design head (0.25m)
-            
-            # Calculate required weir length
-            weir_width = target_q / (Cd * (H_design ** 1.5))
-            weir_width = max(1.0, min(30.0, weir_width))  # Limits: 1m to 30m
-            
-            # Crest height: Higher crest = less aggressive capture
-            # Use 0.10m base, adjust up if tank is small relative to flooding
-            base_flood = pair.flooding_flow if hasattr(pair, 'flooding_flow') and pair.flooding_flow > 0 else 1.0
-            flood_vol_estimate = base_flood * 3600 * STORM_PEAK_DURATION_HOURS
-            
-            # If tank < 50% of flooding, raise crest to capture less
-            if flood_vol_estimate > 0 and tank_volume_m3 < (flood_vol_estimate * 0.5):
-                crest_height = 0.20  # Higher crest = less capture
-            else:
-                crest_height = 0.10  # Standard crest
-            
-            print(f"  [Weir Design] {weir_name}: TankVol={tank_volume_m3:.0f}m³ -> Q={target_q:.2f} cms, W={weir_width:.2f}m (Cr={crest_height}m)")
+            print(f"  [Weir Hydraulic] {weir_name}: 0.7D={crest_height:.2f}m, TankVol={tank_volume_m3:.0f}m³ -> Q={target_q:.2f} cms, W={weir_width:.2f}m")
             
             modifier.add_weir(
                 name=weir_name,

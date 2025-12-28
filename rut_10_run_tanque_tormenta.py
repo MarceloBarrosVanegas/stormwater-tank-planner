@@ -533,10 +533,10 @@ if __name__ == "__main__":
     # Se asume ejecución desde carpeta codigos: root = parent dir
     project_root = config.PROJECT_ROOT
 
-    elev_file = config.PROJECT_ROOT / r"gis\01_raster\elev_10_dmq_reprojected.tif"
-    predios_path = config.PROJECT_ROOT / r"gis\00_vector\07_predios_disponibles.shp"
-    flooding_nodes_path = config.PROJECT_ROOT / r"codigos\00_flooding_stats\00_flooding_nodes.gpkg"
-    swmm_file = project_root / "COLEGIO_TR25_v6.inp"
+    elev_file = config.ELEV_FILE
+    predios_path = config.PREDIOS_FILE
+    flooding_nodes_path = config.FLOODING_NODES_FILE
+    swmm_file = config.SWMM_FILE
     
     
     # Example Usage

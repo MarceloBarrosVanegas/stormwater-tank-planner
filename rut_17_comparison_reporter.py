@@ -14,6 +14,13 @@ from pathlib import Path
 from pyswmm import Output
 from swmm.toolkit.shared_enum import NodeAttribute, LinkAttribute, SystemAttribute
 
+# Import time limit from config
+try:
+    import config
+    PLOT_TIME_LIMIT_HOURS = config.PLOT_TIME_LIMIT_HOURS
+except:
+    PLOT_TIME_LIMIT_HOURS = 3.5  # Default: 3.5 hours
+
 plt.style.use('ggplot')
 
 @dataclass
@@ -661,6 +668,7 @@ class ScenarioComparator:
         ax.set_title("Total System Flooding Rate (All Nodes)")
         ax.set_ylabel("Flooding Rate (cms)")
         ax.set_xlabel("Time (hours)")
+        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
         ax.legend()
         ax.grid(True, alpha=0.3)
         
@@ -763,6 +771,7 @@ class ScenarioComparator:
         ax.set_title("Cumulative Flooding Volume Over Time")
         ax.set_ylabel("Cumulative Volume (m³)")
         ax.set_xlabel("Time (hours)")
+        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
         ax.legend(loc='upper left')
         ax.grid(True, alpha=0.3)
         
@@ -925,6 +934,7 @@ class ScenarioComparator:
             ax1.set_title(f'{tank_id}\nWeir Flow (Inflow)')
             ax1.set_xlabel('Time (hours)')
             ax1.set_ylabel('Flow (m³/s)')
+            ax1.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
             ax1.grid(True, alpha=0.3)
             
             # ===== COL 2: CUMULATIVE VOLUME =====
@@ -949,6 +959,7 @@ class ScenarioComparator:
             ax2.set_title('Cumulative Volume')
             ax2.set_xlabel('Time (hours)')
             ax2.set_ylabel('Volume (m³)')
+            ax2.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
             ax2.grid(True, alpha=0.3)
             
             # ===== COL 3: TANK DEPTH (FILLING CURVE) =====
@@ -972,6 +983,7 @@ class ScenarioComparator:
             ax3.set_title('Tank Depth (Filling Curve)')
             ax3.set_xlabel('Time (hours)')
             ax3.set_ylabel('Depth (m)')
+            ax3.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
             ax3.set_ylim(0, max(designed_depth * 1.2, max_depth * 1.1))
             ax3.legend(loc='upper left', fontsize=8)
             ax3.grid(True, alpha=0.3)
@@ -1285,6 +1297,7 @@ class ScenarioComparator:
                 
         ax_sol.set_xlabel("Time (h)")
         ax_sol.set_ylabel("Flow (CMS)")
+        ax_sol.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
         ax_sol.legend(loc='upper right', fontsize='small')
         ax_sol.grid(True, alpha=0.3)
         
@@ -1304,6 +1317,7 @@ class ScenarioComparator:
                 ax_base.plot(get_hrs(d), d['flow'], color='green', linestyle='--', alpha=0.7, label=f'Base Después: {lid}')
                 
         ax_base.set_xlabel("Time (h)")
+        ax_base.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
         # ax_base.set_ylabel("Flow (CMS)") # Shared axis concept
         ax_base.legend(loc='upper right', fontsize='small')
         ax_base.grid(True, alpha=0.3)
@@ -1356,6 +1370,7 @@ class ScenarioComparator:
         ax.set_xlabel("Time (hours)")
         ax.set_ylabel("Flow (CMS)")
         ax.set_title("Flow Hydrographs @ Intervention Links")
+        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis to configured hours
         if has_plotted:
              ax.legend(fontsize='small', ncol=2)
         ax.grid(True, alpha=0.3)
@@ -1712,6 +1727,7 @@ class ScenarioComparator:
         ax.set_xlabel("Time (hours)")
         ax.set_ylabel("Depth (m)")
         ax.set_title("Hydrographs @ Critical Nodes")
+        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
         ax.legend()
         ax.grid(True)
 
@@ -1849,6 +1865,11 @@ class ScenarioComparator:
                 ax_flow.set_xlabel("Time (h)")
                 ax_vol.set_xlabel("Time (h)")
                 ax_depth.set_xlabel("Time (h)")
+                
+                # Limit X-axis to configured duration
+                ax_flow.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
+                ax_vol.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
+                ax_depth.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
                 
             fig.suptitle(f"{solution_name}: Tank Hydrographs (Page {batch_idx+1})", fontsize=16)
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])

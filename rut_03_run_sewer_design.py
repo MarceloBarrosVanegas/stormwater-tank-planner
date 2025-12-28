@@ -96,7 +96,7 @@ from scipy.interpolate import CubicSpline
 warnings.filterwarnings("ignore")
 np.seterr(divide="ignore", invalid="ignore")
 warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
+# np.VisibleDeprecationWarning removed in numpy 2.x
 
 pd.options.mode.chained_assignment = None
 os.environ["USE_PYGEOS"] = "0"
