@@ -87,7 +87,16 @@ FLOODING_STATS_DIR = CODIGOS_DIR / "00_flooding_stats"
 # =============================================================================
 # SWMM
 SWMM_FILE = CODIGOS_DIR / "COLEGIO_TR25_v6.inp"
-BASE_INP_TR = 25 # Return Period (years) of the base INP file
+BASE_INP_TR = 25  # Return Period (years) of the base INP file
+
+# Return Period List for analysis:
+#   [] or [BASE_INP_TR] = Deterministic (single TR from config)
+#   [tr1, tr2, ...]     = Probabilistic (EAD calculation)
+TR_LIST = [BASE_INP_TR]  # Change to [1,2,5,10,25,50,100] for probabilistic EAD
+VALIDATION_TR_LIST = [1,2,5,10,25,50,100]  # For NSGA final validation
+N_GENERATIONS = 300  # NSGA generations
+POP_SIZE = 100  # NSGA population
+MIN_TANKS = 3   # Minimum number of active tanks (constraint for NSGA)
 
 # Rasters
 ELEV_FILE_ORIGINAL = RASTER_DIR / "elev_10_dmq_reprojected_clipped.tif"
@@ -130,14 +139,14 @@ MANNING_RASTER_FILE = RASTER_DIR / "manning_raster.tif"
 # =============================================================================
 # SIMULATION PARAMETERS
 # =============================================================================
-ITZI_SIMULATION_DURATION_HOURS = 0.25  # Duration for Itzi/SWMM simulation (Hours)
+ITZI_SIMULATION_DURATION_HOURS = 3.5  # Duration for Itzi/SWMM simulation (Hours)
 REPORT_STEP_MINUTES = 5               # Report step for SWMM and Itzi
 PLOT_TIME_LIMIT_HOURS = 3.5           # Limit X-axis on time plots
 
 # =============================================================================
 # COST PARAMETERS
 # =============================================================================
-FLOODING_COST_PER_M3 = 1250.0  # Cost per cubic meter of flooding
+
 
 # Modular cost components for optimization
 COST_COMPONENTS = {
@@ -153,6 +162,18 @@ TANK_DEPTH_M = 5.0              # Default tank depth in meters
 TANK_MIN_VOLUME_M3 = 1000.0     # Minimum tank volume in cubic meters
 TANK_MAX_VOLUME_M3 = 10000.0    # Maximum tank volume in cubic meters
 TANK_OCCUPATION_FACTOR = 1.2    # Extra space factor for access, pumps, maneuvering
+# Tank Volume Sizing
+TANK_VOLUME_SAFETY_FACTOR = 1.2 # Safety factor applied to flooding volume
+TANK_DEFAULT_VOLUME_M3 = 3000.0 # Fallback volume if flooding volume is unknown
+
+# WEIR DESIGN PARAMETERS
+WEIR_DISCHARGE_COEFF = 1.84     # Rectangular weir discharge coefficient (Cd)
+WEIR_CREST_MIN_M = 0.10         # Minimum weir crest height (m)
+WEIR_CREST_MAX_M = 0.50         # Maximum weir crest height (m)
+
+# LAND COST PARAMETERS
+LAND_COST_PER_M2 = 50.0         # Base cost per square meter of land
+PREDIO_VIOLATION_THRESHOLD = 1000.0 # Threshold for penalizing oversized tanks occupying predio
 
 # =============================================================================
 # PROJECT METADATA (for reports and Excel output)

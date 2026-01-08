@@ -328,7 +328,7 @@ class NetworkExporter:
             # 5. Set CRS if provided
             if crs:
                 gdf.set_crs(crs, inplace=True, allow_override=True)
-                print(f"CRS set to: {crs}")
+                # print(f"CRS set to: {crs}")
                     
             if output_gpkg:
                 print(f"Saving to {output_gpkg}...")

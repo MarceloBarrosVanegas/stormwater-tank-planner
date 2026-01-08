@@ -164,7 +164,7 @@ class DynamicSolutionEvaluator:
 
 
         # --- METRICS & COMPARATOR ---
-        self.metric_extractor = MetricExtractor(flooding_cost_per_m3=config.FLOODING_COST_PER_M3)
+        self.metric_extractor = MetricExtractor()
         # Load existing network topology for link analysis
         self.node_topology = {} # NodeID -> {'upstream_links': [], 'downstream_links': []}
         self.static_link_data = {} # LinkID -> {'q_full': float, 'length': float, 'geom1': float}
@@ -203,7 +203,19 @@ class DynamicSolutionEvaluator:
             baseline_dir = self.work_dir / "00_Baseline"
             baseline_dir.mkdir(parents=True, exist_ok=True)
 
-            TR_LIST = [1, 2, 5, 10, 25, 50, 100]
+            # Use TR_LIST from config
+            # [] or [single] = Deterministic, [multiple] = Probabilistic EAD
+            TR_LIST = config.TR_LIST if config.TR_LIST else [config.BASE_INP_TR]
+            
+            if len(TR_LIST) == 0:
+                TR_LIST = [config.BASE_INP_TR]
+            
+            self.is_probabilistic_mode = len(TR_LIST) > 1
+            
+            if self.is_probabilistic_mode:
+                print(f"  [Baseline] Probabilistic mode - TRs: {TR_LIST}")
+            else:
+                print(f"  [Baseline] Deterministic mode - TR: {TR_LIST[0]}")
 
             # 3. Instantiate Runner
 
@@ -216,39 +228,54 @@ class DynamicSolutionEvaluator:
             # 4. Run Analysis
             damage_baseline = runner.run(tr_list=TR_LIST)
             
-            # Extract and display baseline EAD
+            # Extract and store baseline costs
             results = damage_baseline.get('results', [])
             if results:
-                # Calculate total EAD using trapezoidal integration
-                trs = [r['tr'] for r in results]
-                probs = [1.0 / tr for tr in trs]
-                total_damages = [r['total_impact_usd'] for r in results]
-                flood_damages = [r['flood_damage_usd'] for r in results]
-                investment_costs = [r['investment_cost_usd'] for r in results]
-                
-                # EAD = Area under the risk curve
-                ead_total = 0
-                ead_flood = 0
-                ead_investment = 0
-                for i in range(len(trs) - 1):
-                    dp = probs[i] - probs[i+1]
-                    ead_total += dp * (total_damages[i] + total_damages[i+1]) / 2
-                    ead_flood += dp * (flood_damages[i] + flood_damages[i+1]) / 2
-                    ead_investment += dp * (investment_costs[i] + investment_costs[i+1]) / 2
-                
-                # Store for optimization comparison
-                self.baseline_ead_total = ead_total
-                self.baseline_ead_flood = ead_flood
-                self.baseline_ead_investment = ead_investment
-                self.baseline_flood_damage = ead_flood  # For optimizer compatibility
-                
-                print(f"\n  {'='*60}")
-                print(f"  BASELINE EAD (Expected Annual Damage)")
-                print(f"  {'='*60}")
-                print(f"  EAD Flood Damage:      ${ead_flood:,.2f}/año")
-                print(f"  EAD Infrastructure:    ${ead_investment:,.2f}/año")
-                print(f"  EAD TOTAL:             ${ead_total:,.2f}/año")
-                print(f"  {'='*60}\n")
+                if self.is_probabilistic_mode:
+                    # Calculate EAD using trapezoidal integration
+                    trs = [r['tr'] for r in results]
+                    probs = [1.0 / tr for tr in trs]
+                    total_damages = [r['total_impact_usd'] for r in results]
+                    flood_damages = [r['flood_damage_usd'] for r in results]
+                    investment_costs = [r['investment_cost_usd'] for r in results]
+                    
+                    # EAD = Area under the risk curve
+                    ead_total = 0
+                    ead_flood = 0
+                    ead_investment = 0
+                    for i in range(len(trs) - 1):
+                        dp = probs[i] - probs[i+1]
+                        ead_total += dp * (total_damages[i] + total_damages[i+1]) / 2
+                        ead_flood += dp * (flood_damages[i] + flood_damages[i+1]) / 2
+                        ead_investment += dp * (investment_costs[i] + investment_costs[i+1]) / 2
+                    
+                    # Store for optimization comparison
+                    self.baseline_ead_total = ead_total
+                    self.baseline_ead_flood = ead_flood
+                    self.baseline_ead_investment = ead_investment
+                    self.baseline_infra_cost = ead_investment  # Use EAD for comparison
+                    self.baseline_flood_damage = ead_flood
+                    
+                    print(f"\n  {'='*60}")
+                    print(f"  BASELINE EAD (Expected Annual Damage)")
+                    print(f"  {'='*60}")
+                    print(f"  EAD Flood Damage:      ${ead_flood:,.2f}/año")
+                    print(f"  EAD Infrastructure:    ${ead_investment:,.2f}/año")
+                    print(f"  EAD TOTAL:             ${ead_total:,.2f}/año")
+                    print(f"  {'='*60}\n")
+                else:
+                    # Single TR: use direct cost (no EAD)
+                    result = results[0]
+                    self.baseline_infra_cost = result['investment_cost_usd']
+                    self.baseline_flood_damage = result['flood_damage_usd']
+                    self.baseline_ead_investment = self.baseline_infra_cost  # For compatibility
+                    
+                    print(f"\n  {'='*60}")
+                    print(f"  BASELINE SINGLE TR{result['tr']} COST")
+                    print(f"  {'='*60}")
+                    print(f"  Flood Damage:          ${self.baseline_flood_damage:,.2f}")
+                    print(f"  Infrastructure:        ${self.baseline_infra_cost:,.2f}")
+                    print(f"  {'='*60}\n")
 
     # python
     def _build_topology_from_conduits(self, conduits: pd.DataFrame, clear_existing: bool = False):
@@ -405,36 +432,68 @@ class DynamicSolutionEvaluator:
             print(f"  [Warning] Could not get pipe dimensions for {node_id}: {e}")
             return 0.35  # Default
     
-    def _design_weir_hydraulic(self, node_id: str, tank_volume: float) -> dict:
+    def _design_weir_hydraulic(self, node_id: str, tank_volume: float, flooding_flow: float = None) -> dict:
         """
         Design weir based on hydraulic principles.
         
-        Crest height = min(0.7*D_inlet, 0.7*D_outlet) 
+        Crest height = min(0.7*D_inlet, 0.7*D_outlet)
+        Head above crest = Node depth - Crest height (available head)
         Width calculated from weir equation: Q = Cd * L * H^1.5
         
-        Returns dict with: crest_height, width, design_flow
+        Parameters:
+            node_id: SWMM node ID
+            tank_volume: Design tank volume (m³)
+            flooding_flow: Known flooding flow at node (m³/s), if available
+        
+        Returns dict with: crest_height, width, design_flow, Cd, H_design
         """
         # Get minimum 0.7D from connected pipes
         crest_height = self._get_node_min_pipe_depth(node_id)
-        crest_height = max(0.10, min(crest_height, 0.50))  # Clamp 0.10m to 0.50m
+        crest_height = max(config.WEIR_CREST_MIN_M, min(crest_height, config.WEIR_CREST_MAX_M))
         
-        # Estimate storm duration to calculate required flow
-        STORM_PEAK_DURATION_HOURS = 2.0
-        target_flow = tank_volume / (STORM_PEAK_DURATION_HOURS * 3600.0)  # m³/s
+        # Get node depth to calculate available head above crest
+        node_row = self.nodes_gdf[self.nodes_gdf['NodeID'] == node_id]
+        if len(node_row) > 0:
+            node_depth = float(node_row.iloc[0].get('NodeDepth', 2.0))
+        else:
+            node_depth = 2.0  # Default
+        
+        # Available head = Node depth - Crest height (water can rise this high above crest)
+        # Use 70% of available head as design head for safety
+        available_head = node_depth - crest_height
+        H_design = max(0.15, min(available_head * 0.7, 1.0))  # Clamp 0.15m to 1.0m
+        
+        # Determine design flow
+        if flooding_flow and flooding_flow > 0:
+            # Use actual flooding flow if available
+            target_flow = flooding_flow
+        else:
+            # Estimate from tank volume and storm duration
+            STORM_PEAK_DURATION_HOURS = config.ITZI_SIMULATION_DURATION_HOURS if hasattr(config, 'ITZI_SIMULATION_DURATION_HOURS') else 2.0
+            target_flow = tank_volume / (STORM_PEAK_DURATION_HOURS * 3600.0)  # m³/s
+        
+        # Apply safety factor of 1.2 for peak flow
+        target_flow = target_flow * 1.2
         
         # Weir equation: Q = Cd * L * H^1.5
-        Cd = 1.84  # Rectangular weir discharge coefficient
-        H_design = 0.25  # Design head above crest (m)
+        # For SIDEFLOW weir, Cd is typically between 1.7-1.9
+        Cd = config.WEIR_DISCHARGE_COEFF
         
-        # Calculate required weir length
-        weir_width = target_flow / (Cd * (H_design ** 1.5))
+        # Calculate required weir length: L = Q / (Cd * H^1.5)
+        if H_design > 0:
+            weir_width = target_flow / (Cd * (H_design ** 1.5))
+        else:
+            weir_width = 5.0  # Default
+            
         weir_width = max(1.0, min(30.0, weir_width))  # Clamp 1m to 30m
         
         return {
             'crest_height': crest_height,
             'width': weir_width,
             'design_flow': target_flow,
-            'Cd': Cd
+            'Cd': Cd,
+            'H_design': H_design,
+            'node_depth': node_depth
         }
 
 
@@ -580,6 +639,16 @@ class DynamicSolutionEvaluator:
                         # Ensure we operate on the geometry column safely
                         if not path_gdf.empty:
                             geom = path_gdf.geometry.iloc[0]
+                            
+                            # Handle MultiLineString - merge into single LineString
+                            if geom.geom_type == 'MultiLineString':
+                                from shapely.ops import linemerge
+                                geom = linemerge(geom)
+                                # If still multi after merge, take longest
+                                if geom.geom_type == 'MultiLineString':
+                                    geom = max(geom.geoms, key=lambda g: g.length)
+                                path_gdf.geometry.iloc[0] = geom
+                            
                             if geom.geom_type == 'LineString':
                                 coords = list(geom.coords)
                                 # Force first point key to match exact node
@@ -600,8 +669,11 @@ class DynamicSolutionEvaluator:
                             active_pairs[i].geometry = path_gdf.geometry.iloc[0]
                             
             except Exception as e:
-                print(f"    Error generating path for pair {i+1}: {e}")
-                continue
+                import traceback
+                print(f"\n  [FATAL ERROR] Path generation failed for pair {i+1} ({pair.node_id} -> Predio {pair.predio_id})")
+                print(f"  Error: {e}")
+                traceback.print_exc()
+                raise RuntimeError(f"Path generation failed for {pair.node_id}: {e}") from e
         
         return path_gdfs
 
@@ -900,7 +972,7 @@ class DynamicSolutionEvaluator:
             # Add tank coordinates
             modifier.add_coordinate(tank_name, pair.predio_x, pair.predio_y)
             
-            c_land = (pair.volume / config.TANK_DEPTH_M * config.TANK_OCCUPATION_FACTOR) * 50.0 
+            c_land = (pair.volume / config.TANK_DEPTH_M * config.TANK_OCCUPATION_FACTOR) * config.LAND_COST_PER_M2 
             c_tank = CostCalculator.calculate_tank_cost(pair.volume)
             pair.cost_tank = c_tank
             pair.cost_land = c_land
@@ -926,6 +998,11 @@ class DynamicSolutionEvaluator:
         # Create weirs to divert flow from flooding nodes to the derivation pipes
         # IMPORTANT: Weir crest height = min(0.7*D_inlet, 0.7*D_outlet) - hydraulic design
         for i, pair in enumerate(active_pairs):
+            # Skip if pipeline was not created for this ramal (path generation failed)
+            if i not in ramal_end_data:
+                print(f"  [Weir] SKIPPED: No pipeline for pair {i} ({pair.node_id})")
+                continue
+                
             weir_name = f"WR_{pair.node_id}_{i}"
             diversion_node = f"{i}.0"  # First node of the derivation pipe (was just created)
             
@@ -933,18 +1010,23 @@ class DynamicSolutionEvaluator:
             # Get tank volume (clamped)
             MIN_TANK_VOL = config.TANK_MIN_VOLUME_M3
             MAX_TANK_VOL = config.TANK_MAX_VOLUME_M3
-            raw_volume = pair.volume if pair.volume > 0 else 3000.0
+            raw_volume = pair.volume if pair.volume > 0 else config.TANK_DEFAULT_VOLUME_M3
             tank_volume_m3 = max(MIN_TANK_VOL, min(raw_volume, MAX_TANK_VOL))
             
             # Calculate weir dimensions using hydraulic equations
-            weir_design = self._design_weir_hydraulic(pair.node_id, tank_volume_m3)
+            weir_design = self._design_weir_hydraulic(
+                node_id=pair.node_id, 
+                tank_volume=tank_volume_m3,
+                flooding_flow=pair.flooding_flow
+            )
             
             crest_height = weir_design['crest_height']
             weir_width = weir_design['width']
             target_q = weir_design['design_flow']
             Cd = weir_design['Cd']
+            H_design = weir_design.get('H_design', 0.25)
             
-            print(f"  [Weir Hydraulic] {weir_name}: 0.7D={crest_height:.2f}m, TankVol={tank_volume_m3:.0f}m³ -> Q={target_q:.2f} cms, W={weir_width:.2f}m")
+            print(f"  [Weir Hydraulic] {weir_name}: Crest={crest_height:.2f}m, H={H_design:.2f}m, TankVol={tank_volume_m3:.0f}m³ -> Q={target_q:.2f} cms, W={weir_width:.2f}m")
             
             modifier.add_weir(
                 name=weir_name,
@@ -981,9 +1063,12 @@ class DynamicSolutionEvaluator:
             with Simulation(str(final_inp_path), outputfile=str(out_file)) as sim:
                 for _ in sim: pass
         except Exception as e:
-            print(f"  [Error] SWMM Simulation failed: {e}")
-            # Fallback to invalid high flooding
-            return total_cost, 9e9
+            import traceback
+            print(f"\n  [FATAL ERROR] SWMM Simulation failed!")
+            print(f"  INP File: {final_inp_path}")
+            print(f"  Error: {e}")
+            traceback.print_exc()
+            raise RuntimeError(f"SWMM Simulation failed for {solution_name}: {e}") from e
             
         # Extract Real Metrics
         # (Moved below to include target links calculation)
@@ -1157,7 +1242,7 @@ class DynamicSolutionEvaluator:
         # This ensures generate_tank_hydrograph_plots has access to design_vol
         for pair in active_pairs:
             tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
-            designed_depth = 5.0  # We use 5m depth in tank design
+            designed_depth = config.TANK_DEPTH_M
             designed_vol = pair.volume
             
             if tank_name in current_metrics.tank_utilization:
@@ -1244,7 +1329,7 @@ class DynamicSolutionEvaluator:
             print(f"  {'-'*70}")
             for pair in active_pairs:
                 tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
-                designed_depth = 5.0  # We use 5m depth in tank design
+                designed_depth = config.TANK_DEPTH_M
                 designed_vol = pair.volume
                 
                 if tank_name in current_metrics.tank_utilization:
@@ -1349,32 +1434,44 @@ class DynamicSolutionEvaluator:
             print(f"  [Economics] Flood Damage: $0.00 (ITZI/CLIMADA disabled)")
         
         # --- GENERATE AVOIDED COST BUDGET (if deferred_investment enabled) ---
+        infrastructure_benefit = 0.0
+        solution_infra_cost = 0.0
+        
         if config.COST_COMPONENTS.get('deferred_investment', False):
             from rut_20_avoided_costs import DeferredInvestmentCost
             deferred_calc = DeferredInvestmentCost(
                 base_precios_path=str(config.CODIGOS_DIR / "base_precios.xlsx"),
                 capacity_threshold=0.9
             )
-            deferred_calc.run(
+            solution_infra_cost = deferred_calc.run(
                 inp_path=str(final_inp_path),
                 output_dir=str(case_dir)
             )
+            
+            # Store for NSGA optimizer to access
+            self.last_solution_infra_cost = solution_infra_cost
+            
+            # Calculate infrastructure benefit (Baseline - Solution)
+            if hasattr(self, 'baseline_infra_cost') and self.baseline_infra_cost > 0:
+                infrastructure_benefit = max(0, self.baseline_infra_cost - solution_infra_cost)
+                print(f"  [Economics] Infrastructure Benefit: ${infrastructure_benefit:,.2f}")
+                print(f"    (Baseline: ${self.baseline_infra_cost:,.2f} - Solution: ${solution_infra_cost:,.2f})")
         else:
             print(f"  [Economics] Deferred Investment: SKIPPED (disabled in config)")
         
-        # Net Impact (The "Badness" we want to minimize)
-        # Typically = Residual Damage - Benefits
-        # Or if VolumeBased: Volume * Rate
-        net_impact_usd = economic_res.get('net_impact_usd', 0.0)
-        details = economic_res.get('details', {})
+        # Update economic result with infrastructure benefit
+        flood_damage = economic_res.get('flood_damage_usd', 0.0)
+        total_benefit = infrastructure_benefit  # Add other benefits here if enabled
+        net_impact_usd = flood_damage - total_benefit  # Positive = bad, Negative = good
         
+        economic_res['infrastructure_benefit'] = infrastructure_benefit
+        economic_res['total_benefits'] = total_benefit
+        economic_res['net_impact_usd'] = net_impact_usd
+        
+        # Net Impact (The "Badness" we want to minimize)
         print(f"  [Economics] Net Economic Impact (Damage - Benefits): ${net_impact_usd:,.2f}")
-        if 'residual_damage' in details:
-            print(f"    - Residual Damage:   ${details['residual_damage']:,.2f}")
-        if 'total_benefits' in details:
-            print(f"    - Total Benefits:    ${details['total_benefits']:,.2f}")
-            for b_name, b_val in details.get('benefits_breakdown', {}).items():
-                print(f"      * {b_name}: ${b_val:,.2f}")
+        if infrastructure_benefit > 0:
+            print(f"    - Infrastructure Benefit: ${infrastructure_benefit:,.2f}")
 
         # --- FINAL RESULTS ---
         # The optimizer expects (cost, secondary_metric).
@@ -1407,7 +1504,8 @@ class DynamicSolutionEvaluator:
         # For now, we print detailed info here.
         
         print(f"  [Economics] Total Construction Cost: ${total_cost:,.2f}")
-        print(f"  [Economics] B/C Ratio:               {(details.get('total_benefits', 0)/total_cost):.2f}" if total_cost > 0 else "Inf")
+        bc_ratio = total_benefit / total_cost if total_cost > 0 else 0
+        print(f"  [Economics] B/C Ratio:               {bc_ratio:.2f}")
         
         return total_cost, current_metrics.total_flooding_volume
     

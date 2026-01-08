@@ -49,65 +49,10 @@ from RUT_1 import varGlobals
 vg = varGlobals()
 
 
-# =============================================================================
-# ABSTRACT INTERFACE
-# =============================================================================
-
-class EconomicModel(ABC):
-    """Abstract base for economic assessment strategies."""
-    
-    @abstractmethod
-    def calculate_economic_impact(self, 
-                                  baseline_metrics: Any, 
-                                  solution_metrics: Any, 
-                                  **kwargs) -> Dict[str, Any]:
-        """
-        Returns a dict containing:
-        - 'net_impact_usd': Total economic cost (Damage - Benefits)
-        - 'details': Dictionary with breakdown
-        """
-        pass
-
-# =============================================================================
-# 1. VOLUME BASED
-# =============================================================================
-
-class VolumeBasedEvaluator(EconomicModel):
-    """
-    Calculates cost purely based on remaining flood volume.
-    Cost = Volume * Rate.
-    This does NOT consider avoided infrastructure costs.
-    """
-    
-    def __init__(self, cost_per_m3: float = 1250.0):
-        self.cost_per_m3 = cost_per_m3
-
-    def calculate_economic_impact(self, baseline_metrics: Any, solution_metrics: Any, **kwargs) -> Dict[str, Any]:
-        vol = getattr(solution_metrics, 'total_flooding_volume', 0.0)
-        cost = vol * self.cost_per_m3
-        
-        return {
-            "net_impact_usd": cost,
-            "details": {
-                "method": "VolumeBased",
-                "volume_m3": vol,
-                "rate": self.cost_per_m3,
-                "damage_cost": cost,
-                "benefits_usd": 0.0
-            }
-        }
-
 
 # =============================================================================
 # 2. COMPREHENSIVE / REAL EVALUATOR (Aggregator)
 # =============================================================================
-
-class BaseStrategy(ABC):
-    @abstractmethod
-    def calculate(self, base, sol, **kwargs) -> Dict[str, Any]:
-        """Returns {'value': float, 'metadata': dict}"""
-        pass
-
 
 class FloodDamage:
     """
@@ -383,7 +328,6 @@ class FloodDamageFromItzi:
     # VISUALIZATIONS
     # =========================================================================
     
-
 
 class DeferredInvestmentCost:
     """
@@ -784,8 +728,15 @@ class DeferredInvestmentCost:
             & pipes_rehabilitation_gdf.geometry.is_valid
             ].copy()
 
+
         # Reset index after geometry filtering
         pipes_rehabilitation_gdf.reset_index(drop=True, inplace=True)
+
+        # Fill weir-related columns with defaults (these are NaN for conduits, not weirs)
+        weir_columns = ['WeirType', 'FlapGate', 'DischCoeff', 'CrestHeight']
+        for col in weir_columns:
+            if col in pipes_rehabilitation_gdf.columns:
+                pipes_rehabilitation_gdf[col] = pipes_rehabilitation_gdf[col].fillna('N/A')
 
         # Identify rows with any NaN in any column
         mask_nan = pipes_rehabilitation_gdf.isna().any(axis=1)
@@ -795,11 +746,31 @@ class DeferredInvestmentCost:
 
         # Optional: show how many and which ones
         n_dropped = len(rows_to_drop)
-        print(f"Se van a eliminar {n_dropped} filas con al menos un NaN en `pipes_rehabilitation_gdf`.")
+        print(f"  [Info] {n_dropped} pipes removed (missing attributes)")
         if n_dropped > 0:
-            print("Índices (antes de resetear índice) de filas eliminadas:", list(rows_to_drop))
-            # Si también quieres ver el contenido:
-            print(pipes_rehabilitation_gdf.loc[rows_to_drop])
+            rows_df = pipes_rehabilitation_gdf.loc[rows_to_drop].copy()
+            
+            # Save removed pipes to separate files for inspection
+            removed_dir = Path(output_dir) / "avoided_cost" / "deferred_investment" / "removed_pipes"
+            removed_dir.mkdir(parents=True, exist_ok=True)
+            
+            case_name = Path(output_dir).name
+            removed_gpkg = removed_dir / f"{case_name}_removed_pipes.gpkg"
+            removed_xlsx = removed_dir / f"{case_name}_removed_pipes.xlsx"
+            
+            try:
+                rows_df.to_file(removed_gpkg, driver="GPKG")
+                print(f"  [Info] Removed pipes saved to: {removed_gpkg}")
+            except Exception as e:
+                print(f"  [Warning] Could not save removed pipes GPKG: {e}")
+            
+            try:
+                # Drop geometry for Excel
+                rows_df_no_geom = rows_df.drop(columns=['geometry'], errors='ignore')
+                rows_df_no_geom.to_excel(removed_xlsx, index=False)
+                print(f"  [Info] Removed pipes saved to: {removed_xlsx}")
+            except Exception as e:
+                print(f"  [Warning] Could not save removed pipes Excel: {e}")
 
         # Drop those rows
         pipes_rehabilitation_gdf = pipes_rehabilitation_gdf.drop(index=rows_to_drop).copy()
@@ -808,10 +779,10 @@ class DeferredInvestmentCost:
         pipes_rehabilitation_gdf.reset_index(drop=True, inplace=True)
 
         # Mensaje aclarando que es un valor aproximado / estimado
-        print(
-            "\n[AVISO] El costo calculado es una aproximación del valor de inversión "
-            "y debe considerarse como un valor estimado de referencia, no definitivo."
-        )
+        # print(
+        #     "\n[AVISO] El costo calculado es una aproximación del valor de inversión "
+        #     "y debe considerarse como un valor estimado de referencia, no definitivo."
+        # )
 
         # Estructura: output_dir / avoided_cost / deferred_investment
         base_dir = Path(output_dir) / "avoided_cost" / "deferred_investment"
@@ -979,19 +950,45 @@ class DeferredInvestmentCost:
         # Reset index after geometry filtering
         pipes_rehabilitation_gdf.reset_index(drop=True, inplace=True)
 
+        # Fill weir-related columns with defaults (these are NaN for conduits, not weirs)
+        weir_columns = ['WeirType', 'FlapGate', 'DischCoeff', 'CrestHeight']
+        for col in weir_columns:
+            if col in pipes_rehabilitation_gdf.columns:
+                pipes_rehabilitation_gdf[col] = pipes_rehabilitation_gdf[col].fillna('N/A')
+
         # Identify rows with any NaN in any column
         mask_nan = pipes_rehabilitation_gdf.isna().any(axis=1)
 
         # Indices (before dropping) of rows with NaN
         rows_to_drop = pipes_rehabilitation_gdf.index[mask_nan]
 
-        # Optional: show how many and which ones
+        # Save removed pipes to files for inspection
         n_dropped = len(rows_to_drop)
-        print(f"Se van a eliminar {n_dropped} filas con al menos un NaN en `pipes_rehabilitation_gdf`.")
+        print(f"  [Info] {n_dropped} pipes removed (missing attributes)")
         if n_dropped > 0:
-            print("Índices (antes de resetear índice) de filas eliminadas:", list(rows_to_drop))
-            # Si también quieres ver el contenido:
-            print(pipes_rehabilitation_gdf.loc[rows_to_drop])
+            rows_df = pipes_rehabilitation_gdf.loc[rows_to_drop].copy()
+            
+            # Save removed pipes to separate files for inspection
+            removed_dir = Path(output_dir) / "avoided_cost" / "deferred_investment" / "removed_pipes"
+            removed_dir.mkdir(parents=True, exist_ok=True)
+            
+            case_name = Path(output_dir).name
+            removed_gpkg = removed_dir / f"{case_name}_removed_pipes.gpkg"
+            removed_xlsx = removed_dir / f"{case_name}_removed_pipes.xlsx"
+            
+            try:
+                rows_df.to_file(removed_gpkg, driver="GPKG")
+                print(f"  [Info] Removed pipes saved to: {removed_gpkg}")
+            except Exception as e:
+                print(f"  [Warning] Could not save removed pipes GPKG: {e}")
+            
+            try:
+                # Drop geometry for Excel
+                rows_df_no_geom = rows_df.drop(columns=['geometry'], errors='ignore')
+                rows_df_no_geom.to_excel(removed_xlsx, index=False)
+                print(f"  [Info] Removed pipes saved to: {removed_xlsx}")
+            except Exception as e:
+                print(f"  [Warning] Could not save removed pipes Excel: {e}")
 
         # Drop those rows
         pipes_rehabilitation_gdf = pipes_rehabilitation_gdf.drop(index=rows_to_drop).copy()
@@ -1021,7 +1018,7 @@ class DeferredInvestmentCost:
         # Set CRS before saving
         if self.crs is not None:
             pipes_rehabilitation_gdf.set_crs(self.crs, inplace=True, allow_override=True)
-            print(f"  [AvoidedCost] CRS set to: {self.crs.name if hasattr(self.crs, 'name') else self.crs}")
+            # print(f"  [AvoidedCost] CRS set to: {self.crs.name if hasattr(self.crs, 'name') else self.crs}")
         
         pipes_rehabilitation_gdf.to_file(gpkg_path, driver='GPKG', layer='tramos')
         
@@ -1300,7 +1297,7 @@ class DeferredInvestmentCost:
 
 
 #---------------------------------------------------------------------------------
-class PavementDegradationCost(BaseStrategy):
+class PavementDegradationCost:
     """
     Calculates cost of pavement degradation due to flooding.
     
@@ -1360,7 +1357,7 @@ class PavementDegradationCost(BaseStrategy):
         return 1.0
 
 
-class TrafficDisruptionCost(BaseStrategy):
+class TrafficDisruptionCost:
     """
     Calculates cost of traffic disruption due to flooding.
     
@@ -1418,7 +1415,7 @@ class TrafficDisruptionCost(BaseStrategy):
         return total_cost
 
 
-class ErosionControlCost(BaseStrategy):
+class ErosionControlCost:
     """
     Calculates erosion damage cost in natural channels.
     

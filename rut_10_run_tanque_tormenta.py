@@ -202,6 +202,7 @@ class StormwaterOptimizationRunner:
                     gap = node_invert - predio.z
                     
                     valid_pairs.append({
+                        'node_idx': i,  # Index in nodes_gdf (for NSGA optimizer)
                         'NodeID': node.NodeID,
                         'PredioID': j,
                         'NodeZ': node_surface_z,
@@ -210,6 +211,7 @@ class StormwaterOptimizationRunner:
                         'Desnivel': gap,
                         'Distance': dist,
                         'FloodingFlow': node.FloodingFlow,
+                        'FloodingVolume': getattr(node, 'FloodingVolume', 0),  # For tank sizing
                         'PredioArea': predio.geometry.area  # For capacity constraint
                     })
         
@@ -482,6 +484,7 @@ class StormwaterOptimizationRunner:
             evaluator=self.evaluator,
             valid_pairs=valid_pairs_df,
             max_tanks=max_tanks,
+            min_tanks=config.MIN_TANKS,
             min_tank_vol=min_tank_vol,
             max_tank_vol=max_tank_vol,
             cost_components=config.COST_COMPONENTS
@@ -630,10 +633,10 @@ if __name__ == "__main__":
         elev_file=elev_file,
 
         optimizer_mode = 'nsga',  # 'greedy' or 'nsga'
-        optimization_tr_list = [25],  # For NSGA: [25] or [1,2,5,10,25]
-        validation_tr_list= [1,2,5,10,25, 50 , 100],  # For NSGA final validation
-        n_generations = 100,  # NSGA generations
-        pop_size = 30,  # NSGA population
+        optimization_tr_list = config.TR_LIST,  # For NSGA: [25] or [1,2,5,10,25]
+        validation_tr_list= config.VALIDATION_TR_LIST,  # For NSGA final validation
+        n_generations = config.N_GENERATIONS,  # NSGA generations
+        pop_size = config.POP_SIZE,  # NSGA population
     )
 
 

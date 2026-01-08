@@ -719,17 +719,18 @@ class PathFinder:
         
         
         safe_pts = []
-        if hasattr(base_simpl, 'coords'):
+        # Check geometry type to avoid Shapely error when accessing .coords on MultiLineString
+        if base_simpl.geom_type == 'LineString':
             # Es LineString simple
             safe_pts = list(base_simpl.coords)
-        elif hasattr(base_simpl, 'geoms'):
+        elif base_simpl.geom_type == 'MultiLineString':
             # Es MultiLineString - extraer coordenadas de cada segmento
             for line in base_simpl.geoms:
                 safe_pts.extend(list(line.coords))
         else:
             # Fallback: intentar convertir a LineString con linemerge
             merged_line = linemerge(base_simpl)
-            if hasattr(merged_line, 'coords'):
+            if merged_line.geom_type == 'LineString':
                 safe_pts = list(merged_line.coords)
             else:
                 # Si aún es multi-parte, extraer de cada geometría

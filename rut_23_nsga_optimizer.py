@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from pathlib import Path
+import config
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
@@ -82,14 +83,15 @@ class TankOptimizationProblem(Problem):
                  optimization_tr_list: List[int],
                  cost_components: Dict[str, bool],
                  max_tanks: int = 20,
+                 min_tanks: int = 3,
                  **kwargs):
         
         n_candidates = len(valid_pairs)
         
         super().__init__(
             n_var=n_candidates,      # Number of decision variables
-            n_obj=2,                 # Two objectives: cost and damage
-            n_ieq_constr=2,          # Constraints: max_tanks + predio capacity
+            n_obj=3,                 # Three objectives: flooding, construction cost, repair cost
+            n_ieq_constr=3,          # Constraints: max_tanks, min_tanks, predio capacity
             xl=0,                    # Lower bound (binary: 0)
             xu=1,                    # Upper bound (binary: 1)
             vtype=bool,              # Variable type
@@ -101,6 +103,7 @@ class TankOptimizationProblem(Problem):
         self.optimization_tr_list = optimization_tr_list
         self.cost_components = cost_components
         self.max_tanks = max_tanks
+        self.min_tanks = min_tanks  # Minimum number of active tanks
         self.mode = 'probabilistic' if len(optimization_tr_list) > 1 else 'deterministic'
         
         # Tank depth for area calculation (area = volume / depth)
@@ -111,14 +114,50 @@ class TankOptimizationProblem(Problem):
         self._eval_count = 0
         
     def _x_to_assignments(self, x: np.ndarray) -> List[Tuple[int, float]]:
-        """Convert binary decision vector to tank assignments."""
-        assignments = []
+        """
+        Convert binary decision vector to tank assignments.
+        
+        Returns format expected by rut_16._get_active_pairs:
+        List indexed by node position where each element is (predio_1idx, volume).
+        predio_1idx = 0 means no tank, predio_1idx = 1+ is the 1-indexed predio ID.
+        """
+        # Get number of nodes from evaluator
+        n_nodes = len(self.evaluator.nodes_gdf)
+        
+        # Initialize all nodes with no tank (predio=0, volume=0)
+        assignments = [(0, 0) for _ in range(n_nodes)]
+        
         for i, active in enumerate(x):
             if active > 0.5:  # Binary threshold
                 row = self.valid_pairs.iloc[i]
-                node_idx = i  # Use index as node_idx
-                volume = row.get('tank_volume', row.get('FloodingVolume', 10000))
-                assignments.append((node_idx, volume))
+                
+                # Get the original node index in nodes_gdf
+                node_idx = row.get('node_idx', row.get('NodeIdx', i))
+                
+                # Get predio ID (1-indexed for rut_16 format)
+                predio_id = row.get('PredioID', row.get('predio_idx', 0))
+                predio_1idx = int(predio_id) + 1  # Convert to 1-indexed
+                
+                # Calculate tank volume based on flooding volume
+                # FloodingVolume = actual flood volume at node
+                # Apply safety factor of 1.2 to account for uncertainty
+                flooding_vol = row.get('FloodingVolume', 0)
+                if flooding_vol > 0:
+                    # Tank should capture flooding volume + safety factor
+                    volume = flooding_vol * config.TANK_VOLUME_SAFETY_FACTOR
+                else:
+                    # Fallback: estimate from FloodingFlow * storm duration (2 hours)
+                    flooding_flow = row.get('FloodingFlow', 0)
+                    volume = flooding_flow * 2.0 * 3600  # m³/s * 2hr * 3600s
+                
+                # Clamp to config limits
+                import config
+                volume = max(config.TANK_MIN_VOLUME_M3, min(volume, config.TANK_MAX_VOLUME_M3))
+                
+                # Only assign if valid node_idx
+                if 0 <= node_idx < n_nodes:
+                    assignments[node_idx] = (predio_1idx, volume)
+        
         return assignments
     
     def _check_predio_capacity(self, x: np.ndarray) -> float:
@@ -135,8 +174,15 @@ class TankOptimizationProblem(Problem):
                 predio_id = row.get('PredioID', i)
                 predio_area = row.get('PredioArea', 100000)  # Default large if missing
                 
-                # Tank area = volume / depth (approximate)
-                volume = row.get('tank_volume', row.get('FloodingVolume', 10000))
+                # Calculate tank volume same as in _x_to_assignments
+                flooding_vol = row.get('FloodingVolume', 0)
+                if flooding_vol > 0:
+                    volume = flooding_vol * config.TANK_VOLUME_SAFETY_FACTOR
+                else:
+                    flooding_flow = row.get('FloodingFlow', 0)
+                    volume = flooding_flow * 2.0 * 3600
+                
+                volume = max(config.TANK_MIN_VOLUME_M3, min(volume, config.TANK_MAX_VOLUME_M3))
                 tank_area = volume / self.tank_depth
                 
                 if predio_id not in predio_usage:
@@ -157,19 +203,27 @@ class TankOptimizationProblem(Problem):
         """
         Evaluate a population of solutions.
         
-        Args:
-            x: (pop_size, n_var) binary matrix
-            out: Dictionary to store results
+        Objectives (all minimized):
+            f1: Remaining flooding volume (m3)
+            f2: Construction cost ($)
+            f3: Solution repair cost ($) - minimizing this maximizes avoided cost
+        
+        Constraints:
+            g1: n_tanks <= max_tanks
+            g2: n_tanks >= min_tanks
+            g3: predio capacity
         """
         pop_size = x.shape[0]
         
         # Objectives
-        f1 = np.zeros(pop_size)  # Construction cost
-        f2 = np.zeros(pop_size)  # Damage
+        f1 = np.zeros(pop_size)  # Remaining flooding volume
+        f2 = np.zeros(pop_size)  # Construction cost
+        f3 = np.zeros(pop_size)  # Solution repair cost
         
         # Constraints
         g1 = np.zeros(pop_size)  # Max tanks constraint
-        g2 = np.zeros(pop_size)  # Predio capacity constraint
+        g2 = np.zeros(pop_size)  # Min tanks constraint  
+        g3 = np.zeros(pop_size)  # Predio capacity constraint
         
         for i in range(pop_size):
             xi = x[i]
@@ -178,19 +232,23 @@ class TankOptimizationProblem(Problem):
             # Constraint 1: number of tanks <= max_tanks
             g1[i] = n_tanks - self.max_tanks  # <= 0 to be feasible
             
-            # Constraint 2: predio capacity
-            g2[i] = self._check_predio_capacity(xi)  # <= 0 to be feasible
+            # Constraint 2: number of tanks >= min_tanks
+            g2[i] = self.min_tanks - n_tanks  # <= 0 to be feasible (min_tanks - n <= 0 means n >= min)
             
-            # Skip evaluation if constraints heavily violated
-            if n_tanks > self.max_tanks or n_tanks == 0 or g2[i] > 1000:
+            # Constraint 3: predio capacity
+            g3[i] = self._check_predio_capacity(xi)  # <= 0 to be feasible
+            
+            # Skip evaluation if constraints heavily violated or no tanks
+            if n_tanks > self.max_tanks or n_tanks < self.min_tanks or n_tanks == 0 or g3[i] > 1000:
                 f1[i] = 1e12
                 f2[i] = 1e12
+                f3[i] = 1e12
                 continue
             
             # Convert to hashable key for caching
             x_key = tuple(xi > 0.5)
             if x_key in self._cache:
-                f1[i], f2[i] = self._cache[x_key]
+                f1[i], f2[i], f3[i] = self._cache[x_key]
                 continue
             
             # Convert to assignments
@@ -200,29 +258,32 @@ class TankOptimizationProblem(Problem):
                 self._eval_count += 1
                 print(f"\n  [NSGA-II] Evaluation {self._eval_count}: {len(assignments)} tanks")
                 
-                # Run evaluation
-                cost, damage = self._evaluate_single(assignments)
+                # Run evaluation - returns (construction_cost, flooding_volume, repair_cost)
+                constr_cost, flooding, repair_cost = self._evaluate_single(assignments)
                 
-                f1[i] = cost
-                f2[i] = damage
+                f1[i] = flooding       # Minimize remaining flooding
+                f2[i] = constr_cost    # Minimize construction cost
+                f3[i] = repair_cost    # Minimize repair cost (= maximize avoided cost)
                 
                 # Cache result
-                self._cache[x_key] = (cost, damage)
+                self._cache[x_key] = (flooding, constr_cost, repair_cost)
                 
             except Exception as e:
-                print(f"  [NSGA-II] Evaluation failed: {e}")
-                f1[i] = 1e12
-                f2[i] = 1e12
+                import traceback
+                print(f"\n  [FATAL ERROR] NSGA-II Evaluation failed!")
+                print(f"  Error: {e}")
+                traceback.print_exc()
+                raise RuntimeError(f"NSGA-II Evaluation {self._eval_count} failed: {e}") from e
         
-        out["F"] = np.column_stack([f1, f2])
-        out["G"] = np.column_stack([g1, g2])
+        out["F"] = np.column_stack([f1, f2, f3])
+        out["G"] = np.column_stack([g1, g2, g3])
     
-    def _evaluate_single(self, assignments: List[Tuple[int, float]]) -> Tuple[float, float]:
+    def _evaluate_single(self, assignments: List[Tuple[int, float]]) -> Tuple[float, float, float]:
         """
         Evaluate a single tank configuration.
         
         Returns:
-            (construction_cost, damage_cost)
+            (construction_cost, flooding_volume, repair_cost)
         """
         if self.mode == 'deterministic':
             # Single TR evaluation
@@ -233,20 +294,15 @@ class TankOptimizationProblem(Problem):
                 solution_name=f"NSGA_eval_{self._eval_count}"
             )
             
-            # Get damage from evaluator
-            damage = getattr(self.evaluator, 'last_flood_damage_usd', flooding * 100)
+            # Get repair cost from evaluator (set by DeferredInvestmentCost)
+            repair_cost = getattr(self.evaluator, 'last_solution_infra_cost', 1e12)
             
-            # Add deferred investment if enabled
-            if self.cost_components.get('deferred_investment', True):
-                deferred = getattr(self.evaluator, 'last_deferred_cost', 0)
-                damage += deferred
-            
-            return cost, damage
+            return cost, flooding, repair_cost
             
         else:
             # Probabilistic: multiple TRs -> EAD
-            # This is slower but more accurate
-            total_ead = 0
+            total_flooding = 0
+            total_repair = 0
             
             for tr in self.optimization_tr_list:
                 cost, flooding = self.evaluator.evaluate_solution(
@@ -255,15 +311,14 @@ class TankOptimizationProblem(Problem):
                     solution_name=f"NSGA_TR{tr}_eval_{self._eval_count}"
                 )
                 
-                damage = getattr(self.evaluator, 'last_flood_damage_usd', flooding * 100)
-                if self.cost_components.get('deferred_investment', True):
-                    damage += getattr(self.evaluator, 'last_deferred_cost', 0)
+                repair_cost = getattr(self.evaluator, 'last_solution_infra_cost', 1e12)
                 
-                # Weight by probability
+                # Weight by probability for EAD
                 prob = 1.0 / tr
-                total_ead += damage * prob
+                total_flooding += flooding * prob
+                total_repair += repair_cost * prob
             
-            return cost, total_ead
+            return cost, total_flooding, total_repair
 
 
 class NSGATankOptimizer:
@@ -277,6 +332,7 @@ class NSGATankOptimizer:
                  evaluator: DynamicSolutionEvaluator,
                  valid_pairs: pd.DataFrame,
                  max_tanks: int = 20,
+                 min_tanks: int = 3,
                  min_tank_vol: float = 1000,
                  max_tank_vol: float = 100000,
                  cost_components: Dict[str, bool] = None):
@@ -285,6 +341,7 @@ class NSGATankOptimizer:
             evaluator: DynamicSolutionEvaluator from rut_16
             valid_pairs: DataFrame of candidate tank locations
             max_tanks: Maximum number of tanks to place
+            min_tanks: Minimum number of tanks (constraint)
             min_tank_vol: Minimum tank volume (m³)
             max_tank_vol: Maximum tank volume (m³)
             cost_components: Dict controlling which costs to calculate
@@ -295,6 +352,7 @@ class NSGATankOptimizer:
         self.evaluator = evaluator
         self.valid_pairs = valid_pairs
         self.max_tanks = max_tanks
+        self.min_tanks = min_tanks
         self.min_tank_vol = min_tank_vol
         self.max_tank_vol = max_tank_vol
         
@@ -310,7 +368,7 @@ class NSGATankOptimizer:
         print("  NSGA-II MULTI-OBJECTIVE TANK OPTIMIZER")
         print(f"{'='*60}")
         print(f"  Candidates: {len(valid_pairs)}")
-        print(f"  Max Tanks:  {max_tanks}")
+        print(f"  Tanks: {min_tanks} - {max_tanks}")
         print(f"  Cost Components: {self.cost_components}")
     
     def run(self,
@@ -346,7 +404,8 @@ class NSGATankOptimizer:
             valid_pairs=self.valid_pairs,
             optimization_tr_list=optimization_tr_list,
             cost_components=self.cost_components,
-            max_tanks=self.max_tanks
+            max_tanks=self.max_tanks,
+            min_tanks=self.min_tanks
         )
         
         # Create algorithm
@@ -362,12 +421,15 @@ class NSGATankOptimizer:
         termination = get_termination("n_gen", n_generations)
         
         # Run optimization
-        print(f"\n  Starting NSGA-II optimization...")
+        import time
+        random_seed = int(time.time()) % 100000  # Random seed based on current time
+        random_seed = 42
+        print(f"\n  Starting NSGA-II optimization (seed={random_seed})...")
         result = minimize(
             problem,
             algorithm,
             termination,
-            seed=42,
+            seed=random_seed,
             verbose=True
         )
         

@@ -198,13 +198,14 @@ class ExcelFormatter:
             try:
                 matched_key = self.find_best_match(idx, rubros_dict[section])
             except:
-                print()
+                print('error', idx, section)
             if not matched_key:
                 print(idx, section)
             
             if matched_key:
                 if not idx == matched_key:
-                    print(idx, matched_key, section)
+                    # print(idx, matched_key, section)
+                    pass
                 code = rubros_dict[section][matched_key]
                 if code != '*':
                     result['CODIGO'].append(code)
@@ -2428,11 +2429,11 @@ class CantidadesTuberiasPozos:
                 df_list.append(self.get_pz_volumes(df_pz, pz_type))
         
         filtro = np.where(self.pz_especial['pz'].to_numpy() == 'pz-s1', False, True) * np.where(self.pz_especial['pz'].to_numpy() == 'pz-s2', False, True)
-        print('-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
-        print('Pozos a Diseñar')
-        print('-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
-        print(self.pz_especial[filtro])
-        print('-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+        # print('-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+        # print('Pozos a Diseñar')
+        # print('-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
+        # print(self.pz_especial[filtro])
+        # print('-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------')
         
         if len(df_list) == 0:
             return pd.DataFrame([])
