@@ -162,6 +162,9 @@ class PathFinder:
             # Set the 'elevation' attribute for each node in the graph
             nx.set_node_attributes(self.graph, elevation_dict, 'elevation')
             print("Graph nodes updated with elevation.")
+            print('-'*60)
+            print()
+
             # You can verify by checking a node:
             # first_node_id = list(self.graph.nodes)[0]
             # print(f"Elevation for node {first_node_id}: {self.graph.nodes[first_node_id].get('elevation')}")

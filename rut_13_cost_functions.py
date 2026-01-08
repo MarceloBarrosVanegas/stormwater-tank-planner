@@ -105,8 +105,8 @@ class CostCalculator:
         return total_concrete_vol * CostCalculator.REINFORCED_CONCRETE_COST
 
     @classmethod
-    def calculate_total_cost(cls, length: float, volume: float, flow_rate: float) -> Dict[str, float]:
-        """Returns broken down costs."""
+    def calculate_total_construction_cost(cls, length: float, volume: float, flow_rate: float) -> Dict[str, float]:
+        """Returns broken down construction costs."""
         cost_deriv = cls.calculate_derivation_cost(length, flow_rate)
         cost_tank = cls.calculate_tank_cost(volume)
         return {
@@ -115,29 +115,40 @@ class CostCalculator:
             "tank": cost_tank
         }
 
+class FinancialCalculator:
+    """
+    Centralized Financial Model.
+    Handles distinct strategies for calculating flood damage.
+    """
+    
+    def __init__(self, cost_per_m3_flooding: float = 1250.0):
+        self.cost_per_m3_flooding = cost_per_m3_flooding
+        
+    def calculate_damage_volume_based(self, volume_m3: float) -> float:
+        """
+        Calculates damage purely based on volume.
+        Damage = Volume * Cost/m3
+        """
+        return volume_m3 * self.cost_per_m3_flooding
+
+    def calculate_damage_itzi(self, climada_result: Dict) -> float:
+        """
+        Retrieves damage calculated by Itzi/Climada integration.
+        Returns the specific dollar amount from the physical simulation.
+        """
+        if climada_result and 'total_damage' in climada_result:
+            return float(climada_result['total_damage'])
+        return 0.0
+
 if __name__ == "__main__":
-    # Quick Test of Cost Calculator
-    print("--- Cost Calculator Test (rut_13) ---")
+    # Quick Test
+    print("--- Financial Calculator Test ---")
+    fin = FinancialCalculator(cost_per_m3_flooding=100.0)
     
-    # Test Case 1: Small Tank
-    # L = 100m, Vol = 500m3 (approx 10x10 base), Q = 小
-    length_1 = 100.0 
-    vol_1 = 500.0    
-    flow_1 = 0.5    
+    vol = 5000.0
+    dmg_vol = fin.calculate_damage_volume_based(vol)
+    print(f"Volume Based Damage ({vol}m3 @ $100): ${dmg_vol:,.2f}")
     
-    costs_1 = CostCalculator.calculate_total_cost(length_1, vol_1, flow_1)
-    print(f"Case 1 (L={length_1}m, V={vol_1}m3, Q={flow_1}m3/s):")
-    print(f"  Derivation Cost: ${costs_1['derivation']:,.2f}")
-    print(f"  Tank Cost:       ${costs_1['tank']:,.2f}")
-    print(f"  Total Cost:      ${costs_1['total']:,.2f}")
-    
-    # Test Case 2: Large Tank
-    length_2 = 250.0 
-    vol_2 = 5000.0   
-    flow_2 = 3.0    
-    
-    costs_2 = CostCalculator.calculate_total_cost(length_2, vol_2, flow_2)
-    print(f"\nCase 2 (L={length_2}m, V={vol_2}m3, Q={flow_2}m3/s):")
-    print(f"  Derivation Cost: ${costs_2['derivation']:,.2f}")
-    print(f"  Tank Cost:       ${costs_2['tank']:,.2f}")
-    print(f"  Total Cost:      ${costs_2['total']:,.2f}")
+    # Construction
+    const_cost = CostCalculator.calculate_total_construction_cost(100, 5000, 2.0)
+    print(f"Construction Cost: ${const_cost['total']:,.2f}")

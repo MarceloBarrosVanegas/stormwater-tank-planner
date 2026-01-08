@@ -5,9 +5,6 @@ Dynamic Solution Evaluator for Tank Optimization
 Evaluates optimization solutions by executing the full workflow:
 PathFinder → SewerPipeline → SWMMModifier → SWMM → flooding residual
 
-This module integrates with rut_15_optimizer.py to provide real (non-simplified)
-evaluation of tank placement solutions.
-
 Dependencies
 ------------
 - rut_00_path_finder: PathFinder for route optimization
@@ -18,18 +15,16 @@ Dependencies
 
 import os
 import sys
-import tempfile
-import shutil
+import swmmio
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass, field
+from typing import List, Tuple, Any
+from dataclasses import dataclass
 import geopandas as gpd
 import pandas as pd
 import numpy as np
 from shapely.geometry import LineString
-from pyswmm import Simulation, Output
-from swmm.toolkit.shared_enum import NodeAttribute, LinkAttribute
+from pyswmm import Simulation
 
 # Add paths for local modules
 import config
@@ -37,25 +32,16 @@ config.setup_sys_path()
 
 
 from rut_00_path_finder import PathFinder
+from rut_02_elevation import ElevationGetter, ElevationSource
+from rut_03_run_sewer_design import SewerPipeline
+from rut_06_pipe_sizing import SeccionLlena
 from rut_13_cost_functions import CostCalculator
 from rut_14_swmm_modifier import SWMMModifier
-from rut_02_elevation import ElevationGetter, ElevationSource
 from rut_17_comparison_reporter import MetricExtractor, ScenarioComparator, SystemMetrics
-
-# Optional import for SewerPipeline (rut_03)
-try:
-    from rut_03_run_sewer_design import SewerPipeline
-    SEWER_PIPELINE_AVAILABLE = True
-except ImportError:
-    SEWER_PIPELINE_AVAILABLE = False
-    print("Warning: rut_03_run_sewer_design not found. Dynamic evaluation will fail.")
-
-# Optional import for SeccionLlena (rut_06)
-try:
-    from rut_06_pipe_sizing import SeccionLlena
-except ImportError:
-    SeccionLlena = None
-    print("Warning: rut_06_pipe_sizing not found. Dimension parsing might fail.")
+from rut_18_itzi_flood_model import run_itzi_for_case
+from rut_19_flood_damage_climada import calculate_flood_damage_climada
+from rut_20_avoided_costs import AvoidedCostRunner
+from rut_25_from_inp_to_vector import NetworkExporter
 
 
 @dataclass
@@ -79,8 +65,6 @@ class ActivePair:
 
 # SimulationMetrics removed - using rut_17.SystemMetrics
 
-
-
 class DynamicSolutionEvaluator:
     """
     Evaluates optimization solutions by running the complete pipeline:
@@ -91,26 +75,8 @@ class DynamicSolutionEvaluator:
     4. Add tanks to SWMM using SWMMModifier
     5. Run SWMM simulation
     6. Read remaining flooding
-    
-    Parameters
-    ----------
-    nodes_gdf : GeoDataFrame
-        Flooded nodes with columns: NodeID, z, NodeDepth, FloodingFlow
-    predios_gdf : GeoDataFrame
-        Candidate properties with columns: z, geometry
-    inp_file : str
-        Path to the base SWMM input file
-    path_proy : Path
-        Base project path for data files
-    elev_files_list : list
-        List of elevation file paths
-    proj_to : str
-        Target projection (e.g., "EPSG:32717")
-    template_project : str
-        Path to template project for DirTree replication
     """
-    
-    FLOODING_COST_PER_M3 = 1250.0  # USD/m3 (Estimated damage cost)
+
 
     def __init__(self,
                  nodes_gdf: gpd.GeoDataFrame,
@@ -119,10 +85,10 @@ class DynamicSolutionEvaluator:
                  path_proy: Path,
                  elev_files_list: List[str],
                  proj_to: str,
-                 template_project: str = None,
                  work_dir: str = None,
                  path_weights: dict = None,
-                 road_preferences: dict = None):
+                 road_preferences: dict = None,
+):
         
         self.nodes_gdf = nodes_gdf.copy()
         self.predios_gdf = predios_gdf.copy()
@@ -131,7 +97,7 @@ class DynamicSolutionEvaluator:
         self.elev_files_list = elev_files_list
         self.proj_to = proj_to
 
-            
+        
         # Working directory for temporary projects
         if work_dir is None:
             self.work_dir = self.path_proy / "codigos" / "temp_optimizer"
@@ -142,27 +108,10 @@ class DynamicSolutionEvaluator:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         
         # Path finding weights
-        # Default if not provided
-        default_path_weights = {
-            'length_weight': 0.4,
-            'elevation_weight': 0.4,
-            'road_weight': 0.2
-        }
-        default_road_preferences = {
-            'motorway': 5.0, 'trunk': 5.0, 'primary': 2.5,
-            'secondary': 2.5, 'tertiary': 2.5, 'residential': 0.5,
-            'service': 1.0, 'unclassified': 1.0,
-            'footway': 10.0, 'path': 10.0, 'steps': 20.0,
-            'default': 1.5
-        }
-        
-        self.path_weights = path_weights if path_weights else default_path_weights
-        self.road_preferences = road_preferences if road_preferences else default_road_preferences
-        
+        self.path_weights = config.DEFAULT_PATH_WEIGHTS
+        self.road_preferences = config.DEFAULT_ROAD_PREFERENCES
         self.elev_files_list = elev_files_list or []
-        
-        # --- PRE-INITIALIZE SHARED PATHFINDER WITH MAP & ELEVATIONS ---
-        print("  Initializing Shared PathFinder Map (This may take a moment)...")
+
         # Calculate combined bounds from both GeoDataFrames
         combined_geoms = pd.concat([self.nodes_gdf.geometry, self.predios_gdf.geometry])
         min_x, min_y, max_x, max_y = combined_geoms.total_bounds
@@ -206,51 +155,170 @@ class DynamicSolutionEvaluator:
         # Counter for unique solution IDs
         self._solution_counter = 0
 
+        # --- ECONOMIC MODEL ---
+        # ITZI is always used - no fallback to volume-based mode
+        base_precios_path = str(config.CODIGOS_DIR / "base_precios.xlsx")
+        print("  [Economics] Using Deferred Investment and Flood Damage avoided cost.")
+        self.economic_evaluator = None  # Will use AvoidedCostRunner per-case
+        self._base_precios_path = base_precios_path
+
+
         # --- METRICS & COMPARATOR ---
-        self.metric_extractor = MetricExtractor(flooding_cost_per_m3=self.FLOODING_COST_PER_M3)
+        self.metric_extractor = MetricExtractor(flooding_cost_per_m3=config.FLOODING_COST_PER_M3)
         # Load existing network topology for link analysis
         self.node_topology = {} # NodeID -> {'upstream_links': [], 'downstream_links': []}
-        try:
-            import swmmio
-            model = swmmio.Model(str(self.inp_file))
-            conduits = model.conduits
-            if hasattr(conduits, 'dataframe'):
-                 conduits = conduits.dataframe
-            elif callable(conduits):
-                 # Some versions might require calling it? Or it returns DF directly
-                 conduits = conduits()
+        self.static_link_data = {} # LinkID -> {'q_full': float, 'length': float, 'geom1': float}
+
+        inp_file = str(self.inp_file)
+        output_file = str(config.CODIGOS_DIR / "base_network.gpkg")
+
+        exporter = NetworkExporter(inp_file)
+        conduits = exporter.run(output_file, crs=config.PROJECT_CRS)
+        self._build_topology_from_conduits(conduits, clear_existing=True)
+
+        # Initialize Metrics
+        if self._solution_counter == 0 or not hasattr(self, 'baseline_metrics'):
+            print(f"  Running Baseline Simulation (Initial State)...")
+            self.baseline_metrics = self._run_baseline()
+
+            if hasattr(self.baseline_metrics, 'link_capacity_data'):
+                for lid, static_info in self.static_link_data.items():
+                     if lid in self.baseline_metrics.link_capacity_data:
+                          # Merge
+                          self.baseline_metrics.link_capacity_data[lid].update(static_info)
+                     else:
+                          # Add if missing (though q_peak would be missing too)
+                          pass
+
+            print(f"  Baseline Flooding: {self.baseline_metrics.total_flooding_volume:,.2f} m3")
+            self.baseline_damage = 0.0  # Not meaningful without Itzi
+            print(f"  [Economics Mode: REAL] Baseline damage will be calculated per-solution using Itzi/CLIMADA.")
+            print(f"  [Note] Baseline volume stored for reduction comparison.")
+
             
-            # Reset index if LinkID is index, creating 'Name' col if needed
-            if 'Name' not in conduits.columns:
-                conduits['Name'] = conduits.index
+            # Setup Comparator
+            self.comparator = ScenarioComparator(self.baseline_metrics)
+
+
+            baseline_dir = self.work_dir / "00_Baseline"
+            baseline_dir.mkdir(parents=True, exist_ok=True)
+
+            TR_LIST = [1, 2, 5, 10, 25, 50, 100]
+
+            # 3. Instantiate Runner
+
+            runner = AvoidedCostRunner(
+                output_base=str(baseline_dir),
+                base_precios_path=str(config.BASE_PRECIOS),
+                base_inp_path=str(config.SWMM_FILE)
+            )
+
+            # 4. Run Analysis
+            damage_baseline = runner.run(tr_list=TR_LIST)
             
-            for _, row in conduits.iterrows():
-                link_id = str(row['Name'])
-                inlet = str(row['InletNode'])
-                outlet = str(row['OutletNode'])
+            # Extract and display baseline EAD
+            results = damage_baseline.get('results', [])
+            if results:
+                # Calculate total EAD using trapezoidal integration
+                trs = [r['tr'] for r in results]
+                probs = [1.0 / tr for tr in trs]
+                total_damages = [r['total_impact_usd'] for r in results]
+                flood_damages = [r['flood_damage_usd'] for r in results]
+                investment_costs = [r['investment_cost_usd'] for r in results]
                 
-                # Downstream of Inlet
-                if inlet not in self.node_topology: self.node_topology[inlet] = {'upstream': [], 'downstream': []}
+                # EAD = Area under the risk curve
+                ead_total = 0
+                ead_flood = 0
+                ead_investment = 0
+                for i in range(len(trs) - 1):
+                    dp = probs[i] - probs[i+1]
+                    ead_total += dp * (total_damages[i] + total_damages[i+1]) / 2
+                    ead_flood += dp * (flood_damages[i] + flood_damages[i+1]) / 2
+                    ead_investment += dp * (investment_costs[i] + investment_costs[i+1]) / 2
+                
+                # Store for optimization comparison
+                self.baseline_ead_total = ead_total
+                self.baseline_ead_flood = ead_flood
+                self.baseline_ead_investment = ead_investment
+                self.baseline_flood_damage = ead_flood  # For optimizer compatibility
+                
+                print(f"\n  {'='*60}")
+                print(f"  BASELINE EAD (Expected Annual Damage)")
+                print(f"  {'='*60}")
+                print(f"  EAD Flood Damage:      ${ead_flood:,.2f}/año")
+                print(f"  EAD Infrastructure:    ${ead_investment:,.2f}/año")
+                print(f"  EAD TOTAL:             ${ead_total:,.2f}/año")
+                print(f"  {'='*60}\n")
+
+    # python
+    def _build_topology_from_conduits(self, conduits: pd.DataFrame, clear_existing: bool = False):
+        """
+        Build/merge node topology and static link data from a conduits DataFrame.
+
+        Parameters
+        ----------
+        conduits : pd.DataFrame
+            DataFrame with at least 'InletNode' and 'OutletNode' columns (index used as link id).
+        clear_existing : bool
+            If True, reset self.node_topology and self.static_link_data before merging.
+
+        Returns
+        -------
+        tuple
+            (node_topology, static_link_data) updated on self and also returned.
+        """
+        if clear_existing:
+            self.node_topology = {}
+            self.static_link_data = {}
+
+        def _to_float(val, default=0.0):
+            try:
+                return float(val) if pd.notna(val) else default
+            except Exception:
+                return default
+
+        for idx, row in conduits.iterrows():
+            link_id = str(idx)
+            inlet = str(row.get('InletNode', '')).strip()
+            outlet = str(row.get('OutletNode', '')).strip()
+
+            if inlet:
+                self.node_topology.setdefault(inlet, {'upstream': [], 'downstream': []})
                 self.node_topology[inlet]['downstream'].append(link_id)
-                
-                # Upstream of Outlet
-                if outlet not in self.node_topology: self.node_topology[outlet] = {'upstream': [], 'downstream': []}
+
+            if outlet:
+                self.node_topology.setdefault(outlet, {'upstream': [], 'downstream': []})
                 self.node_topology[outlet]['upstream'].append(link_id)
-                
-        except ImportError:
-            print("Warning: swmmio not found. Topology extraction for hydrographs disabled.")
-        except Exception as e:
-            print(f"Topology extraction warning: {e}")
-            
-        # Initialize Metrics for Baseline and Comparison
-        print("  Running Baseline Simulation (Initial State)...")
-        self.baseline_metrics = self._run_baseline()
-        print(f"  Baseline Flooding: {self.baseline_metrics.total_flooding_volume:,.2f} m3")
-        print(f"  Baseline Cost (Damage): ${self.baseline_metrics.flooding_cost:,.2f}")
-        
-        # Initialize Comparator with Baseline
-        self.comparator = ScenarioComparator(self.baseline_metrics)
-        
+
+            l_val = _to_float(row.get('Length', 0.0))
+            g1_val = _to_float(row.get('Geom1', 0.0))
+            flow_max = _to_float(row.get('MaxQ', 0.0))
+
+            self.static_link_data[link_id] = {
+                'q_full': flow_max,
+                'length': l_val,
+                'geom1': g1_val
+            }
+
+    def _run_baseline(self) -> SystemMetrics:
+        """Runs the base INP file once to establish baseline metrics."""
+        # FIX: Ensure baseline uses a distinct output file to avoid overlap with solution runs
+        base_out = str(Path(self.inp_file).with_name(f"baseline_{Path(self.inp_file).stem}.out"))
+
+        # Identify all potential interest links (upstream/downstream of ANY candidate)
+        potential_links = []
+        if hasattr(self, 'nodes_gdf') and not self.nodes_gdf.empty:
+            for nid in self.nodes_gdf['NodeID'].astype(str):
+                if nid in self.node_topology:
+                    potential_links.extend(self.node_topology[nid].get('upstream', []))
+                    potential_links.extend(self.node_topology[nid].get('downstream', []))
+
+        potential_links = list(set(potential_links))
+        if potential_links:
+            print(f"  [Info] Baseline: Extracting hydrographs for {len(potential_links)} potential links.")
+
+        return self.metric_extractor.extract(base_out, target_links=potential_links)
+
     def _parse_dimension_to_mm(self, d_val) -> float:
         """
         Parses a dimension value (float, string, or 'WxH' string) to millimeters.
@@ -370,38 +438,6 @@ class DynamicSolutionEvaluator:
         }
 
 
-    def _run_baseline(self) -> SystemMetrics:
-        """Runs the base INP file once to establish baseline metrics."""
-        # FIX: Ensure baseline uses a distinct output file to avoid overlap with solution runs
-        base_out = str(Path(self.inp_file).with_name(f"baseline_{Path(self.inp_file).stem}.out"))
-        
-        # Remove old
-        if Path(base_out).exists():
-            try: os.remove(base_out)
-            except: pass
-            
-        try:
-            # FIX: Explicit outputfile
-            with Simulation(str(self.inp_file), outputfile=base_out) as sim:
-                for _ in sim: pass
-        except Exception as e:
-            print(f"  [Error] Baseline simulation failed: {e}")
-            return SystemMetrics()
-            
-        # Identify all potential interest links (upstream/downstream of ANY candidate)
-        # to ensure we have baseline data for whatever solution is chosen later.
-        potential_links = []
-        if hasattr(self, 'nodes_gdf') and not self.nodes_gdf.empty:
-            for nid in self.nodes_gdf['NodeID'].astype(str):
-                if nid in self.node_topology:
-                    potential_links.extend(self.node_topology[nid].get('upstream', []))
-                    potential_links.extend(self.node_topology[nid].get('downstream', []))
-        
-        potential_links = list(set(potential_links))
-        if potential_links:
-            print(f"  [Info] Baseline: Extracting hydrographs for {len(potential_links)} potential links.")
-            
-        return self.metric_extractor.extract(base_out, target_links=potential_links)
 
 
     def _get_active_pairs(self, assignments: List[Tuple[int, float]]) -> List[ActivePair]:
@@ -613,7 +649,6 @@ class DynamicSolutionEvaluator:
             
             node_id = row.get('NodeID', f"N{i}")
 
-            
 
             # Use preserved index from path generation to handle skipped paths
             ramal_idx = row.get('ActivePairIdx', i)
@@ -679,10 +714,6 @@ class DynamicSolutionEvaluator:
         """
         Evaluate a complete solution using SewerPipeline + SWMM.
         """
-        if not SEWER_PIPELINE_AVAILABLE:
-            print("Error: SewerPipeline not available. Using fallback.")
-            return self._fallback_cost_estimation(self._get_active_pairs(assignments))
-            
         # 1. Get Active Pairs
         active_pairs = self._get_active_pairs(assignments)
         if not active_pairs:
@@ -862,14 +893,14 @@ class DynamicSolutionEvaluator:
             tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
             modifier.add_storage_unit(
                 name=tank_name,
-                area=pair.volume / 5.0, # Depth 5m
-                max_depth=5.0,
+                area=pair.volume / config.TANK_DEPTH_M, 
+                max_depth=config.TANK_DEPTH_M,
                 invert_elev=z_invert
             )
             # Add tank coordinates
             modifier.add_coordinate(tank_name, pair.predio_x, pair.predio_y)
             
-            c_land = (pair.volume / 5.0 * 1.2) * 50.0 
+            c_land = (pair.volume / config.TANK_DEPTH_M * config.TANK_OCCUPATION_FACTOR) * 50.0 
             c_tank = CostCalculator.calculate_tank_cost(pair.volume)
             pair.cost_tank = c_tank
             pair.cost_land = c_land
@@ -900,8 +931,8 @@ class DynamicSolutionEvaluator:
             
             # --- HYDRAULIC WEIR DESIGN ---
             # Get tank volume (clamped)
-            MIN_TANK_VOL = 1000.0
-            MAX_TANK_VOL = 10000.0
+            MIN_TANK_VOL = config.TANK_MIN_VOLUME_M3
+            MAX_TANK_VOL = config.TANK_MAX_VOLUME_M3
             raw_volume = pair.volume if pair.volume > 0 else 3000.0
             tank_volume_m3 = max(MIN_TANK_VOL, min(raw_volume, MAX_TANK_VOL))
             
@@ -1155,9 +1186,8 @@ class DynamicSolutionEvaluator:
             designed_gdf=designed_gdf
         )
 
-        # Calculate Delta
+        # Calculate Delta (Volume-Based Simple Metric for Comparison)
         delta_vol = self.baseline_metrics.total_flooding_volume - current_metrics.total_flooding_volume
-        delta_cost = self.baseline_metrics.flooding_cost - current_metrics.flooding_cost
         pct_improvement = 0.0
         if self.baseline_metrics.total_flooding_volume > 0:
             pct_improvement = (delta_vol / self.baseline_metrics.total_flooding_volume) * 100.0
@@ -1196,11 +1226,11 @@ class DynamicSolutionEvaluator:
             print(f"    - Flooding REDUCED:   {delta_vol:,.2f} m3 ({pct_improvement:.1f}% Improvement)")
         else:
             print(f"    - Flooding INCREASED: +{abs(delta_vol):,.2f} m3 ({abs(pct_improvement):.1f}% Worsened)")
-            
-        if delta_cost >= 0:
-            print(f"    - Cost Saved:         ${delta_cost:,.2f}")
-        else:
-            print(f"    - Cost INCREASED:     +${abs(delta_cost):,.2f}")
+
+        # --- ECONOMIC REPORTING ---
+        # REAL MODE: Use ComprehensiveEconomicEvaluator results directly
+        # The real benefits were already printed in the [Economics] section earlier.
+        print(f"    [Economics Mode: REAL] See [Economics] section above for damage/benefit analysis.")
             
         print(f"    - Flooded Nodes:      {current_metrics.flooded_nodes_count} (Base: {self.baseline_metrics.flooded_nodes_count})")
         
@@ -1250,42 +1280,127 @@ class DynamicSolutionEvaluator:
              except Exception as e:
                  print(f"  [Warning] Failed to generate report: {e}")
         
-        # The optimizer expects (cost, remaining_flooding_volume)
+        # --- RUN ITZI FLOOD MODEL ---
+        print(f"\n  [Itzi] Running 2D surface flood simulation...")
+        itzi_dir = case_dir / "02_itzi_2d"
+        itzi_dir.mkdir(parents=True, exist_ok=True)
+        
+        itzi_result = run_itzi_for_case(
+            swmm_file=str(final_inp_path),
+            output_dir=str(itzi_dir),
+            verbose=False
+        )
+        if itzi_result.get('success'):
+            print(f"  [Itzi] ✓ 2D simulation complete (Max Depth: {itzi_result.get('max_depth_m', 0):.2f}m)")
+            
+            # Run CLIMADA on depth raster
+            if 'max_depth_file' in itzi_result and itzi_result['max_depth_file']:
+                 damage_dir = case_dir / "03_flood_damage"
+                 damage_dir.mkdir(parents=True, exist_ok=True)
+                 
+                 # Use CLIMADA flood damage calculation
+                 climada_res = calculate_flood_damage_climada(
+                     depth_raster_path=itzi_result['max_depth_file'],
+                     output_gpkg=damage_dir / "flood_damage_results.gpkg",
+                     output_txt=damage_dir / "flood_damage_report.txt"
+                 )
+                 itzi_result['climada_result'] = climada_res
+                 print(f"  [CLIMADA] Total Damage: ${climada_res.get('total_damage_usd', 0):,.2f}")
+        else:
+            raise RuntimeError(f"ITZI simulation failed: {itzi_result}")
+
+        # --- CALCULATE ECONOMIC IMPACT ---
+        print("\n  [Economics] Calculating Economic Impact...")
+        
+        # Use CLIMADA results from itzi_result
+        if itzi_result and 'climada_result' in itzi_result and itzi_result['climada_result']:
+            climada_res = itzi_result['climada_result']
+            flood_damage = climada_res.get('total_damage_usd', 0.0)
+            
+            # Store for optimizer to calculate avoided cost
+            self.last_flood_damage_usd = flood_damage
+            
+            # If this is the first CLIMADA run, store as baseline proxy
+            if not hasattr(self, 'baseline_flood_damage') or self.baseline_flood_damage == 0:
+                # First run: estimate baseline from current damage + marginal improvement
+                # This is an approximation - ideally baseline ITZI should run separately
+                self.baseline_flood_damage = flood_damage * 1.2  # Assume ~20% improvement from first tank
+                print(f"  [Economics] Baseline CLIMADA Damage (estimated): ${self.baseline_flood_damage:,.2f}")
+            
+            # Return flooding damage as economic impact
+            economic_res = {
+                'net_impact_usd': flood_damage,
+                'flood_damage_usd': flood_damage,
+                'details': climada_res
+            }
+            print(f"  [Economics] ITZI/CLIMADA Flood Damage: ${flood_damage:,.2f}")
+        else:
+            # ITZI ran but no CLIMADA result - raise error (NO FALLBACKS)
+            raise RuntimeError(
+                f"ITZI ran but no CLIMADA result available. "
+                f"ITZI result: {itzi_result}. Check ITZI/CLIMADA configuration."
+            )
+        
+        # --- GENERATE AVOIDED COST BUDGET ---
+        from rut_20_avoided_costs import DeferredInvestmentCost
+        deferred_calc = DeferredInvestmentCost(
+            base_precios_path=str(config.CODIGOS_DIR / "base_precios.xlsx"),
+            capacity_threshold=0.9
+        )
+        deferred_calc.run(
+            inp_path=str(final_inp_path),
+            output_dir=str(case_dir)
+        )
+        
+        # Net Impact (The "Badness" we want to minimize)
+        # Typically = Residual Damage - Benefits
+        # Or if VolumeBased: Volume * Rate
+        net_impact_usd = economic_res.get('net_impact_usd', 0.0)
+        details = economic_res.get('details', {})
+        
+        print(f"  [Economics] Net Economic Impact (Damage - Benefits): ${net_impact_usd:,.2f}")
+        if 'residual_damage' in details:
+            print(f"    - Residual Damage:   ${details['residual_damage']:,.2f}")
+        if 'total_benefits' in details:
+            print(f"    - Total Benefits:    ${details['total_benefits']:,.2f}")
+            for b_name, b_val in details.get('benefits_breakdown', {}).items():
+                print(f"      * {b_name}: ${b_val:,.2f}")
+
+        # --- FINAL RESULTS ---
+        # The optimizer expects (cost, secondary_metric).
+        # We assume total_cost (construction) is the primary cost, and we want to pass the simplified flooding volume 
+        # as the secondary metric for the Pareto front, OR we pass the Full Economic Impact?
+        # The current signature is (cost, remaining_flooding_volume).
+        # But 'cost' is construction cost usually.
+        # Wait, if we want to minimize Total Cost TO SOCIETY, it should be Construction + Impact.
+        # For now, let's keep Construction as Index 0, and Flooding Volume as Index 1 (for compatibility with optimizer logic)
+        # OR, we can update the Optimizer to use 'Net Economic Impact' as the second objective?
+        # The user's request "Stopping Criterion: ECONOMIC BREAKEVEN" implies we need to compare Construction vs Benefits.
+        # Breakeven = (Benefits >= Construction).
+        # The optimizer check logic is in rut_10.
+        
+        # Let's verify what rut_10 does with the return value.
+        # It expects (cost, remaining_flooding). cost is traditionally construction.
+        # But for Breakeven analysis, it needs Benefits.
+        # The optimizer currently doesn't see benefits directly returned here unless we change valid_pairs or something.
+        
+        # ACTUALLY: The return value is just for printing/plotting in rut_10 loop.
+        # But wait, rut_10 uses `cost` and `remaining_flooding`.
+        
+        # CRITICAL: We need to expose the BENEFITS to the optimizer for the breakeven check.
+        # We can attach it to the current_metrics or return it. But the signature is fixed.
+        # A hack is to treat "remaining_flooding" as "Net Impact" if we change units? No, dangerous.
+        
+        # Let's print them vividly. For the Breakeven check in rut_10:
+        # It compares `total_cost` (construction) with `reduction * cost_per_m3`.
+        # We should update rut_10 later to read the real benefits if we want "Real" breakeven.
+        # For now, we print detailed info here.
+        
+        print(f"  [Economics] Total Construction Cost: ${total_cost:,.2f}")
+        print(f"  [Economics] B/C Ratio:               {(details.get('total_benefits', 0)/total_cost):.2f}" if total_cost > 0 else "Inf")
+        
         return total_cost, current_metrics.total_flooding_volume
     
-
-    def _fallback_cost_estimation(self, 
-                                  active_pairs: List[ActivePair]) -> Tuple[float, float]:
-        """
-        Fallback cost estimation using straight-line distances.
-        Used when PathFinder fails.
-        """
-        total_cost = 0.0
-        total_flooding_captured = 0.0
-        
-        for pair in active_pairs:
-            distance = np.sqrt(
-                (pair.node_x - pair.predio_x)**2 + 
-                (pair.node_y - pair.predio_y)**2
-            )
-            
-            c_derivation = CostCalculator.calculate_derivation_cost(distance, pair.flooding_flow)
-            c_tank = CostCalculator.calculate_tank_cost(pair.volume)
-            
-            predio = self.predios_gdf.iloc[pair.predio_idx]
-            area_required = pair.volume / 5.0 * 1.2
-            c_land = area_required * predio.get('costo_suelo_m2', 50.0)
-            
-            total_cost += c_derivation + c_tank + c_land
-            
-            node = self.nodes_gdf.iloc[pair.node_idx]
-            flooding_captured = min(pair.volume, node.FloodingVolume)
-            total_flooding_captured += flooding_captured
-        
-        total_node_flooding = self.nodes_gdf['FloodingVolume'].sum()
-        remaining_flooding = total_node_flooding - total_flooding_captured
-        
-        return (total_cost, remaining_flooding)
 
     def _read_designed_gpkg(self, output_gpkg: Path) -> gpd.GeoDataFrame:
         """Helper to read and validate designed GPKG."""

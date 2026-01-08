@@ -1027,7 +1027,8 @@ class GreedyTankOptimizer:
                  min_tank_volume: float = 1000.0,  # Minimum tank size (m³)
                  max_tank_volume: float = 10000.0, # Maximum tank size (m³)
                  tank_depth: float = 5.0,          # Tank depth (m)
-                 stop_at_breakeven: bool = False,  # Stop when cost >= savings
+                 stop_at_breakeven: bool = False,  # Stop when cost >= savings * multiplier
+                 breakeven_multiplier: float = 1.0,  # Allow investment up to X times avoided damage
                  flooding_cost_per_m3: float = 1250.0):  # $/m³ flooding damage
         self.nodes_gdf = nodes_gdf
         self.predios_gdf = predios_gdf
@@ -1038,6 +1039,7 @@ class GreedyTankOptimizer:
         self.max_tank_volume = max_tank_volume
         self.tank_depth = tank_depth
         self.stop_at_breakeven = stop_at_breakeven
+        self.breakeven_multiplier = breakeven_multiplier
         self.flooding_cost_per_m3 = flooding_cost_per_m3
         
     def run_sequential(self, candidates: List[dict]) -> pd.DataFrame:
@@ -1061,7 +1063,7 @@ class GreedyTankOptimizer:
         
         # Constants for area calculation
         TANK_DEPTH = self.tank_depth  # Use configurable depth
-        OCCUPATION_FACTOR = 1.5  # Extra space for access, pumps, maneuvering
+        OCCUPATION_FACTOR = 1.2  # Extra space for access, pumps, maneuvering
         # Use configurable volume limits from instance
         MIN_TANK_VOLUME = self.min_tank_volume
         MAX_TANK_VOLUME = self.max_tank_volume
@@ -1240,9 +1242,24 @@ class GreedyTankOptimizer:
                 })
                 
                 # === ECONOMIC TRACKING (for graphing) ===
+                # Get CLIMADA damage from evaluator (ITZI always used)
+                current_damage = getattr(self.evaluator, 'last_flood_damage_usd', 0)
+                baseline_damage = getattr(self.evaluator, 'baseline_flood_damage', 0)
+                
+                # Avoided Cost = Baseline Damage - Current Damage
+                cost_saved = baseline_damage - current_damage
+                
+                # Get flooding volume from metrics for display
+                if hasattr(self.evaluator, 'last_metrics') and self.evaluator.last_metrics:
+                    flooding_vol_display = self.evaluator.last_metrics.total_flooding_volume
+                else:
+                    flooding_vol_display = flooding_vol
                 baseline_flood = self.evaluator.baseline_metrics.total_flooding_volume
-                flooding_reduced = baseline_flood - flooding_vol
-                cost_saved = flooding_reduced * self.flooding_cost_per_m3
+                flooding_reduced = baseline_flood - flooding_vol_display
+                
+                print(f"  [Economics] Baseline CLIMADA Damage: ${baseline_damage:,.2f}")
+                print(f"  [Economics] Current CLIMADA Damage:  ${current_damage:,.2f}")
+                print(f"  [Economics] Avoided Cost:            ${cost_saved:,.2f}")
                 
                 # Track for plotting
                 economic_history.append({
@@ -1251,7 +1268,7 @@ class GreedyTankOptimizer:
                     'savings': cost_saved,
                     'n_tanks': len(active_candidates),
                     'flooding_reduced': flooding_reduced,
-                    'flooding_remaining': flooding_vol,  # Residual risk
+                    'flooding_remaining': flooding_vol_display,
                     'baseline_flooding': baseline_flood
                 })
                 
@@ -1272,9 +1289,12 @@ class GreedyTankOptimizer:
                     print(f"  [Graph] Skipped (config unchanged)")
                 
                 # === BREAKEVEN CHECK ===
-                if self.stop_at_breakeven and cost >= cost_saved:
+                # Stop when cost >= savings * multiplier (e.g., multiplier=1.5 allows 50% more investment)
+                threshold = cost_saved * self.breakeven_multiplier
+                if self.stop_at_breakeven and cost >= threshold:
                     print(f"\n  *** BREAKEVEN REACHED ***")
-                    print(f"  Construction cost (${cost:,.0f}) >= Flooding savings (${cost_saved:,.0f})")
+                    print(f"  Construction cost (${cost:,.0f}) >= Threshold (${threshold:,.0f})")
+                    print(f"  [Threshold = Savings × {self.breakeven_multiplier:.2f}]")
                     print(f"  Stopping optimization at {len(active_candidates)} tanks.")
                     break
 

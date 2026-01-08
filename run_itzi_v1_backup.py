@@ -138,7 +138,7 @@ hmin = 0.01
 cfl = 0.4
 theta = 0.9
 dtmax = 0.5
-nprocs = 18
+nprocs = 12
 """
     
     with open(CONFIG_FILE, 'w') as f:
@@ -256,26 +256,8 @@ if result.returncode == 0:
             map_to_export = max_map
             print(f"  Using PRE-COMPUTED MAX: {max_map}")
         else:
-            # Fallback: Calculate MAX using r.series
-            print(f"  Pre-computed max map '{max_map}' not found.")
-            print(f"  calculating MAX from {len(var_maps)} timesteps using r.series...")
-            
-            if not var_maps:
-                print(f"  Error: No maps found for {itzi_name} to calculate max.")
-                continue
-                
-            # Construct r.series command
-            # input=map1,map2,... output=max_map method=maximum
-            input_maps = ','.join(var_maps)
-            try:
-                gscript.run_command('r.series', input=input_maps, output=max_map, method='maximum', overwrite=True)
-                map_to_export = max_map
-                print(f"  ✓ Calculated MAX: {max_map}")
-            except Exception as e:
-                print(f"  Error calculating r.series: {e}")
-                map_to_export = var_maps[-1]
-                print(f"  Fallback to LAST TIMESTEP: {map_to_export}")
-
+            map_to_export = var_maps[-1]
+            print(f"  Using LAST TIMESTEP: {map_to_export}")
         
         final_output = os.path.join(OUTPUT_DIR, filename)
         

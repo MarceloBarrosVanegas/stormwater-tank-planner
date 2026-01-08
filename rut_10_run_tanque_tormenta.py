@@ -25,6 +25,7 @@ config.setup_sys_path()
 from rut_02_elevation import ElevationGetter, ElevationSource
 from rut_15_optimizer import TankOptimizer
 from rut_16_dynamic_evaluator import DynamicSolutionEvaluator
+from rut_15_optimizer import GreedyTankOptimizer
 
 class StormwaterOptimizationRunner:
     """
@@ -245,13 +246,13 @@ class StormwaterOptimizationRunner:
         ranked_pairs = df_c.to_dict('records')
         
         print(f"\n--- TOP 5 CANDIDATES (After Filtering) (Weights: Flow={w_flow}, Dist={w_dist}, Gap={w_gap}) ---")
-        for k in range(min(5, len(ranked_pairs))):
+        for k in range(min(10, len(ranked_pairs))):
             p = ranked_pairs[k]
             print(f"  #{k+1}: Node {p['NodeID']} -> Predio {p['PredioID']}")
             print(f"      Flow: {p['FloodingFlow']:.3f} m3/s | Dist: {p['Distance']:.1f} m | Desnivel: {p['Desnivel']:.2f} m")
             print(f"      Score: {p['Score']:.4f}")
             
-        print("---------------------------------------------------\n")
+        print("")
         
         self.valid_pairs = ranked_pairs
         return ranked_pairs
@@ -321,7 +322,8 @@ class StormwaterOptimizationRunner:
     def step_3_run_sequential_analysis(self, max_tanks: int = 10, max_iterations: int = 50,
                                          min_tank_vol: float = 1000.0, max_tank_vol: float = 10000.0, 
                                          tank_depth: float = 5.0,
-                                         stop_at_breakeven: bool = False, flooding_cost_per_m3: float = 1250.0,
+                                         stop_at_breakeven: bool = False, 
+                                         breakeven_multiplier: float = 1.0,  # Allow investment up to X times avoided damage
                                          swmm_file: Path = None, elev_file: Path = None):
         """
         Step 3: Sequential Tank Analysis
@@ -354,7 +356,7 @@ class StormwaterOptimizationRunner:
         print(f"  Volume Range: {min_tank_vol} - {max_tank_vol} m³")
         if stop_at_breakeven:
             print(f"  Stopping Criterion: ECONOMIC BREAKEVEN")
-            print(f"  Flooding Cost: ${flooding_cost_per_m3:,.0f}/m³")
+
         
         # 1. Setup Environment
         if self.nodes_gdf is None:
@@ -362,16 +364,22 @@ class StormwaterOptimizationRunner:
             
         if self.evaluator is None:
             print(f"\n  [Setup] Initializing SWMM Evaluator...")
+
+
             self.work_dir = Path(os.getcwd()) / "optimization_results"
-            self.setup_optimization(use_dynamic=True, swmm_file=swmm_file, elev_file=elev_file)
+            self.setup_optimization(use_dynamic=True,
+                                    swmm_file=swmm_file,
+                                    elev_file=elev_file,
+                                    max_depth = tank_depth,
+                                    min_tank_vol=min_tank_vol,
+                                    max_tank_vol=max_tank_vol, )
         
         # 2. Verify candidates exist
         if not hasattr(self, 'valid_pairs') or not self.valid_pairs:
             print("  [Error] No valid candidates. Run step_1 first.")
             return
         
-        # 3. Run Sequential Analysis
-        from rut_15_optimizer import GreedyTankOptimizer
+
         
         print(f"\n  [Analysis] Running Iterative Sequential Analysis...")
         print(f"  Candidates: {len(self.valid_pairs)} nodes with valid predios")
@@ -386,7 +394,8 @@ class StormwaterOptimizationRunner:
             max_tank_volume=max_tank_vol,
             tank_depth=tank_depth,
             stop_at_breakeven=stop_at_breakeven,
-            flooding_cost_per_m3=flooding_cost_per_m3
+            breakeven_multiplier=breakeven_multiplier,
+            # flooding_cost_per_m3=flooding_cost_per_m3
         )
 
 
@@ -408,46 +417,54 @@ class StormwaterOptimizationRunner:
             curve_path = self.work_dir / "sequential_curve.png"
             greedy_opt.plot_sequence_curve(df_seq, save_path=str(curve_path))
             
+            # Generate Damage Curves (rut_20) - ITZI is always used
+            print(f"\n  Generating flood damage curves...")
+            try:
+                from rut_20_plot_damage_curves import plot_all_curves_combined, plot_individual_curves, save_curves_as_csv
+                curves_dir = self.work_dir / "damage_curves"
+                curves_dir.mkdir(parents=True, exist_ok=True)
+                plot_all_curves_combined(output_dir=curves_dir)
+                plot_individual_curves(output_dir=curves_dir)
+                save_curves_as_csv(output_dir=curves_dir)
+                print(f"  Damage curves saved to: {curves_dir}")
+            except Exception as e:
+                print(f"  Warning: Could not generate damage curves: {e}")
+            
         except Exception as e:
             print(f"  [Error] Sequential analysis failed: {e}")
             import traceback
             traceback.print_exc()
         
-        # 4. RUN FULL GENETIC OPTIMIZATION
-        # (Commented out temporarily to focus on Greedy Analysis as requested)
-        '''
-        print(f"\n  [Phase B] Starting Full Genetic Optimization Loop...")
-        print(f"  Output folder: {self.work_dir}")
-        
-        start_t = time.time()
-        result = self.optimizer.run(n_gen=n_gen, pop_size=pop_size, seed=1)
-        end_t = time.time()
-        
-        print(f"\n  >>> OPTIMIZATION COMPLETE in {(end_t - start_t)/60:.1f} minutes <<<")
-        
-        # 5. Show Results
-        df_res = self.optimizer.get_pareto_solutions()
-        if not df_res.empty:
-            print("\n  PARETO FRONT SOLUTIONS (Trade-off: Cost vs Flooding):")
-            print(df_res.to_string(index=False))
-            
-            # Save CSV
-            csv_path = self.work_dir / "pareto_results.csv"
-            df_res.to_csv(csv_path, index=False)
-            print(f"  Results saved to: {csv_path}")
-        else:
-            print("  No solutions found or optimization failed.")
-        '''
 
-    def setup_optimization(self, use_dynamic: bool = True, swmm_file: Path = None, elev_file: Path = None):
-        """Initialize the evaluator and optimizer components."""
+    def setup_optimization(self, use_dynamic: bool = True,
+                           swmm_file: Path = None,
+                           elev_file: Path = None,
+                           V_min: float = 1000.0,
+                           V_max: float = 100000.0,
+                           max_tanks: int = 20,
+                           max_depth: float = 5.0,
+                           min_tank_vol: float = 1000.0,
+                           max_tank_vol: float = 100000.0):
+        """Initialize the evaluator and optimizer components.
+        
+        Args:
+            use_dynamic: Use dynamic SWMM simulation (True) or simple estimation (False)
+            swmm_file: Path to SWMM .inp file
+            elev_file: Path to elevation raster
+        """
         
         
         if self.work_dir is None:
              self.work_dir = self.project_root / "codigos" / "optimization_results"
         
-        self.swmm_file = swmm_file 
+        self.swmm_file_original = swmm_file
              
+        # Update Config with provided parameters
+        import config
+        config.TANK_DEPTH_M = max_depth
+        config.TANK_MIN_VOLUME_M3 = min_tank_vol
+        config.TANK_MAX_VOLUME_M3 = max_tank_vol
+
         self.evaluator = DynamicSolutionEvaluator(
             work_dir=self.work_dir,
             path_proy=self.project_root,
@@ -455,16 +472,17 @@ class StormwaterOptimizationRunner:
             nodes_gdf=self.nodes_gdf,
             predios_gdf=self.predios_gdf,
             elev_files_list=[str(elev_file)],
-            proj_to=self.proj_to
+            proj_to=self.proj_to,
+
         )
         
         # Initialize Optimizer
         self.optimizer = TankOptimizer(
             nodes_gdf=self.nodes_gdf,
             predios_gdf=self.predios_gdf,
-            V_min=100.0,
-            V_max=3000.0,
-            max_tanks=5,
+            V_min=V_min,
+            V_max=V_max,
+            max_tanks=max_tanks,
             dynamic_evaluator=self.evaluator,
             use_dynamic_evaluation=use_dynamic
         )
@@ -490,7 +508,7 @@ class StormwaterOptimizationRunner:
             best_sol = self.optimizer.get_pareto_solutions().sort_values('cost').iloc[0]
             self.optimizer.plot_solution_map(
                 solution_id=best_sol['solution_id'],
-                inp_path=str(self.swmm_file) if hasattr(self, 'swmm_file') else None,
+                inp_path=str(self.swmm_file_original) if hasattr(self, 'swmm_file') else None,
                 save_path=str(self.work_dir / f"map_solution_{best_sol['solution_id']}.png")
             )
         except Exception as e:
@@ -498,36 +516,8 @@ class StormwaterOptimizationRunner:
 
 if __name__ == "__main__":
 
-    #definir sistema de coordenadas del proyecto
-    source_crs = CRS(
-        """PROJCRS["SIRES-DMQ",
-        BASEGEOGCRS["WGS 84",
-            DATUM["World Geodetic System 1984",
-                ELLIPSOID["WGS 84",6378137,298.257223563,
-                LENGTHUNIT["metre",1]],ID["EPSG",6326]],
-            PRIMEM["Greenwich",0,
-                ANGLEUNIT["Degree",0.0174532925199433]]],
-        CONVERSION["unnamed",
-            METHOD["Transverse Mercator",ID["EPSG",9807]],
-            PARAMETER["Latitude of natural origin",0,
-                ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8801]],
-            PARAMETER["Longitude of natural origin",-78.5,
-                ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8802]],
-            PARAMETER["Scale factor at natural origin",1.0004584,
-                SCALEUNIT["unity",1],ID["EPSG",8805]],
-            PARAMETER["False easting",500000,
-                LENGTHUNIT["metre",1],ID["EPSG",8806]],
-            PARAMETER["False northing",10000000,
-                LENGTHUNIT["metre",1],ID["EPSG",8807]]],
-        CS[Cartesian,3],
-        AXIS["(E)",east,ORDER[1],
-            LENGTHUNIT["metre",1,ID["EPSG",9001]]],
-        AXIS["(N)",north,ORDER[2],
-            LENGTHUNIT["metre",1,ID["EPSG",9001]]],
-        AXIS["ellipsoidal height (h)",up,ORDER[3],
-        LENGTHUNIT["metre",1,ID["EPSG",9001]]]]"""
-        )
-    proj_to = source_crs.to_2d()
+    # Usar CRS del proyecto desde config
+    proj_to = config.PROJECT_CRS
 
 
     # Se asume ejecución desde carpeta codigos: root = parent dir
@@ -555,12 +545,22 @@ if __name__ == "__main__":
         max_iterations=100,        # Max iterations (stopping condition 2)
         min_tank_vol=5000.0,       # Minimum tank size (m³)
         max_tank_vol=1000000.0,    # Very high - predio area will limit actual size
-        tank_depth=5.0,            # Tank depth (m)
-        stop_at_breakeven=True,    # Stop when cost >= flooding savings (condition 3)
-        flooding_cost_per_m3=1250.0,  # $/m³ flooding damage
+        tank_depth=7.0,            # Tank depth (m)
+        stop_at_breakeven=True,    # Stop when cost >= threshold (condition 3)
+        breakeven_multiplier=1000,  # Allow investment up to 1.5x avoided damage
         swmm_file=swmm_file,
         elev_file=elev_file
     )
+
+
+    # para plastico verificar que no se salga de los pozos anteriores y poreseriotes
+    # piedra, tuberia de homrigon simple no pueden presurizarse
+    # controlar velocidades  entuberia segun material
+    #criteriios de riesgo de coletores,
+
+
+
+
 
 
     

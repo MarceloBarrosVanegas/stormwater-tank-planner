@@ -1,24 +1,53 @@
 import sys
 import os
 from pathlib import Path
+from pyproj import CRS
 
-# --- PROJECT ROOTS ---
-# Automatically detect 'codigos' directory and Project Root
+# =============================================================================
+# PROJECT ROOTS
+# =============================================================================
 CODIGOS_DIR = Path(__file__).parent.resolve()
 PROJECT_ROOT = CODIGOS_DIR.parent
 
-# --- EXTERNAL DEPENDENCIES ---
-# PyPiper (ALCANTARILLADO_PyQt5)
-# Assuming standard structure relative to User Home or OneDrive
-# Try to find OneDrive for the current user
+# =============================================================================
+# PROJECT COORDINATE REFERENCE SYSTEM (CRS)
+# =============================================================================
+# SIRES-DMQ: Sistema de Referencia del DMQ (Quito)
+PROJECT_CRS_WKT = """PROJCRS["SIRES-DMQ",
+    BASEGEOGCRS["WGS 84",
+        DATUM["World Geodetic System 1984",
+            ELLIPSOID["WGS 84",6378137,298.257223563,
+            LENGTHUNIT["metre",1]],ID["EPSG",6326]],
+        PRIMEM["Greenwich",0,
+            ANGLEUNIT["Degree",0.0174532925199433]]],
+    CONVERSION["unnamed",
+        METHOD["Transverse Mercator",ID["EPSG",9807]],
+        PARAMETER["Latitude of natural origin",0,
+            ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8801]],
+        PARAMETER["Longitude of natural origin",-78.5,
+            ANGLEUNIT["Degree",0.0174532925199433],ID["EPSG",8802]],
+        PARAMETER["Scale factor at natural origin",1.0004584,
+            SCALEUNIT["unity",1],ID["EPSG",8805]],
+        PARAMETER["False easting",500000,
+            LENGTHUNIT["metre",1],ID["EPSG",8806]],
+        PARAMETER["False northing",10000000,
+            LENGTHUNIT["metre",1],ID["EPSG",8807]]],
+    CS[Cartesian,2],
+    AXIS["(E)",east,ORDER[1],
+        LENGTHUNIT["metre",1,ID["EPSG",9001]]],
+    AXIS["(N)",north,ORDER[2],
+        LENGTHUNIT["metre",1,ID["EPSG",9001]]]]"""
+
+PROJECT_CRS = CRS(PROJECT_CRS_WKT)
+# =============================================================================
+# EXTERNAL DEPENDENCIES (PyPiper)
+# =============================================================================
 USER_HOME = Path.home()
 ONEDRIVE_DIR = USER_HOME / "OneDrive"
 
-# Fallback strategies for PyPiper
 POSSIBLE_PYPIPER_PATHS = [
     ONEDRIVE_DIR / "ALCANTARILLADO_PyQt5/00_MODULOS/pypiper",
     USER_HOME / "ALCANTARILLADO_PyQt5/00_MODULOS/pypiper",
-    
 ]
 
 PYPIPER_DIR = None
@@ -30,31 +59,122 @@ for p in POSSIBLE_PYPIPER_PATHS:
 if PYPIPER_DIR:
     PYPIPER_SRC = PYPIPER_DIR / "src"
     PYPIPER_GUI = PYPIPER_DIR / "gui"
+    PYPIPER_UTIL_GEOMETRY = PYPIPER_DIR / "util" / "geometry"
 else:
-    print("WARNING: PyPiper directory not found. Dependencies found later might fail.")
     PYPIPER_SRC = None
     PYPIPER_GUI = None
+    PYPIPER_UTIL_GEOMETRY = None
 
-# --- ADD TO SYS.PATH (Helper) ---
 def setup_sys_path():
-    """Adds PyPiper paths to sys.path if not present."""
-    if PYPIPER_SRC and str(PYPIPER_SRC) not in sys.path:
-        sys.path.append(str(PYPIPER_SRC))
+    """Adds PyPiper paths to sys.path if not present (at beginning for priority)."""
+    if PYPIPER_UTIL_GEOMETRY and str(PYPIPER_UTIL_GEOMETRY) not in sys.path:
+        sys.path.insert(0, str(PYPIPER_UTIL_GEOMETRY))
     if PYPIPER_GUI and str(PYPIPER_GUI) not in sys.path:
-        sys.path.append(str(PYPIPER_GUI))
+        sys.path.insert(0, str(PYPIPER_GUI))
+    if PYPIPER_SRC and str(PYPIPER_SRC) not in sys.path:
+        sys.path.insert(0, str(PYPIPER_SRC))
 
-# --- DATA PATHS ---
+# =============================================================================
+# DATA DIRECTORIES
+# =============================================================================
 GIS_DIR = PROJECT_ROOT / "gis"
 RASTER_DIR = GIS_DIR / "01_raster"
+VECTOR_DIR = GIS_DIR / "00_vector"
 FLOODING_STATS_DIR = CODIGOS_DIR / "00_flooding_stats"
 
-# Default Files
+# =============================================================================
+# MAIN PROJECT FILES
+# =============================================================================
+# SWMM
+SWMM_FILE = CODIGOS_DIR / "COLEGIO_TR25_v6.inp"
+BASE_INP_TR = 25 # Return Period (years) of the base INP file
+
+# Rasters
+ELEV_FILE_ORIGINAL = RASTER_DIR / "elev_10_dmq_reprojected_clipped.tif"
+ELEV_FILE_CARVED = RASTER_DIR / "dem_carved.tif"
+ELEV_FILE = ELEV_FILE_CARVED  # Use carved DEM for Itzi simulation
+
+
+# Vectors
+PREDIOS_FILE = VECTOR_DIR / "07_predios_disponibles.shp"
+NETWORK_FILE = VECTOR_DIR / "06_red_principal.gpkg"
+FLOODING_NODES_FILE = FLOODING_STATS_DIR / "00_flooding_nodes.gpkg"
+
+# Other
 DEFAULT_NODES_XLSX = FLOODING_STATS_DIR / "00_flooding_nodes.xlsx"
 OSM_CACHE_PATH = PROJECT_ROOT / "osm_cache.graphml"
+BASE_PRECIOS = CODIGOS_DIR / "base_precios.xlsx"
 
-# --- CONSTANTS ---
-FLOODING_COST_PER_M3 = 1250.0
 
+# =============================================================================
+# ITZI 2D FLOOD SIMULATION SETTINGS
+# =============================================================================
+# GRASS GIS location for Itzi
+GRASSDATA = USER_HOME / "grassdata" / "tanques_tormenta"
+
+# Itzi executable
+ITZI_EXE = USER_HOME / "AppData/Roaming/Python/Python312/Scripts/itzi.exe"
+
+# Itzi output directory
+ITZI_OUTPUT_DIR = CODIGOS_DIR / "itzi_results"
+
+# Itzi config file
+ITZI_CONFIG_FILE = CODIGOS_DIR / "itzi_config.ini"
+
+# Manning friction coefficient (uniform)
+MANNING_VALUE = 0.035
+
+# Manning friction raster (variable by surface type)
+MANNING_RASTER_FILE = RASTER_DIR / "manning_raster.tif"
+
+# =============================================================================
+# SIMULATION PARAMETERS
+# =============================================================================
+ITZI_SIMULATION_DURATION_HOURS = 0.25  # Duration for Itzi/SWMM simulation (Hours)
+REPORT_STEP_MINUTES = 5               # Report step for SWMM and Itzi
+PLOT_TIME_LIMIT_HOURS = 3.5           # Limit X-axis on time plots
+
+# =============================================================================
+# COST PARAMETERS
+# =============================================================================
+FLOODING_COST_PER_M3 = 1250.0  # Cost per cubic meter of flooding
+
+# =============================================================================
+# TANK DESIGN PARAMETERS
+# =============================================================================
+TANK_DEPTH_M = 5.0              # Default tank depth in meters
+TANK_MIN_VOLUME_M3 = 1000.0     # Minimum tank volume in cubic meters
+TANK_MAX_VOLUME_M3 = 10000.0    # Maximum tank volume in cubic meters
+TANK_OCCUPATION_FACTOR = 1.2    # Extra space factor for access, pumps, maneuvering
+
+# =============================================================================
+# PROJECT METADATA (for reports and Excel output)
+# =============================================================================
+EXCEL_METADATA = {
+    'proyecto_name': 'REDUCCION DE CAUDALES DE DESCARGA CON TANQUES DE TORMENTA',
+    'sistema': 'SUBSISTEMA EL COLEGIO OCIDENTAL',
+    'ubicacion': 'QUITO',
+    'obra': 'COSTO DE REPOSICION DE TUBERIAS',
+    'cliente': 'EPMAPS'
+}
+
+# Default if not provided
+DEFAULT_PATH_WEIGHTS = {
+    'length_weight': 0.4,
+    'elevation_weight': 0.3,
+    'road_weight': 0.3
+}
+DEFAULT_ROAD_PREFERENCES = {
+    'motorway': 5.0, 'trunk': 5.0, 'primary': 1.0,
+    'secondary': 2.5, 'tertiary': 2.5, 'residential': 0.5,
+    'service': 1.0, 'unclassified': 1.0,
+    'footway': 10.0, 'path': 10.0, 'steps': 20.0,
+    'default': 1.5
+}
+
+# =============================================================================
+# INITIALIZATION MESSAGE
+# =============================================================================
 print(f"[Config] Project Root: {PROJECT_ROOT}")
 if PYPIPER_DIR:
     print(f"[Config] PyPiper found at: {PYPIPER_DIR}")

@@ -51,6 +51,10 @@ class SystemMetrics:
     # Time Series for Link Capacity (LinkID -> {time: [], capacity: []})
     link_capacities: Dict[str, Dict[str, list]] = field(default_factory=dict)
     
+    # NEW: Metadata for full network capacity analysis (Avoided Costs)
+    # {LinkID: {'q_peak': float, 'q_full': float, 'length': float, 'geom1': float}}
+    link_capacity_data: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
     # Arrays for distribution plots (Derived or stored for convenience)
     conduit_velocities: np.ndarray = field(default_factory=lambda: np.array([]))
     conduit_capacities: np.ndarray = field(default_factory=lambda: np.array([]))
@@ -76,234 +80,260 @@ class MetricExtractor:
             print(f"[MetricExtractor] Error: File not found {out_file_path}")
             return SystemMetrics()
             
-        # DEBUG: unexpected identity check
         import time
         stats = os.stat(out_file_path)
         print(f"[MetricExtractor] Reading: {out_file_path} (Size: {stats.st_size} bytes, Mod: {time.ctime(stats.st_mtime)})")
         
         metrics = SystemMetrics()
         
-        try:
-            # Force close any potential lingering handles? Not needed with 'with' context usually.
-            # ensure string
-            out_file_path = str(out_file_path)
+        # No Try-Except - Fail Hard
+        out_file_path = str(out_file_path)
+        
+        with Output(out_file_path) as out:
             
-            with Output(out_file_path) as out:
-                # 1. System Scalars
-                # ... (rest of extraction logic remains the same, assuming Output(path) works correctly)
-                
-                # Verify we are reading the correct file by checking something unique if possible?
-                # For now just proceed.
-                
-                # ... existing logic ...
-                # Note: PySWMM direct access to system stats might be limited, 
-                # so we aggregate from nodes/links or assume we parse .rpt file elsewhere.
-                # Here we aggregate from nodes:
-                
-                # Node Depths & Flooding
-                node_depths = {}
-                flood_vols = {}
-                
-                # System Aggregation Arrays (ONLY ORIGINAL NETWORK NODES)
-                system_flood_ts = None
-                system_times = None
-                
-                def is_original_node(nid):
-                    """Check if node is part of original network (not tank or derivation)"""
-                    # Tanks start with TK_
-                    if nid.startswith('TK_'):
-                        return False
-                    # Derivation nodes are format: 0.0, 0.1, 1.0, etc.
-                    parts = nid.split('.')
-                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                        return False
-                    return True
-                
-                # Calculate flooding and system aggregate for ORIGINAL NODES ONLY
-                for nid in out.nodes:
-                    # Skip tank and derivation nodes
-                    if not is_original_node(nid):
-                        continue
-                        
-                    # Get Flooding Series (This is the key metric)
-                    f_series = out.node_series(nid, NodeAttribute.FLOODING_LOSSES)
-                    
-                    if f_series:
-                        rates = list(f_series.values()) # cms
-                        times = list(f_series.keys())
-                        
-                        # --- SYSTEM AGGREGATION (only for original network nodes) ---
-                        if f_series:
-                            # Create pandas series for this node
-                            # Series index is datetime, values are rates
-                            ts_node = pd.Series(data=list(f_series.values()), index=list(f_series.keys()))
-                            
-                            # Calculate max rate for volume check
-                            max_rate = ts_node.max() if not ts_node.empty else 0.0
-                            
-                            if system_flood_ts is None:
-                                system_flood_ts = ts_node
-                            else:
-                                # Sum with alignment (fill_value=0 ensures we don't lose data if times differ)
-                                system_flood_ts = system_flood_ts.add(ts_node, fill_value=0)
-                        
-                        # Only compute volume if there's actual flooding
-                        if max_rate > 0.001: # Significant flooding threshold
-                            # Vol Calc
-                            vol = 0.0
-                            if len(times) > 1:
-                                for i in range(1, len(times)):
-                                    dt = (times[i] - times[i-1]).total_seconds()
-                                    vol += rates[i-1] * dt
-                                    
-                            if vol > 0.1:
-                                flood_vols[nid] = vol
-                                
-                                # Only get depth for flooded nodes (OPTIMIZATION)
-                                d_vals = list(out.node_series(nid, NodeAttribute.INVERT_DEPTH).values())
-                                if d_vals:
-                                    node_depths[nid] = max(d_vals)
-                
-                # Store System Hydrograph (already filtered - only original network nodes)
-                if system_flood_ts is not None:
-                    # Sort index just in case
-                    system_flood_ts = system_flood_ts.sort_index()
-                    
-                    system_times = system_flood_ts.index.tolist()
-                    system_rates = system_flood_ts.values.tolist()
-                    
-                    metrics.system_flood_hydrograph = {
-                        'times': system_times,
-                        'total_rate': system_rates
-                    }
-                    
-                    # Calculate total volume from summed filtered hydrograph
-                    # This ensures consistency between the plot and the reported number
-                    total_vol = 0.0
-                    if len(system_times) > 1:
-                        # Use trapezoidal integration or simply step integration strictly consistent with rates
-                        # Using simple retangular (rate * dt) as typically SWMM reports average rate for step or similar
-                        for i in range(1, len(system_times)):
-                            dt = (system_times[i] - system_times[i-1]).total_seconds()
-                            # Use rate at t-1
-                            total_vol += system_rates[i-1] * dt
-                    
-                    metrics.total_flooding_volume = total_vol
+            # --- NEW: Extract full link capacity data for Deferred Invesment Calc ---
+            # We need Q_peak, Q_full, Length, Diameter for ALL links (or at least conduits)
+            link_cap_data = {}
+            
+            for link_item in out.links:
+                if isinstance(link_item, str):
+                    lid = link_item
+                    # Strict access: Expect out.links to be subscriptable
+                    link_obj = out.links[lid] 
                 else:
-                     metrics.total_flooding_volume = 0.0
+                    lid = link_item.id
+                    link_obj = link_item
                 
-                # Node-level data for detailed analysis 
-                metrics.node_depths = node_depths
-                metrics.flooding_volumes = flood_vols
-                metrics.flooded_nodes_count = len(flood_vols)
+                # Strict series extraction - Q_peak (max flow)
+                q_series = out.link_series(lid, LinkAttribute.FLOW_RATE).values()
+                q_peak = max(list(q_series)) if q_series else 0.0
                 
-                # Cost calc
-                metrics.flooding_cost = metrics.total_flooding_volume * self.flooding_cost_per_m3
+                # Capacity series (d/D) - this is what DeferredInvestmentCost uses
+                cap_series = out.link_series(lid, LinkAttribute.CAPACITY).values()
+                max_capacity = max(list(cap_series)) if cap_series else 0.0
+                    
+                # Static attributes via .out are unreliable/unavailable in some pyswmm versions.
+                # We will populate these in rut_16 from the INP/Model data.
+                q_full = 0.0
+                length = 0.0
+                geom1 = 0.0
                 
-                if node_depths:
-                    metrics.avg_node_depth = np.mean(list(node_depths.values()))
+                link_cap_data[lid] = {
+                    'q_peak': q_peak,
+                    'q_full': q_full,
+                    'length': length,
+                    'geom1': geom1,
+                    'max_capacity': max_capacity  # d/D ratio for surcharge check
+                }
+            
+            metrics.link_capacity_data = link_cap_data
+
+
+            # 1. System Scalars
+            # Note: PySWMM direct access to system stats might be limited, 
+            # so we aggregate from nodes/links or assume we parse .rpt file elsewhere.
+            # Here we aggregate from nodes:
+            
+            # Node Depths & Flooding
+            node_depths = {}
+            flood_vols = {}
+            
+            # System Aggregation Arrays (ONLY ORIGINAL NETWORK NODES)
+            system_flood_ts = None
+            system_times = None
+            
+            def is_original_node(nid):
+                """Check if node is part of original network (not tank or derivation)"""
+                # Tanks start with TK_
+                if nid.startswith('TK_'):
+                    return False
+                # Derivation nodes are format: 0.0, 0.1, 1.0, etc.
+                parts = nid.split('.')
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    return False
+                return True
+            
+            # Calculate flooding and system aggregate for ORIGINAL NODES ONLY
+            for nid in out.nodes:
+                # Skip tank and derivation nodes
+                if not is_original_node(nid):
+                    continue
+                    
+                # Get Flooding Series (This is the key metric)
+                f_series = out.node_series(nid, NodeAttribute.FLOODING_LOSSES)
                 
-                # 2. Extract Hydrographs for Critical Nodes + Target Nodes
-                # Sort flooding volumes desc
-                sorted_flood = sorted(flood_vols.items(), key=lambda x: x[1], reverse=True)
-                top_nodes = [x[0] for x in sorted_flood[:top_n_hydrographs]]
-                
-                nodes_to_extract = set(top_nodes)
-                if target_nodes:
-                    nodes_to_extract.update(target_nodes)
-                
-                for nid in nodes_to_extract:
-                    try:
-                        # Get depth hydrograph (Depth vs Time)
-                        # We could also get Flowing Losses vs Time
-                        depth_series = out.node_series(nid, NodeAttribute.INVERT_DEPTH)
-                        # Convert datetimes to relative hours or similar? Keep as is for now.
-                        times = list(depth_series.keys())
-                        vals = list(depth_series.values())
+                if f_series:
+                    rates = list(f_series.values()) # cms
+                    times = list(f_series.keys())
+                    
+                    # --- SYSTEM AGGREGATION (only for original network nodes) ---
+                    if f_series:
+                        # Create pandas series for this node
+                        # Series index is datetime, values are rates
+                        ts_node = pd.Series(data=list(f_series.values()), index=list(f_series.keys()))
                         
-                        # Store as simple list of tuples or separate arrays
-                        # Let's simple lists of timestamps and values
-                        metrics.flood_hydrographs[nid] = {
-                            'times': times,
-                            'depths': vals,
-                            'flood_vol': flood_vols.get(nid, 0.0),
-                            'flood_rate': list(out.node_series(nid, NodeAttribute.FLOODING_LOSSES).values())
+                        # Calculate max rate for volume check
+                        max_rate = ts_node.max() if not ts_node.empty else 0.0
+                        
+                        if system_flood_ts is None:
+                            system_flood_ts = ts_node
+                        else:
+                            # Sum with alignment (fill_value=0 ensures we don't lose data if times differ)
+                            system_flood_ts = system_flood_ts.add(ts_node, fill_value=0)
+                    
+                    # Only compute volume if there's actual flooding
+                    if max_rate > 0.001: # Significant flooding threshold
+                        # Vol Calc
+                        vol = 0.0
+                        if len(times) > 1:
+                            for i in range(1, len(times)):
+                                dt = (times[i] - times[i-1]).total_seconds()
+                                vol += rates[i-1] * dt
+                                
+                        if vol > 0.1:
+                            flood_vols[nid] = vol
+                            
+                            # Only get depth for flooded nodes (OPTIMIZATION)
+                            d_vals = list(out.node_series(nid, NodeAttribute.INVERT_DEPTH).values())
+                            if d_vals:
+                                node_depths[nid] = max(d_vals)
+            
+            # Store System Hydrograph (already filtered - only original network nodes)
+            if system_flood_ts is not None:
+                # Sort index just in case
+                system_flood_ts = system_flood_ts.sort_index()
+                
+                system_times = system_flood_ts.index.tolist()
+                system_rates = system_flood_ts.values.tolist()
+                
+                metrics.system_flood_hydrograph = {
+                    'times': system_times,
+                    'total_rate': system_rates
+                }
+                
+                # Calculate total volume from summed filtered hydrograph
+                # This ensures consistency between the plot and the reported number
+                total_vol = 0.0
+                if len(system_times) > 1:
+                    # Use trapezoidal integration or simply step integration strictly consistent with rates
+                    # Using simple retangular (rate * dt) as typically SWMM reports average rate for step or similar
+                    for i in range(1, len(system_times)):
+                        dt = (system_times[i] - system_times[i-1]).total_seconds()
+                        # Use rate at t-1
+                        total_vol += system_rates[i-1] * dt
+                
+                metrics.total_flooding_volume = total_vol
+            else:
+                 metrics.total_flooding_volume = 0.0
+            
+            # Node-level data for detailed analysis 
+            metrics.node_depths = node_depths
+            metrics.flooding_volumes = flood_vols
+            metrics.flooded_nodes_count = len(flood_vols)
+            
+            # Cost calc
+            metrics.flooding_cost = metrics.total_flooding_volume * self.flooding_cost_per_m3
+            
+            if node_depths:
+                metrics.avg_node_depth = np.mean(list(node_depths.values()))
+            
+            # 2. Extract Hydrographs for Critical Nodes + Target Nodes
+            # Sort flooding volumes desc
+            sorted_flood = sorted(flood_vols.items(), key=lambda x: x[1], reverse=True)
+            top_nodes = [x[0] for x in sorted_flood[:top_n_hydrographs]]
+            
+            nodes_to_extract = set(top_nodes)
+            if target_nodes:
+                nodes_to_extract.update(target_nodes)
+            
+            for nid in nodes_to_extract:
+                try:
+                    # Get depth hydrograph (Depth vs Time)
+                    # We could also get Flowing Losses vs Time
+                    depth_series = out.node_series(nid, NodeAttribute.INVERT_DEPTH)
+                    # Convert datetimes to relative hours or similar? Keep as is for now.
+                    times = list(depth_series.keys())
+                    vals = list(depth_series.values())
+                    
+                    # Store as simple list of tuples or separate arrays
+                    # Let's simple lists of timestamps and values
+                    metrics.flood_hydrographs[nid] = {
+                        'times': times,
+                        'depths': vals,
+                        'flood_vol': flood_vols.get(nid, 0.0),
+                        'flood_rate': list(out.node_series(nid, NodeAttribute.FLOODING_LOSSES).values())
+                    }
+                except Exception as e:
+                     print(f"[MetricExtractor] Warning: Could not extract hydrograph for node {nid}: {e}")
+
+            # 3. Links Analysis (Velocity and Capacity)
+            velocities = []
+            capacities = []
+            
+            for lid in out.links:
+                 # Velocity data
+                 v_vals = list(out.link_series(lid, LinkAttribute.FLOW_VELOCITY).values())
+                 if v_vals:
+                     velocities.append(max(v_vals))
+                 
+                 # Capacity data (d/D)
+                 c_vals = list(out.link_series(lid, LinkAttribute.CAPACITY).values())
+                 if c_vals:
+                     capacities.append(max(c_vals))
+                     
+            metrics.conduit_velocities = np.array(velocities)
+            metrics.conduit_capacities = np.array(capacities)
+            
+            if velocities:
+                metrics.avg_conduit_velocity = np.mean(velocities)
+                
+            # 4. Extract Hydrographs for Target Links
+            if target_links:
+                 for lid in target_links:
+                     try:
+                         # Get Flow and Velocity
+                         link_flow = list(out.link_series(lid, LinkAttribute.FLOW_RATE).values())
+                         link_depth = list(out.link_series(lid, LinkAttribute.FLOW_DEPTH).values())
+                         times = list(out.link_series(lid, LinkAttribute.FLOW_RATE).keys())
+                         
+                         metrics.link_hydrographs[lid] = {
+                             'times': times,
+                             'flow': link_flow,
+                             'depth': link_depth
+                         }
+                         
+                         # Capacity (Fraction Full or similar)
+                         cap_series = list(out.link_series(lid, LinkAttribute.CAPACITY).values())
+                         metrics.link_capacities[lid] = {
+                             'times': times,
+                             'capacity': cap_series
+                         }
+                     except Exception as e:
+                         print(f"[MetricExtractor] Warning: Could not extract hydrograph for link {lid}: {e}")
+
+            # 5. EXTRACT TANK UTILIZATION (New Logic)
+            # Look for all nodes starting with TK_
+            for nid in out.nodes:
+                if nid.startswith("TK_"):
+                    try:
+                        # Get full depth series for tank
+                        depth_series_raw = out.node_series(nid, NodeAttribute.INVERT_DEPTH)
+                        times = list(depth_series_raw.keys())
+                        depths = list(depth_series_raw.values())
+                        max_depth = max(depths) if depths else 0.0
+                        
+                        metrics.tank_utilization[nid] = {
+                            'max_depth': max_depth,
+                            'max_volume': 0.0,
+                            'depth_series': depths,
+                            'times': times
                         }
                     except Exception as e:
-                         print(f"[MetricExtractor] Warning: Could not extract hydrograph for node {nid}: {e}")
-
-                # 3. Links Analysis (Velocity and Capacity)
-                velocities = []
-                capacities = []
-                
-                for lid in out.links:
-                     # Velocity data
-                     v_vals = list(out.link_series(lid, LinkAttribute.FLOW_VELOCITY).values())
-                     if v_vals:
-                         velocities.append(max(v_vals))
-                     
-                     # Capacity data (d/D)
-                     c_vals = list(out.link_series(lid, LinkAttribute.CAPACITY).values())
-                     if c_vals:
-                         capacities.append(max(c_vals))
-                         
-                metrics.conduit_velocities = np.array(velocities)
-                metrics.conduit_capacities = np.array(capacities)
-                
-                if velocities:
-                    metrics.avg_conduit_velocity = np.mean(velocities)
-                    
-                # 4. Extract Hydrographs for Target Links
-                if target_links:
-                     for lid in target_links:
-                         try:
-                             # Get Flow and Velocity
-                             link_flow = list(out.link_series(lid, LinkAttribute.FLOW_RATE).values())
-                             link_depth = list(out.link_series(lid, LinkAttribute.FLOW_DEPTH).values())
-                             times = list(out.link_series(lid, LinkAttribute.FLOW_RATE).keys())
-                             
-                             metrics.link_hydrographs[lid] = {
-                                 'times': times,
-                                 'flow': link_flow,
-                                 'depth': link_depth
-                             }
-                             
-                             # Capacity (Fraction Full or similar)
-                             cap_series = list(out.link_series(lid, LinkAttribute.CAPACITY).values())
-                             metrics.link_capacities[lid] = {
-                                 'times': times,
-                                 'capacity': cap_series
-                             }
-                         except Exception as e:
-                             print(f"[MetricExtractor] Warning: Could not extract hydrograph for link {lid}: {e}")
-
-                # 5. EXTRACT TANK UTILIZATION (New Logic)
-                # Look for all nodes starting with TK_
-                for nid in out.nodes:
-                    if nid.startswith("TK_"):
-                        try:
-                            # Get full depth series for tank
-                            depth_series_raw = out.node_series(nid, NodeAttribute.INVERT_DEPTH)
-                            times = list(depth_series_raw.keys())
-                            depths = list(depth_series_raw.values())
-                            max_depth = max(depths) if depths else 0.0
-                            
-                            metrics.tank_utilization[nid] = {
-                                'max_depth': max_depth,
-                                'max_volume': 0.0,
-                                'depth_series': depths,
-                                'times': times
-                            }
-                        except Exception as e:
-                            print(f"[MetricExtractor] Warning: Error processing tank {nid}: {e}")
+                        print(f"[MetricExtractor] Warning: Error processing tank {nid}: {e}")
 
 
-                return metrics
-        except Exception as e:
-            print(f"[MetricExtractor] Extraction Error: {e}")
-            import traceback
-            traceback.print_exc()
-            
+            return metrics
+        # (End of with Output block)
         return metrics
 
 class ScenarioComparator:

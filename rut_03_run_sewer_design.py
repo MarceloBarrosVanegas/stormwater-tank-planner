@@ -59,7 +59,7 @@ import matplotlib.ticker as ticker
 import networkx as nx
 import numpy as np
 import pandas as pd
-import ollama
+#import ollama
 import rasterio
 import scipy.optimize as opt
 import shapefile

@@ -26,7 +26,7 @@ import shutil
 import os
 from pathlib import Path
 from typing import Dict, Optional
-
+import rasterio
 # ============================================================================
 # PATHS
 # ============================================================================
@@ -97,13 +97,18 @@ def run_itzi_for_case(
     """
     vars_to_export = vars_to_export or ['depth', 'v']
     
-    # If custom SWMM file provided, copy it to the expected location
+    # Determine which SWMM file to use for simulation
+    # IMPORTANT: Never overwrite the original project SWMM file!
     if swmm_file and Path(swmm_file).exists():
-        swmm_file = Path(swmm_file)
-        if swmm_file != DEFAULT_SWMM_FILE:
-            if verbose:
-                print(f"  Copying SWMM file to: {DEFAULT_SWMM_FILE}")
-            shutil.copy2(swmm_file, DEFAULT_SWMM_FILE)
+        # Use the custom SWMM file directly (it's already in the case directory)
+        swmm_to_use = Path(swmm_file)
+        if verbose:
+            print(f"  Using custom SWMM file: {swmm_to_use}")
+    else:
+        # Use the default project file (baseline simulation)
+        swmm_to_use = DEFAULT_SWMM_FILE
+        if verbose:
+            print(f"  Using default SWMM file: {swmm_to_use}")
     
     if verbose:
         print("="*60)
@@ -112,9 +117,11 @@ def run_itzi_for_case(
         print(f"  GRASS: {GRASS_BAT}")
         print(f"  Script: {RUN_ITZI_SCRIPT}")
     
-    # Build command
+    # Build command with custom SWMM file path
     vars_str = ','.join(vars_to_export)
-    cmd = [GRASS_BAT, "--exec", "python", str(RUN_ITZI_SCRIPT), "--vars", vars_str]
+    cmd = [GRASS_BAT, "--exec", "python", str(RUN_ITZI_SCRIPT), 
+           "--vars", vars_str, 
+           "--swmm", str(swmm_to_use)]
     
     if verbose:
         print(f"  Command: {' '.join(cmd)}")
@@ -139,10 +146,16 @@ def run_itzi_for_case(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        for fname in ['max_water_depth.tif', 'max_velocity.tif', 'itzi_statistics.csv', 'itzi_config.ini']:
+        # Copy result files from default output
+        for fname in ['max_water_depth.tif', 'max_velocity.tif', 'itzi_statistics.csv']:
             src = DEFAULT_OUTPUT_DIR / fname
             if src.exists():
                 shutil.copy2(src, output_dir / fname)
+        
+        # Copy itzi_config.ini from codigos/ (where run_itzi.py creates it)
+        config_src = CODIGOS_DIR / 'itzi_config.ini'
+        if config_src.exists():
+            shutil.copy2(config_src, output_dir / 'itzi_config.ini')
         
         output['output_dir'] = str(output_dir)
         output['max_depth_file'] = str(output_dir / 'max_water_depth.tif')
@@ -152,7 +165,7 @@ def run_itzi_for_case(
     depth_file = Path(output['max_depth_file'])
     if depth_file.exists():
         try:
-            import rasterio
+
             with rasterio.open(depth_file) as src:
                 data = src.read(1)
                 output['max_depth_m'] = float(data.max())
@@ -182,8 +195,20 @@ if __name__ == "__main__":
     print("ITZI RUNNER MODULE TEST")
     print("="*60)
     
-    # Example: run with defaults
-    result = run_itzi_for_case(verbose=True)
+    # Carpeta de salida para flood damage
+    output_dir = r'C:\Users\Alienware\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\test_avoided_cost\avoided_cost\flood_damage'
+    
+    # INP file desde config
+    swmm_file = config.SWMM_FILE
+    print(f"  SWMM file: {swmm_file}")
+    
+    # Run ITZI with specified SWMM and copy results to flood_damage folder
+    result = run_itzi_for_case(
+        swmm_file=swmm_file,
+        output_dir=output_dir,
+        vars_to_export=['depth', 'v'],
+        verbose=True
+    )
     
     print("\n" + "="*60)
     print("RESULTS")
@@ -191,8 +216,11 @@ if __name__ == "__main__":
     for key, value in result.items():
         print(f"  {key}: {value}")
     
-    # Example for optimization loop:
-    # result = run_itzi_for_case(
-    #     swmm_file="cases/case_001/modified_swmm.inp",
-    #     output_dir="cases/case_001/itzi_results"
-    # )
+    # Verificar que los rasters estén en flood_damage
+    from pathlib import Path
+    print("\n" + "="*60)
+    print("FILES IN OUTPUT DIR")
+    print("="*60)
+    for f in Path(output_dir).glob('*'):
+        print(f"  {f.name}")
+
