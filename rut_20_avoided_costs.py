@@ -1564,39 +1564,48 @@ class AvoidedCostRunner:
             scenario_res = {'tr': tr, 'inp': inp_path.name}
             
             # --- A. Pipe Investment Cost ---
-            try:
-                print(f"\n> Metric A: Deferred Investment (Pipes)")
-                cost_pipes = investment_eval.run(
-                    inp_path=str(inp_path),
-                    output_dir=str(out_folder)
-                )
-                scenario_res['investment_cost_usd'] = cost_pipes
-            except Exception as e:
-                print(f"[Error] Pipe Cost TR {tr}: {e}")
+            if config.COST_COMPONENTS.get('deferred_investment', True):
+                try:
+                    print(f"\n> Metric A: Deferred Investment (Pipes)")
+                    cost_pipes = investment_eval.run(
+                        inp_path=str(inp_path),
+                        output_dir=str(out_folder)
+                    )
+                    scenario_res['investment_cost_usd'] = cost_pipes
+                except Exception as e:
+                    print(f"[Error] Pipe Cost TR {tr}: {e}")
+                    scenario_res['investment_cost_usd'] = 0.0
+                    import traceback
+                    traceback.print_exc()
+                    sys.exit()
+            else:
+                print(f"\n> Metric A: Deferred Investment - SKIPPED (config)")
                 scenario_res['investment_cost_usd'] = 0.0
-                import traceback
-                traceback.print_exc()
-                sys.exit()
 
             # --- B. Flood Damage Cost ---
-            try:
-                print(f"\n> Metric B: Flood Damage (ITZI+CLIMADA)")
-                f_res = flood_eval.run(
-                    inp_path=str(inp_path),
-                    output_dir=str(out_folder)
-                )
-                scenario_res['flood_damage_usd'] = f_res['total_damage_usd']
-                scenario_res['damage_gpkg'] = f_res.get('output_gpkg')
-                
-                # Generate Visualizations
-                print(f"  > Generating visualizations for TR {tr}...")
-                flood_eval.generate_visualizations(output_dir=str(out_folder))
+            if config.COST_COMPONENTS.get('flood_damage', True):
+                try:
+                    print(f"\n> Metric B: Flood Damage (ITZI+CLIMADA)")
+                    f_res = flood_eval.run(
+                        inp_path=str(inp_path),
+                        output_dir=str(out_folder)
+                    )
+                    scenario_res['flood_damage_usd'] = f_res['total_damage_usd']
+                    scenario_res['damage_gpkg'] = f_res.get('output_gpkg')
+                    
+                    # Generate Visualizations
+                    print(f"  > Generating visualizations for TR {tr}...")
+                    flood_eval.generate_visualizations(output_dir=str(out_folder))
 
-            except Exception as e:
-                print(f"[Error] Flood Damage TR {tr}: {e}")
+                except Exception as e:
+                    print(f"[Error] Flood Damage TR {tr}: {e}")
+                    scenario_res['flood_damage_usd'] = 0.0
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"\n> Metric B: Flood Damage - SKIPPED (config)")
                 scenario_res['flood_damage_usd'] = 0.0
-                import traceback
-                traceback.print_exc()
+                scenario_res['damage_gpkg'] = None
             
             # Total
             scenario_res['total_impact_usd'] = scenario_res['investment_cost_usd'] + scenario_res['flood_damage_usd']

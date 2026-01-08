@@ -1280,39 +1280,43 @@ class DynamicSolutionEvaluator:
              except Exception as e:
                  print(f"  [Warning] Failed to generate report: {e}")
         
-        # --- RUN ITZI FLOOD MODEL ---
-        print(f"\n  [Itzi] Running 2D surface flood simulation...")
-        itzi_dir = case_dir / "02_itzi_2d"
-        itzi_dir.mkdir(parents=True, exist_ok=True)
-        
-        itzi_result = run_itzi_for_case(
-            swmm_file=str(final_inp_path),
-            output_dir=str(itzi_dir),
-            verbose=False
-        )
-        if itzi_result.get('success'):
-            print(f"  [Itzi] ✓ 2D simulation complete (Max Depth: {itzi_result.get('max_depth_m', 0):.2f}m)")
+        # --- RUN ITZI FLOOD MODEL (if flood_damage enabled) ---
+        itzi_result = {}
+        if config.COST_COMPONENTS.get('flood_damage', False):
+            print(f"\n  [Itzi] Running 2D surface flood simulation...")
+            itzi_dir = case_dir / "02_itzi_2d"
+            itzi_dir.mkdir(parents=True, exist_ok=True)
             
-            # Run CLIMADA on depth raster
-            if 'max_depth_file' in itzi_result and itzi_result['max_depth_file']:
-                 damage_dir = case_dir / "03_flood_damage"
-                 damage_dir.mkdir(parents=True, exist_ok=True)
-                 
-                 # Use CLIMADA flood damage calculation
-                 climada_res = calculate_flood_damage_climada(
-                     depth_raster_path=itzi_result['max_depth_file'],
-                     output_gpkg=damage_dir / "flood_damage_results.gpkg",
-                     output_txt=damage_dir / "flood_damage_report.txt"
-                 )
-                 itzi_result['climada_result'] = climada_res
-                 print(f"  [CLIMADA] Total Damage: ${climada_res.get('total_damage_usd', 0):,.2f}")
+            itzi_result = run_itzi_for_case(
+                swmm_file=str(final_inp_path),
+                output_dir=str(itzi_dir),
+                verbose=False
+            )
+            if itzi_result.get('success'):
+                print(f"  [Itzi] ✓ 2D simulation complete (Max Depth: {itzi_result.get('max_depth_m', 0):.2f}m)")
+                
+                # Run CLIMADA on depth raster
+                if 'max_depth_file' in itzi_result and itzi_result['max_depth_file']:
+                     damage_dir = case_dir / "03_flood_damage"
+                     damage_dir.mkdir(parents=True, exist_ok=True)
+                     
+                     # Use CLIMADA flood damage calculation
+                     climada_res = calculate_flood_damage_climada(
+                         depth_raster_path=itzi_result['max_depth_file'],
+                         output_gpkg=damage_dir / "flood_damage_results.gpkg",
+                         output_txt=damage_dir / "flood_damage_report.txt"
+                     )
+                     itzi_result['climada_result'] = climada_res
+                     print(f"  [CLIMADA] Total Damage: ${climada_res.get('total_damage_usd', 0):,.2f}")
+            else:
+                raise RuntimeError(f"ITZI simulation failed: {itzi_result}")
         else:
-            raise RuntimeError(f"ITZI simulation failed: {itzi_result}")
+            print(f"\n  [Itzi] SKIPPED (flood_damage=False in config)")
 
         # --- CALCULATE ECONOMIC IMPACT ---
         print("\n  [Economics] Calculating Economic Impact...")
         
-        # Use CLIMADA results from itzi_result
+        # Use CLIMADA results from itzi_result (if available)
         if itzi_result and 'climada_result' in itzi_result and itzi_result['climada_result']:
             climada_res = itzi_result['climada_result']
             flood_damage = climada_res.get('total_damage_usd', 0.0)
@@ -1335,22 +1339,28 @@ class DynamicSolutionEvaluator:
             }
             print(f"  [Economics] ITZI/CLIMADA Flood Damage: ${flood_damage:,.2f}")
         else:
-            # ITZI ran but no CLIMADA result - raise error (NO FALLBACKS)
-            raise RuntimeError(
-                f"ITZI ran but no CLIMADA result available. "
-                f"ITZI result: {itzi_result}. Check ITZI/CLIMADA configuration."
-            )
+            # No CLIMADA result - use volume-based approximation or zero
+            self.last_flood_damage_usd = 0.0
+            economic_res = {
+                'net_impact_usd': 0.0,
+                'flood_damage_usd': 0.0,
+                'details': {}
+            }
+            print(f"  [Economics] Flood Damage: $0.00 (ITZI/CLIMADA disabled)")
         
-        # --- GENERATE AVOIDED COST BUDGET ---
-        from rut_20_avoided_costs import DeferredInvestmentCost
-        deferred_calc = DeferredInvestmentCost(
-            base_precios_path=str(config.CODIGOS_DIR / "base_precios.xlsx"),
-            capacity_threshold=0.9
-        )
-        deferred_calc.run(
-            inp_path=str(final_inp_path),
-            output_dir=str(case_dir)
-        )
+        # --- GENERATE AVOIDED COST BUDGET (if deferred_investment enabled) ---
+        if config.COST_COMPONENTS.get('deferred_investment', False):
+            from rut_20_avoided_costs import DeferredInvestmentCost
+            deferred_calc = DeferredInvestmentCost(
+                base_precios_path=str(config.CODIGOS_DIR / "base_precios.xlsx"),
+                capacity_threshold=0.9
+            )
+            deferred_calc.run(
+                inp_path=str(final_inp_path),
+                output_dir=str(case_dir)
+            )
+        else:
+            print(f"  [Economics] Deferred Investment: SKIPPED (disabled in config)")
         
         # Net Impact (The "Badness" we want to minimize)
         # Typically = Residual Damage - Benefits

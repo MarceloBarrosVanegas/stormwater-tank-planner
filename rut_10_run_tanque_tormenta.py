@@ -209,7 +209,8 @@ class StormwaterOptimizationRunner:
                         'PredioZ': predio.z,
                         'Desnivel': gap,
                         'Distance': dist,
-                        'FloodingFlow': node.FloodingFlow
+                        'FloodingFlow': node.FloodingFlow,
+                        'PredioArea': predio.geometry.area  # For capacity constraint
                     })
         
         n_valid = len(valid_pairs)
@@ -323,39 +324,43 @@ class StormwaterOptimizationRunner:
                                          min_tank_vol: float = 1000.0, max_tank_vol: float = 10000.0, 
                                          tank_depth: float = 5.0,
                                          stop_at_breakeven: bool = False, 
-                                         breakeven_multiplier: float = 1.0,  # Allow investment up to X times avoided damage
+                                         breakeven_multiplier: float = 1.0,
+                                         optimizer_mode: str = 'greedy',  # 'greedy' or 'nsga'
+                                         optimization_tr_list: list = None,  # For NSGA: [25] or [1,2,5,10,25]
+                                         validation_tr_list: list = None,    # For NSGA final validation
+                                         n_generations: int = 50,            # NSGA generations
+                                         pop_size: int = 30,                 # NSGA population
                                          swmm_file: Path = None, elev_file: Path = None):
         """
         Step 3: Sequential Tank Analysis
         ---------------------------------
-        Runs an iterative greedy analysis that:
-        1. Adds tanks one by one based on flooding priority
-        2. Runs SWMM simulation after each addition
-        3. Re-evaluates and re-ranks candidates based on residual flooding
-        4. Prunes tanks that become irrelevant (flooding < min_tank_vol)
-        5. Recalculates tank volumes dynamically
+        Runs optimization analysis using either:
+        - 'greedy': Iterative greedy algorithm (fast, local optimum)
+        - 'nsga': NSGA-II multi-objective optimization (slower, global optimum)
         
-        Stopping Conditions (any one stops the loop):
+        NSGA-II Parameters:
+        - optimization_tr_list: [25] for deterministic, [1,2,5,10,25] for probabilistic
+        - validation_tr_list: Optional different TRs for final solution validation
+        - n_generations: Number of NSGA-II generations
+        - pop_size: Population size per generation
+        
+        Stopping Conditions (Greedy mode):
         - max_tanks: Maximum number of active tanks
         - max_iterations: Maximum number of attempts/iterations
         - stop_at_breakeven: When construction cost >= flooding savings
-        
-        Parameters:
-        - max_tanks: Maximum number of tanks to add
-        - max_iterations: Maximum number of iterations (attempts)
-        - min_tank_vol: Minimum tank volume (m³) - tanks below this are pruned
-        - max_tank_vol: Maximum tank volume (m³)
-        - tank_depth: Tank depth (m)
-        - stop_at_breakeven: If True, stop when construction cost >= flooding savings
-        - flooding_cost_per_m3: Cost per m³ of flooding damage ($/m³)
         """
         print(f"\n{'='*60}")
         print(f"STEP 3: SEQUENTIAL TANK ANALYSIS")
         print(f"{'='*60}")
-        print(f"  Max Tanks: {max_tanks} | Max Iterations: {max_iterations}")
-        print(f"  Volume Range: {min_tank_vol} - {max_tank_vol} m³")
-        if stop_at_breakeven:
-            print(f"  Stopping Criterion: ECONOMIC BREAKEVEN")
+        print(f"  Optimizer Mode: {optimizer_mode.upper()}")
+        print(f"  Max Tanks: {max_tanks} | Volume Range: {min_tank_vol} - {max_tank_vol} m³")
+        if optimizer_mode == 'nsga':
+            optimization_tr_list = optimization_tr_list or [25]
+            mode_type = 'probabilistic' if len(optimization_tr_list) > 1 else 'deterministic'
+            print(f"  NSGA Mode: {mode_type} | TRs: {optimization_tr_list}")
+            print(f"  Generations: {n_generations} | Population: {pop_size}")
+        elif stop_at_breakeven:
+            print(f"  Stopping Criterion: ECONOMIC BREAKEVEN (multiplier={breakeven_multiplier})")
 
         
         # 1. Setup Environment
@@ -379,62 +384,134 @@ class StormwaterOptimizationRunner:
             print("  [Error] No valid candidates. Run step_1 first.")
             return
         
+        print(f"\n  [Analysis] Candidates: {len(self.valid_pairs)} nodes with valid predios")
 
-        
-        print(f"\n  [Analysis] Running Iterative Sequential Analysis...")
-        print(f"  Candidates: {len(self.valid_pairs)} nodes with valid predios")
-        
-        greedy_opt = GreedyTankOptimizer(
-            nodes_gdf=self.nodes_gdf,
-            predios_gdf=self.predios_gdf,
-            dynamic_evaluator=self.evaluator,
-            max_tanks=max_tanks,
-            max_iterations=max_iterations,
-            min_tank_volume=min_tank_vol,
-            max_tank_volume=max_tank_vol,
-            tank_depth=tank_depth,
-            stop_at_breakeven=stop_at_breakeven,
-            breakeven_multiplier=breakeven_multiplier,
-            # flooding_cost_per_m3=flooding_cost_per_m3
-        )
+        # 3. Run optimization based on mode
+        if optimizer_mode == 'nsga':
+            # NSGA-II Multi-Objective Optimization
+            self._run_nsga_optimization(
+                max_tanks=max_tanks,
+                min_tank_vol=min_tank_vol,
+                max_tank_vol=max_tank_vol,
+                optimization_tr_list=optimization_tr_list,
+                validation_tr_list=validation_tr_list,
+                n_generations=n_generations,
+                pop_size=pop_size
+            )
+        else:
+            # Greedy Sequential Optimization (default)
+            greedy_opt = GreedyTankOptimizer(
+                nodes_gdf=self.nodes_gdf,
+                predios_gdf=self.predios_gdf,
+                dynamic_evaluator=self.evaluator,
+                max_tanks=max_tanks,
+                max_iterations=max_iterations,
+                min_tank_volume=min_tank_vol,
+                max_tank_volume=max_tank_vol,
+                tank_depth=tank_depth,
+                stop_at_breakeven=stop_at_breakeven,
+                breakeven_multiplier=breakeven_multiplier,
+            )
 
-
-        
-        try:
-            df_seq = greedy_opt.run_sequential(self.valid_pairs)
-            
-            print(f"\n{'='*60}")
-            print("SEQUENTIAL ANALYSIS RESULTS:")
-            print(f"{'='*60}")
-            print(df_seq.to_string(index=False))
-            
-            # Save results
-            csv_path = self.work_dir / "sequential_results.csv"
-            df_seq.to_csv(csv_path, index=False)
-            print(f"\n  Saved: {csv_path}")
-            
-            # Plot Curve
-            curve_path = self.work_dir / "sequential_curve.png"
-            greedy_opt.plot_sequence_curve(df_seq, save_path=str(curve_path))
-            
-            # Generate Damage Curves (rut_20) - ITZI is always used
-            print(f"\n  Generating flood damage curves...")
             try:
-                from rut_20_plot_damage_curves import plot_all_curves_combined, plot_individual_curves, save_curves_as_csv
-                curves_dir = self.work_dir / "damage_curves"
-                curves_dir.mkdir(parents=True, exist_ok=True)
-                plot_all_curves_combined(output_dir=curves_dir)
-                plot_individual_curves(output_dir=curves_dir)
-                save_curves_as_csv(output_dir=curves_dir)
-                print(f"  Damage curves saved to: {curves_dir}")
+                df_seq = greedy_opt.run_sequential(self.valid_pairs)
+                
+                print(f"\n{'='*60}")
+                print("SEQUENTIAL ANALYSIS RESULTS:")
+                print(f"{'='*60}")
+                print(df_seq.to_string(index=False))
+                
+                # Save results
+                csv_path = self.work_dir / "sequential_results.csv"
+                df_seq.to_csv(csv_path, index=False)
+                print(f"\n  Saved: {csv_path}")
+                
+                # Plot Curve
+                curve_path = self.work_dir / "sequential_curve.png"
+                greedy_opt.plot_sequence_curve(df_seq, save_path=str(curve_path))
+                
+                # Generate Damage Curves (rut_20) - ITZI is always used
+                print(f"\n  Generating flood damage curves...")
+                try:
+                    from rut_20_plot_damage_curves import plot_all_curves_combined, plot_individual_curves, save_curves_as_csv
+                    curves_dir = self.work_dir / "damage_curves"
+                    curves_dir.mkdir(parents=True, exist_ok=True)
+                    plot_all_curves_combined(output_dir=curves_dir)
+                    plot_individual_curves(output_dir=curves_dir)
+                    save_curves_as_csv(output_dir=curves_dir)
+                    print(f"  Damage curves saved to: {curves_dir}")
+                except Exception as e:
+                    print(f"  Warning: Could not generate damage curves: {e}")
+                
             except Exception as e:
-                print(f"  Warning: Could not generate damage curves: {e}")
-            
-        except Exception as e:
-            print(f"  [Error] Sequential analysis failed: {e}")
-            import traceback
-            traceback.print_exc()
+                print(f"  [Error] Sequential analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
         
+
+    def _run_nsga_optimization(self, max_tanks: int, min_tank_vol: float, max_tank_vol: float,
+                                optimization_tr_list: list, validation_tr_list: list,
+                                n_generations: int, pop_size: int):
+        """Run NSGA-II multi-objective optimization."""
+        from rut_23_nsga_optimizer import NSGATankOptimizer
+        import config
+        
+        print(f"\n  [NSGA-II] Initializing multi-objective optimizer...")
+        
+        # Convert valid_pairs to DataFrame if needed
+        import pandas as pd
+        if isinstance(self.valid_pairs, list):
+            # Convert list of dicts to DataFrame
+            valid_pairs_df = pd.DataFrame(self.valid_pairs)
+        else:
+            valid_pairs_df = self.valid_pairs
+        
+        # Filter to top N candidates based on ranking score (from Step 1)
+        top_n_candidates = 50  # Use top 50 ranked candidates
+        if len(valid_pairs_df) > top_n_candidates:
+            # Sort by score (descending) and take top N
+            if 'score' in valid_pairs_df.columns:
+                valid_pairs_df = valid_pairs_df.nlargest(top_n_candidates, 'score')
+                print(f"  [NSGA-II] Filtered to TOP {top_n_candidates} candidates (by ranking score)")
+            else:
+                valid_pairs_df = valid_pairs_df.head(top_n_candidates)
+                print(f"  [NSGA-II] Filtered to first {top_n_candidates} candidates")
+        
+        # Create NSGA optimizer
+        nsga_opt = NSGATankOptimizer(
+            evaluator=self.evaluator,
+            valid_pairs=valid_pairs_df,
+            max_tanks=max_tanks,
+            min_tank_vol=min_tank_vol,
+            max_tank_vol=max_tank_vol,
+            cost_components=config.COST_COMPONENTS
+        )
+        
+        # Run optimization
+        result = nsga_opt.run(
+            optimization_tr_list=optimization_tr_list,
+            validation_tr_list=validation_tr_list,
+            n_generations=n_generations,
+            pop_size=pop_size,
+            output_dir=self.work_dir / "nsga_results"
+        )
+        
+        # Print summary
+        print(f"\n{'='*60}")
+        print("NSGA-II OPTIMIZATION RESULTS:")
+        print(f"{'='*60}")
+        print(f"  Total Pareto Solutions: {len(result.solutions)}")
+        print(f"  Mode: {result.mode.upper()}")
+        print(f"\n  BEST B/C SOLUTION:")
+        best = result.best_bc_solution
+        print(f"    Tanks: {best.n_tanks}")
+        print(f"    Construction Cost: ${best.construction_cost:,.2f}")
+        print(f"    Damage Cost: ${best.damage_cost:,.2f}")
+        print(f"    B/C Ratio: {best.bc_ratio:.2f}")
+        print(f"    Tank Locations: {best.tank_indices}")
+        
+        return result
+
 
     def setup_optimization(self, use_dynamic: bool = True,
                            swmm_file: Path = None,
@@ -538,10 +615,11 @@ if __name__ == "__main__":
     
     # Step 1: Check Elevation Constraints
     candidates = runner.step_1_check_elevation_constraints()
-        
+
+
     # Step 3: Run Sequential Tank Analysis
     runner.step_3_run_sequential_analysis(
-        max_tanks=50,              # Max active tanks (stopping condition 1)
+        max_tanks=10,              # Max active tanks (stopping condition 1)
         max_iterations=100,        # Max iterations (stopping condition 2)
         min_tank_vol=5000.0,       # Minimum tank size (m³)
         max_tank_vol=1000000.0,    # Very high - predio area will limit actual size
@@ -549,7 +627,13 @@ if __name__ == "__main__":
         stop_at_breakeven=True,    # Stop when cost >= threshold (condition 3)
         breakeven_multiplier=1000,  # Allow investment up to 1.5x avoided damage
         swmm_file=swmm_file,
-        elev_file=elev_file
+        elev_file=elev_file,
+
+        optimizer_mode = 'nsga',  # 'greedy' or 'nsga'
+        optimization_tr_list = [25],  # For NSGA: [25] or [1,2,5,10,25]
+        validation_tr_list= [1,2,5,10,25, 50 , 100],  # For NSGA final validation
+        n_generations = 100,  # NSGA generations
+        pop_size = 30,  # NSGA population
     )
 
 

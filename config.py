@@ -139,6 +139,13 @@ PLOT_TIME_LIMIT_HOURS = 3.5           # Limit X-axis on time plots
 # =============================================================================
 FLOODING_COST_PER_M3 = 1250.0  # Cost per cubic meter of flooding
 
+# Modular cost components for optimization
+COST_COMPONENTS = {
+    'deferred_investment': True,   # Pipe replacement cost (DeferredInvestmentCost)
+    'flood_damage': False,          # Building damage from CLIMADA
+    'river_damage': False,         # Future: downstream environmental impact
+}
+
 # =============================================================================
 # TANK DESIGN PARAMETERS
 # =============================================================================
