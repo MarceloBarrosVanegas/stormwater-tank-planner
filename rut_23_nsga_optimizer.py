@@ -21,21 +21,18 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 
-# pymoo imports
-try:
-    from pymoo.core.problem import Problem
-    from pymoo.algorithms.moo.nsga2 import NSGA2
-    from pymoo.operators.crossover.sbx import SBX
-    from pymoo.operators.mutation.pm import PM
-    from pymoo.operators.sampling.rnd import BinaryRandomSampling
-    from pymoo.operators.crossover.pntx import TwoPointCrossover
-    from pymoo.operators.mutation.bitflip import BitflipMutation
-    from pymoo.optimize import minimize
-    from pymoo.termination import get_termination
-    PYMOO_AVAILABLE = True
-except ImportError:
-    PYMOO_AVAILABLE = False
-    print("Warning: pymoo not installed. Run: pip install pymoo")
+
+from pymoo.core.problem import Problem
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.operators.crossover.sbx import SBX
+from pymoo.operators.mutation.pm import PM
+from pymoo.operators.sampling.rnd import BinaryRandomSampling
+from pymoo.operators.crossover.pntx import TwoPointCrossover
+from pymoo.operators.mutation.bitflip import BitflipMutation
+from pymoo.optimize import minimize
+from pymoo.termination import get_termination
+
+
 
 import config
 config.setup_sys_path()
@@ -142,16 +139,12 @@ class TankOptimizationProblem(Problem):
                 # FloodingVolume = actual flood volume at node
                 # Apply safety factor of 1.2 to account for uncertainty
                 flooding_vol = row.get('FloodingVolume', 0)
-                if flooding_vol > 0:
-                    # Tank should capture flooding volume + safety factor
-                    volume = flooding_vol * config.TANK_VOLUME_SAFETY_FACTOR
-                else:
-                    # Fallback: estimate from FloodingFlow * storm duration (2 hours)
-                    flooding_flow = row.get('FloodingFlow', 0)
-                    volume = flooding_flow * 2.0 * 3600  # m³/s * 2hr * 3600s
+                # Tank should capture flooding volume + safety factor
+                volume = flooding_vol * config.TANK_VOLUME_SAFETY_FACTOR
+
                 
                 # Clamp to config limits
-                import config
+
                 volume = max(config.TANK_MIN_VOLUME_M3, min(volume, config.TANK_MAX_VOLUME_M3))
                 
                 # Only assign if valid node_idx
@@ -346,8 +339,7 @@ class NSGATankOptimizer:
             max_tank_vol: Maximum tank volume (m³)
             cost_components: Dict controlling which costs to calculate
         """
-        if not PYMOO_AVAILABLE:
-            raise ImportError("pymoo not installed. Run: pip install pymoo")
+
         
         self.evaluator = evaluator
         self.valid_pairs = valid_pairs
@@ -423,7 +415,7 @@ class NSGATankOptimizer:
         # Run optimization
         import time
         random_seed = int(time.time()) % 100000  # Random seed based on current time
-        random_seed = 42
+        # random_seed = 42
         print(f"\n  Starting NSGA-II optimization (seed={random_seed})...")
         result = minimize(
             problem,
@@ -561,19 +553,3 @@ class NSGATankOptimizer:
         print("  [TODO] Full probabilistic validation not yet implemented")
 
 
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
-
-if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("  NSGA-II Tank Optimizer - Test Run")
-    print("="*60)
-    
-    if not PYMOO_AVAILABLE:
-        print("\nError: pymoo not installed. Run:")
-        print("  pip install pymoo")
-        exit(1)
-    
-    print("\nThis module should be called from rut_10_run_tanque_tormenta.py")
-    print("or used interactively after setting up the evaluator.")

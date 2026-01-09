@@ -119,7 +119,7 @@ class PathFinder:
             print(f"Loading OSM data from cache: {cache_path}...")
             try:
                 self.graph = ox.load_graphml(cache_path)
-                print("OSM graph loaded from cache successfully.")
+                # print("OSM graph loaded from cache successfully.")
                 return
             except Exception as e:
                 print(f"Error loading cache: {e}. Proceeding to download.")
@@ -164,9 +164,9 @@ class PathFinder:
                    Returns (None, None) if the graph is not available.
         """
         if self.graph:
-            print("Converting graph to GeoDataFrames...")
+            # print("Converting graph to GeoDataFrames...")
             nodes, edges = ox.graph_to_gdfs(self.graph)
-            print("GeoDataFrames created successfully.")
+            # print("GeoDataFrames created successfully.")
             return nodes, edges
         else:
             print("No graph data available to convert.")

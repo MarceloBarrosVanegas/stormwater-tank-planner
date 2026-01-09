@@ -34,7 +34,7 @@ config.setup_sys_path()
 from rut_00_path_finder import PathFinder
 from rut_02_elevation import ElevationGetter, ElevationSource
 from rut_03_run_sewer_design import SewerPipeline
-from rut_06_pipe_sizing import SeccionLlena
+from rut_06_pipe_sizing import SeccionLlena, SeccionParcialmenteLlena
 from rut_13_cost_functions import CostCalculator
 from rut_14_swmm_modifier import SWMMModifier
 from rut_17_comparison_reporter import MetricExtractor, ScenarioComparator, SystemMetrics
@@ -123,14 +123,14 @@ class DynamicSolutionEvaluator:
 
         # Use persistent cache for OSM data
         osm_cache_path = config.OSM_CACHE_PATH
-        print(f"  [Init] Using OSM Cache Path: {osm_cache_path}")
+        # print(f"  [Init] Using OSM Cache Path: {osm_cache_path}")
         self.shared_path_finder.download_osm_data(cache_path=str(osm_cache_path))
         
         if self.shared_path_finder.graph:
             nodes_osm, _ = self.shared_path_finder.get_graph_geodataframes()
             if nodes_osm is not None:
                 # Pre-calculate elevations ONCE
-                print("  Mapping Elevations to OSM Graph...")
+                print("Mapping Elevations to OSM Graph...")
 
                 nodes_proj = nodes_osm.to_crs(self.proj_to)
                 xy = nodes_proj.geometry.get_coordinates().to_numpy()
@@ -319,18 +319,29 @@ class DynamicSolutionEvaluator:
 
             l_val = _to_float(row.get('Length', 0.0))
             g1_val = _to_float(row.get('Geom1', 0.0))
+            g2_val = _to_float(row.get('Geom2', 0.0))
             flow_max = _to_float(row.get('MaxQ', 0.0))
+            slope = _to_float(row.get('Slope', 0.0))
+            roughness = _to_float(row.get('Roughness', 0.013))
+            shape = str(row.get('Shape', 'CIRCULAR'))
+            # Try to get pre-calculated full flow if available
+            q_capacity = _to_float(row.get('MaxFullFlow', 0.0)) 
 
             self.static_link_data[link_id] = {
-                'q_full': flow_max,
+                'max_q': flow_max,       # Simulated max flow (baseline)
                 'length': l_val,
-                'geom1': g1_val
+                'geom1': g1_val,
+                'geom2': g2_val,
+                'slope': slope,
+                'roughness': roughness,
+                'shape': shape,
+                'q_capacity': q_capacity 
             }
 
     def _run_baseline(self) -> SystemMetrics:
         """Runs the base INP file once to establish baseline metrics."""
-        # FIX: Ensure baseline uses a distinct output file to avoid overlap with solution runs
-        base_out = str(Path(self.inp_file).with_name(f"baseline_{Path(self.inp_file).stem}.out"))
+
+        base_out = str(Path(self.inp_file).with_name(f"{Path(self.inp_file).stem}_clean.out"))
 
         # Identify all potential interest links (upstream/downstream of ANY candidate)
         potential_links = []
@@ -366,11 +377,8 @@ class DynamicSolutionEvaluator:
                 print(f"Error parsing dimension '{d_val}': {e}")
                 sys.exit('-----error parsing dimension----')
                 
-        # Default safety if SeccionLlena is not loaded (should not happen based on user input)
-        try:
-             return float(d_val) * 1000.0
-        except:
-             return 200.0
+        # No fallback - if we can't parse, fail explicitly
+        raise ValueError(f"Cannot parse dimension value: {d_val}")
 
     def _get_pipe_vertical_dim(self, link_id: str) -> float:
         """
@@ -389,8 +397,8 @@ class DynamicSolutionEvaluator:
                 if pd.notna(geom1) and geom1 > 0:
                     return float(geom1)
         except Exception as e:
-            pass
-        return 0.5  # Default 0.5m if not found
+            raise RuntimeError(f"Error getting vertical dimension for link {link_id}: {e}") from e
+        raise ValueError(f"Link {link_id} not found or has no valid Geom1 dimension")
     
     def _get_node_min_pipe_depth(self, node_id: str) -> float:
         """
@@ -423,78 +431,140 @@ class DynamicSolutionEvaluator:
                             if vertical_dim < min_vertical:
                                 min_vertical = vertical_dim
             
-            if min_vertical == float('inf'):
-                return 0.35  # Default: 0.7 * 0.5m = 0.35m
             
             return 0.7 * min_vertical  # Return 0.7 * minimum vertical dimension
             
         except Exception as e:
-            print(f"  [Warning] Could not get pipe dimensions for {node_id}: {e}")
-            return 0.35  # Default
+            raise RuntimeError(f"Error getting pipe dimensions for node {node_id}: {e}") from e
     
-    def _design_weir_hydraulic(self, node_id: str, tank_volume: float, flooding_flow: float = None) -> dict:
+    def _design_weir_hydraulic(self, node_id: str, flooding_flow: float = None) -> dict:
         """
-        Design weir based on hydraulic principles.
+        Design weir based on SWMM SIDEFLOW equation: Q = Cd * L^0.83 * H^(5/3)
         
-        Crest height = min(0.7*D_inlet, 0.7*D_outlet)
-        Head above crest = Node depth - Crest height (available head)
-        Width calculated from weir equation: Q = Cd * L * H^1.5
+        Logic for Target Flow:
+            Target = Flooding Flow + (Downstream Simulated Flow - Downstream Capacity)
+            This captures both the surface flooding AND the excess flow surcharging pipes.
         
-        Parameters:
-            node_id: SWMM node ID
-            tank_volume: Design tank volume (m³)
-            flooding_flow: Known flooding flow at node (m³/s), if available
-        
-        Returns dict with: crest_height, width, design_flow, Cd, H_design
+        Crest height = config.WEIR_CREST_MIN_M (fixed)
+        H_design = Available Head (Node Depth - Crest)
         """
-        # Get minimum 0.7D from connected pipes
-        crest_height = self._get_node_min_pipe_depth(node_id)
-        crest_height = max(config.WEIR_CREST_MIN_M, min(crest_height, config.WEIR_CREST_MAX_M))
+        # 1. FIXED CREST HEIGHT
+        crest_height = config.WEIR_CREST_MIN_M
         
-        # Get node depth to calculate available head above crest
+        # 2. AVAILABLE HEAD
         node_row = self.nodes_gdf[self.nodes_gdf['NodeID'] == node_id]
-        if len(node_row) > 0:
-            node_depth = float(node_row.iloc[0].get('NodeDepth', 2.0))
-        else:
-            node_depth = 2.0  # Default
+        node_depth = float(node_row.iloc[0]['NodeDepth'])
+        H_design = node_depth - crest_height
         
-        # Available head = Node depth - Crest height (water can rise this high above crest)
-        # Use 70% of available head as design head for safety
-        available_head = node_depth - crest_height
-        H_design = max(0.15, min(available_head * 0.7, 1.0))  # Clamp 0.15m to 1.0m
         
-        # Determine design flow
-        if flooding_flow and flooding_flow > 0:
-            # Use actual flooding flow if available
-            target_flow = flooding_flow
-        else:
-            # Estimate from tank volume and storm duration
-            STORM_PEAK_DURATION_HOURS = config.ITZI_SIMULATION_DURATION_HOURS if hasattr(config, 'ITZI_SIMULATION_DURATION_HOURS') else 2.0
-            target_flow = tank_volume / (STORM_PEAK_DURATION_HOURS * 3600.0)  # m³/s
+        # 3. CALCULATE EXCESS FLOW FROM DOWNSTREAM PIPES (target: limit flow to 80% capacity)
+        excess_downstream = 0.0
+        downstream_links = self.node_topology.get(node_id, {}).get('downstream', [])
         
-        # Apply safety factor of 1.2 for peak flow
-        target_flow = target_flow * 1.2
+        # Target H/D ratio for downstream pipe capacity (e.g., 0.8)
+        TARGET_H_D = 0.7
         
-        # Weir equation: Q = Cd * L * H^1.5
-        # For SIDEFLOW weir, Cd is typically between 1.7-1.9
-        Cd = config.WEIR_DISCHARGE_COEFF
-        
-        # Calculate required weir length: L = Q / (Cd * H^1.5)
-        if H_design > 0:
-            weir_width = target_flow / (Cd * (H_design ** 1.5))
-        else:
-            weir_width = 5.0  # Default
+        for link_id in downstream_links:
+            # Use last_metrics if available (reflects previous iteration), otherwise baseline
+            if hasattr(self, 'last_metrics') and self.last_metrics and hasattr(self.last_metrics, 'link_capacity_data'):
+                link_data_dynamic = self.last_metrics.link_capacity_data.get(link_id, {})
+                max_q = link_data_dynamic.get('q_peak', 0.0)  # Use q_peak from last simulation
+            else:
+                max_q = self.static_link_data.get(link_id, {}).get('max_q', 0.0)  # Fallback to baseline
             
-        weir_width = max(1.0, min(30.0, weir_width))  # Clamp 1m to 30m
+            # Get static geometry data for Manning calculation (doesn't change between iterations)
+            link_data = self.static_link_data.get(link_id, {})
+            
+            # Calculate capacity at target H/D using Manning
+            q_cap_target = self._calculate_manning_flow(link_data, h_over_d=TARGET_H_D)
+
+            
+            # Calculate excess: Flow ABOVE the 70% capacity target
+            if q_cap_target > 0:
+                excess = max(0.0, max_q - q_cap_target)
+                excess_downstream += excess
         
+        # 4. DETERMINE TARGET FLOW
+        base_flood = (flooding_flow  + excess_downstream) * config.TANK_VOLUME_SAFETY_FACTOR
+
+        # 5. CALCULATE WEIR WIDTH
+        Cd = config.WEIR_DISCHARGE_COEFF
+
+        # SWMM SIDEFLOW: L = (Q / (Cd * H^(5/3)))^(1/0.83)
+        weir_width = (base_flood / (Cd * (H_design ** (5 / 3)))) ** (1 / 0.83)
+        weir_width = max(1, weir_width)
+
+
         return {
             'crest_height': crest_height,
-            'width': weir_width,
-            'design_flow': target_flow,
+            'width': round(weir_width, 2),
+            'target_flow': base_flood,
             'Cd': Cd,
-            'H_design': H_design,
-            'node_depth': node_depth
+            'node_depth': node_depth,
+            'available_head': H_design,
+            'flooding_flow': flooding_flow,
+            'excess_downstream': excess_downstream
         }
+        
+
+
+    def _calculate_manning_flow(self, link_data: dict, h_over_d: float = 1.0) -> float:
+        """
+        Calculate flow capacity using Manning's equation for a specific relative depth (h/D).
+        Supports CIRCULAR and RECT_CLOSED/MODBASKETHANDLE shapes.
+        Returns: Flow in m³/s.
+        """
+        geom1 = float(link_data.get('geom1', 0.0)) # Height/Diameter
+        geom2 = float(link_data.get('geom2', 0.0)) # Width (for rect)
+        slope = abs(float(link_data.get('slope', 0.001)))
+        n = float(link_data.get('roughness', 0.013))
+        shape = str(link_data.get('shape', 'CIRCULAR')).upper()
+        
+        if geom1 <= 0 or slope <= 0 or n <= 0:
+            return 0.0
+
+        # Calculate geometric properties based on shape and depth
+        depth = geom1 * h_over_d
+        
+        if shape in  ['CIRCULAR']:
+            diameter = geom1
+            if h_over_d >= 1.0:
+                # Full flow
+                area = np.pi * (diameter**2) / 4.0
+                perimeter = np.pi * diameter
+            else:
+                # Partial flow
+                # theta (radians) = 2 * arccos(1 - 2 * h/D)
+                theta = 2.0 * np.arccos(1.0 - 2.0 * h_over_d)
+                area = (diameter**2 / 8.0) * (theta - np.sin(theta))
+                perimeter = (diameter / 2.0) * theta
+                
+        elif shape in ['RECT_CLOSED', 'MODBASKETHANDLE']:
+            width = geom2 if geom2 > 0 else geom1 # Fallback to square if width missing
+            if h_over_d >= 1.0:
+                depth = geom1 # Cap at full height
+            
+            area = width * depth
+            # Wetted perimeter depends on if it's closed (full) or open (partial)
+            # If h/d >= 1, for closed rect, P = 2W + 2H. For partial, P = W + 2y.
+            # Assuming strictly partial calculation logic for capacity LIMIT:
+            # If h/d=1, it acts as full pipe.
+            if h_over_d >= 0.99:
+                 perimeter = 2.0 * (width + depth) # Closed full
+            else:
+                 perimeter = width + 2.0 * depth
+        else:
+            # Fallback for other shapes: treat as circular with geom1 as diameter
+            return self._calculate_manning_flow({**link_data, 'shape': 'CIRCULAR'}, h_over_d)
+
+        rh = area / perimeter
+        # Manning: Q = (1/n) * A * R^(2/3) * S^(1/2)
+        q = (1.0 / n) * area * (rh**(2.0/3.0)) * (slope**0.5)
+        
+        return q
+
+        
+
 
 
 
@@ -807,8 +877,7 @@ class DynamicSolutionEvaluator:
         # 3. Generate Paths (PathFinder)
         path_gdfs = self._generate_paths(active_pairs, solution_name, case_dir)
         if not path_gdfs:
-            print(f"  [Warning] PathFinder failed. Using fallback.")
-            return self._fallback_cost_estimation(active_pairs)
+            raise RuntimeError(f"PathFinder failed to generate paths for solution {solution_name}. Check path generation logs.")
             
         # 4. Save Input GPKG for rut_03
         input_gpkg = self._save_input_gpkg_for_rut03(active_pairs, path_gdfs, case_dir, solution_name)
@@ -844,20 +913,14 @@ class DynamicSolutionEvaluator:
             except SystemExit:
                 pass  # Pipeline exits via SystemExit on success
             except Exception as e:
-                print(f"    [Error] SewerPipeline crashed: {e}")
                 import traceback
                 traceback.print_exc()
-                return self._fallback_cost_estimation(active_pairs)
+                raise RuntimeError(f"SewerPipeline crashed: {e}") from e
                 
         except Exception as e:
-            print(f"  [Error] Failed to initialize SewerPipeline: {e}")
             import traceback
             traceback.print_exc()
-            return self._fallback_cost_estimation(active_pairs)
-                
-        except Exception as e:
-            print(f"  [Error] Failed to initialize SewerPipeline: {e}")
-            return self._fallback_cost_estimation(active_pairs)
+            raise RuntimeError(f"Failed to initialize SewerPipeline: {e}") from e
 
         # 6. Read Designed Output
         # rut_03 output check
@@ -870,8 +933,7 @@ class DynamicSolutionEvaluator:
                 out_gpkg = possible[0]
                 print(f"  [Info] Found output GPKG with different name: {out_gpkg.name}")
             else:
-                print(f"  [Error] No output GPKG found in {case_dir}. SewerPipeline failed silently?")
-                return self._fallback_cost_estimation(active_pairs)
+                raise RuntimeError(f"No output GPKG found in {case_dir}. SewerPipeline failed silently.")
             
         designed_gdf = gpd.read_file(out_gpkg)
         
@@ -946,47 +1008,80 @@ class DynamicSolutionEvaluator:
                             zff = float(row.ZFF) if hasattr(row, 'ZFF') else 0.0
                             ramal_end_data[r_idx] = {'last_node_idx': n_idx, 'zff': zff}
 
-        # --- ADD TANKS (Storage Units) ---
+        # --- ADD TANKS (Storage Units) - CONSOLIDATED BY PREDIO ---
+        # Group pairs by predio_id and sum volumes for each predio
+        predio_tank_data = {}  # predio_id -> {'volume': total_vol, 'z_invert': z, 'x': x, 'y': y, 'pairs': []}
+        
         for i, pair in enumerate(active_pairs):
+            pid = pair.predio_id
             
-            # Determine correct invert elevation
-            # Default to GPKG elevation (predio_z)
+            # Determine invert elevation from pipe ZFF
             z_invert = pair.predio_z
-            
-            # If we found a pipe feeding this tank, use its discharge elevation (ZFF)
-            # This ensures hydraulic continuity (Pipe Bottom -> Tank Bottom)
             if i in ramal_end_data:
-                z_pipe = ramal_end_data[i]['zff']
-                # If pipe ZFF is reasonable (not 0.0 unless intended), use it.
-                # Or just trust it. Data from rut_03 should be correct.
-                z_invert = z_pipe
-                
-            # Add storage unit
-            tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
+                z_invert = ramal_end_data[i]['zff']
+            
+            if pid not in predio_tank_data:
+                predio_tank_data[pid] = {
+                    'volume': 0.0,
+                    'z_invert': z_invert,
+                    'x': pair.predio_x,
+                    'y': pair.predio_y,
+                    'pairs': []
+                }
+            
+            # Accumulate volume
+            predio_tank_data[pid]['volume'] += pair.volume
+            predio_tank_data[pid]['pairs'].append((i, pair))
+            
+            # Use the lowest z_invert (most downstream)
+            if z_invert < predio_tank_data[pid]['z_invert']:
+                predio_tank_data[pid]['z_invert'] = z_invert
+        
+        # Create one tank per predio with combined volume
+        for pid, data in predio_tank_data.items():
+            tank_name = f"TK_PREDIO_{pid}"
+            total_vol = data['volume']
+            
             modifier.add_storage_unit(
                 name=tank_name,
-                area=pair.volume / config.TANK_DEPTH_M, 
+                area=total_vol / config.TANK_DEPTH_M, 
                 max_depth=config.TANK_DEPTH_M,
-                invert_elev=z_invert
+                invert_elev=data['z_invert']
             )
-            # Add tank coordinates
-            modifier.add_coordinate(tank_name, pair.predio_x, pair.predio_y)
+            modifier.add_coordinate(tank_name, data['x'], data['y'])
             
-            c_land = (pair.volume / config.TANK_DEPTH_M * config.TANK_OCCUPATION_FACTOR) * config.LAND_COST_PER_M2 
-            c_tank = CostCalculator.calculate_tank_cost(pair.volume)
-            pair.cost_tank = c_tank
-            pair.cost_land = c_land
+            # Calculate cost for combined tank
+            c_land = (total_vol / config.TANK_DEPTH_M * config.TANK_OCCUPATION_FACTOR) * config.LAND_COST_PER_M2 
+            c_tank = CostCalculator.calculate_tank_cost(total_vol)
+            
+            # Distribute cost back to pairs
+            for idx, pair in data['pairs']:
+                pair.cost_tank = c_tank / len(data['pairs'])
+                pair.cost_land = c_land / len(data['pairs'])
+            
             total_cost += c_tank + c_land
+            
+            if len(data['pairs']) > 1:
+                node_ids = [p.node_id for _, p in data['pairs']]
+                print(f"  [Tank] {tank_name}: Combined {len(data['pairs'])} nodes ({', '.join(node_ids)}) -> Vol: {total_vol:,.0f} m³")
             
         # --- CONNECT PIPES ---
         # Add Designed Pipes FIRST (creates junctions for i.0, i.1, etc.)
         conn_map = {}
         
-        # END Nodes (Last Node -> Tank)
+        # START Nodes (First Node -> SWMM existing node)
+        # This ensures the first node of the pipeline is mapped to the existing SWMM node
         for r_idx, data in ramal_end_data.items():
             if 0 <= r_idx < len(active_pairs):
                 pair = active_pairs[r_idx]
-                tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
+                first_node_name = f"{r_idx}.0"
+                conn_map[first_node_name] = pair.node_id  # Map to existing SWMM node
+        
+        # END Nodes (Last Node -> Tank) - Use consolidated tank name
+        for r_idx, data in ramal_end_data.items():
+            if 0 <= r_idx < len(active_pairs):
+                pair = active_pairs[r_idx]
+                tank_name = f"TK_PREDIO_{pair.predio_id}"  # Consolidated tank per predio
                 
                 # The node index identified as "last" connects TO the tank
                 last_node_name = f"{r_idx}.{data['last_node_idx']}"
@@ -1004,7 +1099,9 @@ class DynamicSolutionEvaluator:
                 continue
                 
             weir_name = f"WR_{pair.node_id}_{i}"
-            diversion_node = f"{i}.0"  # First node of the derivation pipe (was just created)
+            # Use second node of pipeline (i.1) as diversion target
+            # The first node (i.0) is mapped to pair.node_id (the existing SWMM node)
+            diversion_node = f"{i}.1"
             
             # --- HYDRAULIC WEIR DESIGN ---
             # Get tank volume (clamped)
@@ -1015,16 +1112,15 @@ class DynamicSolutionEvaluator:
             
             # Calculate weir dimensions using hydraulic equations
             weir_design = self._design_weir_hydraulic(
-                node_id=pair.node_id, 
-                tank_volume=tank_volume_m3,
+                node_id=pair.node_id,
                 flooding_flow=pair.flooding_flow
             )
             
             crest_height = weir_design['crest_height']
             weir_width = weir_design['width']
-            target_q = weir_design['design_flow']
+            target_q = weir_design['target_flow']
             Cd = weir_design['Cd']
-            H_design = weir_design.get('H_design', 0.25)
+            H_design = weir_design['available_head']
             
             print(f"  [Weir Hydraulic] {weir_name}: Crest={crest_height:.2f}m, H={H_design:.2f}m, TankVol={tank_volume_m3:.0f}m³ -> Q={target_q:.2f} cms, W={weir_width:.2f}m")
             
@@ -1164,22 +1260,17 @@ class DynamicSolutionEvaluator:
             target_nodes.extend(base_flooded)
             
         # Also include tank nodes for debug  
-        tank_names = [f"TK_{pair.node_id}_{pair.predio_id}" for pair in active_pairs]
+        tank_names = [f"TK_PREDIO_{pair.predio_id}" for pair in active_pairs]
         target_nodes.extend(tank_names)
             
         # Deduplicate
         target_nodes = list(set(target_nodes))
         
         current_metrics = self.metric_extractor.extract(str(out_file), target_links=target_links, target_nodes=target_nodes)
-        
-        # --- DEBUG: Print tank and source node data ---
-        print(f"\n  [DEBUG] Tank and Source Node Analysis:")
-        print(f"  {'Source Node':<12} {'Base Flood (m3)':<16} {'Sol Flood (m3)':<16} {'Tank Inflow':<12}")
-        print(f"  {'-'*60}")
-        
+
         for pair in active_pairs:
             nid = str(pair.node_id)
-            tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
+            tank_name = f"TK_PREDIO_{pair.predio_id}"
             
             # Baseline flooding for this node
             base_flood = self.baseline_metrics.flooding_volumes.get(nid, 0.0) if self.baseline_metrics else 0.0
@@ -1241,7 +1332,7 @@ class DynamicSolutionEvaluator:
         # --- INJECT DESIGN VOL INTO TANK UTILIZATION (BEFORE PLOTTING) ---
         # This ensures generate_tank_hydrograph_plots has access to design_vol
         for pair in active_pairs:
-            tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
+            tank_name = f"TK_PREDIO_{pair.predio_id}"
             designed_depth = config.TANK_DEPTH_M
             designed_vol = pair.volume
             
@@ -1258,6 +1349,64 @@ class DynamicSolutionEvaluator:
                         ann['stored_vol'] = used_vol
                         break
 
+        # --- BUILD TANK_DETAILS FOR DASHBOARD TABLE ---
+        tank_details = []
+        for pair in active_pairs:
+            tank_name = f"TK_PREDIO_{pair.predio_id}"
+            
+            # Get stored volume from tank utilization
+            stored_vol = 0.0
+            if tank_name in current_metrics.tank_utilization:
+                stored_vol = current_metrics.tank_utilization[tank_name].get('stored_volume', 0)
+            
+            # Get pipeline length and diameter from designed_gdf
+            pipeline_length = 0.0
+            diameter = 'N/A'
+            if designed_gdf is not None and 'Ramal' in designed_gdf.columns:
+                ramal_pipes = designed_gdf[designed_gdf['Ramal'] == str(active_pairs.index(pair))]
+                if not ramal_pipes.empty:
+                    if 'L' in ramal_pipes.columns:
+                        pipeline_length = ramal_pipes['L'].sum()
+                    else:
+                        # Calculate from geometry
+                        pipeline_length = ramal_pipes.geometry.length.sum()
+                    # Get diameter from D_int column
+                    if 'D_int' in ramal_pipes.columns:
+                        diameter = str(ramal_pipes.iloc[0]['D_int'])
+            
+            # Also try to get diameter from annotations_data
+            for ann in annotations_data:
+                if ann.get('node_id') == pair.node_id:
+                    diameter = ann.get('diameter', diameter)
+                    break
+            
+            # Get predio area (safely)
+            predio_area = 0.0
+            if hasattr(pair, 'predio_area'):
+                predio_area = pair.predio_area
+            elif self.predios_gdf is not None:
+                try:
+                    # Try using index or available ID column
+                    if pair.predio_id in self.predios_gdf.index:
+                        predio_area = self.predios_gdf.loc[pair.predio_id].geometry.area
+                    elif 'PredioID' in self.predios_gdf.columns:
+                        predio_row = self.predios_gdf[self.predios_gdf['PredioID'] == pair.predio_id]
+                        if not predio_row.empty:
+                            predio_area = predio_row.geometry.area.values[0]
+                except Exception:
+                    pass  # Keep default 0.0
+            
+            tank_details.append({
+                'NodeID': pair.node_id,
+                'FloodingFlow': pair.flooding_flow if hasattr(pair, 'flooding_flow') else 0.0,
+                'PredioArea': predio_area,
+                'PipelineLength': pipeline_length,
+                'Diameter': diameter,
+                'StoredVolume': stored_vol,
+                'TankVolume': pair.volume,
+                'PredioID': pair.predio_id
+            })
+
         # --- COMPARISON & LOGGING ---
         self.comparator.generate_comparison_plots(
             current_metrics, 
@@ -1268,7 +1417,8 @@ class DynamicSolutionEvaluator:
             derivations=derivations_geom,
             detailed_links=detailed_links,
             annotations_data=annotations_data,
-            designed_gdf=designed_gdf
+            designed_gdf=designed_gdf,
+            tank_details=tank_details
         )
 
         # Calculate Delta (Volume-Based Simple Metric for Comparison)
@@ -1284,7 +1434,7 @@ class DynamicSolutionEvaluator:
         # --- WHITE ELEPHANT PENALTY ---
         penalty_cost = 0.0
         for pair in active_pairs:
-            tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
+            tank_name = f"TK_PREDIO_{pair.predio_id}"
             deriv_id = detailed_links[str(pair.node_id)]['derivation'][0]
             total_inflow_vol_est = 0.0
             
@@ -1328,7 +1478,7 @@ class DynamicSolutionEvaluator:
             print(f"  {'Tank':<20} {'Design Vol':<12} {'Stored Vol':<12} {'Max Depth':<12} {'Util %':<8}")
             print(f"  {'-'*70}")
             for pair in active_pairs:
-                tank_name = f"TK_{pair.node_id}_{pair.predio_id}"
+                tank_name = f"TK_PREDIO_{pair.predio_id}"
                 designed_depth = config.TANK_DEPTH_M
                 designed_vol = pair.volume
                 
@@ -1506,6 +1656,9 @@ class DynamicSolutionEvaluator:
         print(f"  [Economics] Total Construction Cost: ${total_cost:,.2f}")
         bc_ratio = total_benefit / total_cost if total_cost > 0 else 0
         print(f"  [Economics] B/C Ratio:               {bc_ratio:.2f}")
+        
+        # Store economic result for optimizer to access
+        self.last_economic_result = economic_res
         
         return total_cost, current_metrics.total_flooding_volume
     

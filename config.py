@@ -159,17 +159,19 @@ COST_COMPONENTS = {
 # TANK DESIGN PARAMETERS
 # =============================================================================
 TANK_DEPTH_M = 5.0              # Default tank depth in meters
-TANK_MIN_VOLUME_M3 = 1000.0     # Minimum tank volume in cubic meters
-TANK_MAX_VOLUME_M3 = 10000.0    # Maximum tank volume in cubic meters
+TANK_MIN_VOLUME_M3 = 5000.0     # Minimum tank volume in cubic meters
+TANK_MAX_VOLUME_M3 = 100000.0    # Maximum tank volume in cubic meters
 TANK_OCCUPATION_FACTOR = 1.2    # Extra space factor for access, pumps, maneuvering
+TANK_MIN_UTILIZATION_PCT = 40.0 # Minimum tank utilization % (warn if below this)
+TANK_VOLUME_ROUND_M3 = 100      # Round volumes to this increment for display
+MAX_TANKS = 15
+
 # Tank Volume Sizing
 TANK_VOLUME_SAFETY_FACTOR = 1.2 # Safety factor applied to flooding volume
-TANK_DEFAULT_VOLUME_M3 = 3000.0 # Fallback volume if flooding volume is unknown
-
-# WEIR DESIGN PARAMETERS
-WEIR_DISCHARGE_COEFF = 1.84     # Rectangular weir discharge coefficient (Cd)
-WEIR_CREST_MIN_M = 0.10         # Minimum weir crest height (m)
-WEIR_CREST_MAX_M = 0.50         # Maximum weir crest height (m)
+WEIR_CREST_MIN_M = 0.1         # Minimum weir crest height above tank bottom (m)
+WEIR_DISCHARGE_COEFF = 1.84   # Weir discharge coefficient (Cd) for rectangular sharp-crested weir
+DERIVATION_MIN_DISTANCE_M = 100.0  # Minimum distance (m) between derivation points on same pipe line
+# =============================================================================
 
 # LAND COST PARAMETERS
 LAND_COST_PER_M2 = 50.0         # Base cost per square meter of land

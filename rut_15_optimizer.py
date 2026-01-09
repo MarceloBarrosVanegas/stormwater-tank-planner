@@ -1062,11 +1062,11 @@ class GreedyTankOptimizer:
         predio_capacity = {}
         
         # Constants for area calculation
-        TANK_DEPTH = self.tank_depth  # Use configurable depth
-        OCCUPATION_FACTOR = 1.2  # Extra space for access, pumps, maneuvering
+        TANK_DEPTH = config.TANK_DEPTH_M  # Use configurable depth
+        OCCUPATION_FACTOR = config.TANK_OCCUPATION_FACTOR  # Extra space for access, pumps, maneuvering
         # Use configurable volume limits from instance
-        MIN_TANK_VOLUME = self.min_tank_volume
-        MAX_TANK_VOLUME = self.max_tank_volume
+        MIN_TANK_VOLUME = config.TANK_MIN_VOLUME_M3
+        MAX_TANK_VOLUME = config.TANK_MAX_VOLUME_M3
         
         # Pre-calculate available area for each predio
         for idx, row in self.predios_gdf.iterrows():
@@ -1242,12 +1242,16 @@ class GreedyTankOptimizer:
                 })
                 
                 # === ECONOMIC TRACKING (for graphing) ===
-                # Get CLIMADA damage from evaluator (ITZI always used)
+                # Get CLIMADA damage from evaluator
                 current_damage = getattr(self.evaluator, 'last_flood_damage_usd', 0)
                 baseline_damage = getattr(self.evaluator, 'baseline_flood_damage', 0)
                 
-                # Avoided Cost = Baseline Damage - Current Damage
-                cost_saved = baseline_damage - current_damage
+                # Get Infrastructure Benefit (Deferred Investment savings)
+                infrastructure_benefit = getattr(self.evaluator, 'last_economic_result', {}).get('infrastructure_benefit', 0)
+                
+                # Total Avoided Cost = CLIMADA savings + Infrastructure Benefit
+                climada_savings = baseline_damage - current_damage
+                cost_saved = climada_savings + infrastructure_benefit
                 
                 # Get flooding volume from metrics for display
                 if hasattr(self.evaluator, 'last_metrics') and self.evaluator.last_metrics:

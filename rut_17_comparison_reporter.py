@@ -15,11 +15,10 @@ from pyswmm import Output
 from swmm.toolkit.shared_enum import NodeAttribute, LinkAttribute, SystemAttribute
 
 # Import time limit from config
-try:
-    import config
-    PLOT_TIME_LIMIT_HOURS = config.PLOT_TIME_LIMIT_HOURS
-except:
-    PLOT_TIME_LIMIT_HOURS = 3.5  # Default: 3.5 hours
+
+import config
+PLOT_TIME_LIMIT_HOURS = config.PLOT_TIME_LIMIT_HOURS
+from config import TANK_MIN_UTILIZATION_PCT, TANK_VOLUME_ROUND_M3
 
 plt.style.use('ggplot')
 
@@ -345,13 +344,14 @@ class ScenarioComparator:
         
     def generate_comparison_plots(self, solution: SystemMetrics, solution_name: str, save_dir: Path, 
                                   nodes_gdf: gpd.GeoDataFrame, inp_path: str, derivations: List,
-                                  annotations_data: List[Dict], detailed_links: Dict, designed_gdf: gpd.GeoDataFrame = None):
+                                  annotations_data: List[Dict], detailed_links: Dict, designed_gdf: gpd.GeoDataFrame = None,
+                                  tank_details: List[Dict] = None):
         """Generates all comparison plots for a given solution."""
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         
-        # 1. Combined Map (Spatial + Scatter + Hydro + Hists)
-        self.generate_combined_map(solution, solution_name, save_dir, nodes_gdf, inp_path, derivations, annotations_data, detailed_links)
+        # 1. Combined Map (Spatial + Scatter + Hydro + Hists + Tank Table)
+        self.generate_combined_map(solution, solution_name, save_dir, nodes_gdf, inp_path, derivations, annotations_data, detailed_links, tank_details)
         
         # 2. Hydrographs (3x3 grid)
         if detailed_links:
@@ -614,41 +614,121 @@ class ScenarioComparator:
     def generate_combined_map(self, solution: SystemMetrics, solution_name: str, save_dir: Path, 
                               nodes_gdf: gpd.GeoDataFrame, inp_path: str, derivations: List,
                               annotations_data: List[Dict] = None,
-                              detailed_links: Dict = None):
+                              detailed_links: Dict = None,
+                              tank_details: List[Dict] = None):
         """
         Dashboard Layout:
-        Left (Col 0, Rows 0-2): Map
-        Right (Col 1):
-           Row 0: Scatter Plot
-           Row 1: System Flooding Hydrograph
-           Row 2: Cumulative Flooding Volume
-           Row 3: Histograms (Capacity | Flood Vol)
+        ┌─────────┬──────────────────────┬─────────────────────────┐
+        │  Table  │        Map           │  Scatter  │ Cumulative  │
+        │         │                      ├───────────┼─────────────┤
+        │         │                      │  Hydro    │  Histogram  │
+        └─────────┴──────────────────────┴───────────────────────────┘
         """
-        fig = plt.figure(figsize=(24, 22))
-        gs = fig.add_gridspec(4, 2, width_ratios=[2, 1])
+        fig = plt.figure(figsize=(22, 9))
+        # Grid: 2 rows, 4 cols - Table | Map | 4 plots in 2x2 (last 2 columns)
+        gs = fig.add_gridspec(2, 4, width_ratios=[0.7, 1.8, 1, 1])
         
-        # --- LEFT: MAP ---
-        ax_map = fig.add_subplot(gs[:, 0])
+        # === LEFT: TANK TABLE (col 0, rows 0-1) ===
+        ax_table = fig.add_subplot(gs[:, 0])
+        ax_table.axis('off')
+        ax_table.set_title('Tank Details', fontsize=12, fontweight='bold', pad=5)
+        
+        # Build table data - compact format
+        # L in km, Vol = actual volume rounded, Util% with warning color if low
+        table_headers = ['#', 'Node', 'Q\n(m³/s)', 'L\n(km)', 'D', 'Vol\n(m³)']
+        table_data = []
+        tank_positions = {}  # To store positions for map labels
+        low_util_rows = []   # Track rows with low utilization
+        
+        # Get config values
+
+        if tank_details:
+            for i, tank in enumerate(tank_details[:12], 1):  # Limit to 12 rows
+                node_id = tank.get('NodeID', '?')
+                q_derivacion = tank.get('FloodingFlow', 0)
+                longitud_km = tank.get('PipelineLength', 0) / 1000.0  # Convert to km
+                diametro = tank.get('Diameter', 'N/A')
+                vol_used = tank.get('StoredVolume', 0)
+                vol_design = tank.get('TankVolume', 0)
+                util_pct = vol_used / vol_design
+
+                
+                # Round volume to configured increment
+                vol_rounded = round(vol_used / TANK_VOLUME_ROUND_M3) * TANK_VOLUME_ROUND_M3
+                
+                # Track low utilization
+                if util_pct < TANK_MIN_UTILIZATION_PCT:
+                    low_util_rows.append(i)
+                
+                table_data.append([
+                    str(i),
+                    node_id[-7:] if len(node_id) > 7 else node_id,
+                    f"{q_derivacion:.1f}",
+                    f"{longitud_km:.2f}",
+                    str(diametro)[:9],  # Truncate diameter string
+                    f"{vol_rounded:,.0f}",
+                ])
+                tank_positions[node_id] = i  # Map node to number
+        
+        if table_data:
+            table = ax_table.table(cellText=table_data, colLabels=table_headers, 
+                                   loc='center', cellLoc='center',
+                                   colWidths=[0.06, 0.18, 0.10, 0.12, 0.20, 0.18])
+            table.auto_set_font_size(False)
+            table.set_fontsize(8)
+            table.scale(1.0, 1.6)
+            
+            # Style header row
+            for j in range(len(table_headers)):
+                table[(0, j)].set_facecolor('#3498db')
+                table[(0, j)].set_text_props(color='white', fontweight='bold')
+            
+            # Highlight low utilization rows in orange
+            for row_idx in low_util_rows:
+                for col_idx in range(len(table_headers)):
+                    table[(row_idx, col_idx)].set_facecolor('#ffebcc')  # Light orange
+        else:
+            ax_table.text(0.5, 0.5, 'No tank data\navailable', ha='center', va='center',
+                         fontsize=10, color='gray', transform=ax_table.transAxes)
+        
+        # === CENTER: SPATIAL MAP (col 1, rows 0-1) ===
+        ax_map = fig.add_subplot(gs[:, 1])
         self._plot_spatial_diff(ax_map, nodes_gdf, self.baseline.flooding_volumes, solution.flooding_volumes, inp_path, derivations)
         if annotations_data and derivations:
              self._overlay_annotations(ax_map, derivations, annotations_data)
-
-        # --- RIGHT COLUMN ---
         
-        # 1. Scatter (Top)
-        ax_scatter = fig.add_subplot(gs[0, 1])
+        # Add numbered labels on map for tanks
+        if tank_details and derivations:
+            for i, tank in enumerate(tank_details[:12], 1):
+                node_id = tank.get('NodeID', '?')
+                # Find the derivation geometry for this node
+                for deriv in derivations:
+                    if hasattr(deriv, 'centroid'):
+                        # Check if this derivation belongs to this tank
+                        if deriv is derivations[i-1] if i-1 < len(derivations) else False:
+                            centroid = deriv.centroid
+                            ax_map.annotate(str(i), xy=(centroid.x, centroid.y), 
+                                          fontsize=12, fontweight='bold', color='black',
+                                          ha='center', va='center',
+                                          bbox=dict(boxstyle='circle,pad=0.2', facecolor='white', 
+                                                   edgecolor='black', alpha=0.9))
+                            break
+        
+        # === RIGHT: 2x2 PLOTS (cols 2-3) ===
+        # Row 0, Col 2: Scatter Plot
+        ax_scatter = fig.add_subplot(gs[0, 2])
         self._plot_volume_scatter(ax_scatter, self.baseline.flooding_volumes, solution.flooding_volumes)
         
-        # 2. System Flooding Hydrograph (Middle-Top)
-        ax_flood = fig.add_subplot(gs[1, 1])
-        self._plot_system_flood_hydrograph(ax_flood, self.baseline, solution)
-        
-        # 3. Cumulative Flooding Volume (Middle-Bottom) - NEW!
-        ax_cumulative = fig.add_subplot(gs[2, 1])
+        # Row 0, Col 3: Cumulative Volume
+        ax_cumulative = fig.add_subplot(gs[0, 3])
         self._plot_cumulative_volume(ax_cumulative, self.baseline, solution)
         
-        # 4. Flood Volume Histogram (Bottom)
-        ax_hist_vol = fig.add_subplot(gs[3, 1])
+        # Row 1, Col 2: System Flooding Hydrograph
+        ax_flood = fig.add_subplot(gs[1, 2])
+        self._plot_system_flood_hydrograph(ax_flood, self.baseline, solution)
+        
+        # Row 1, Col 3: Flood Volume Histogram
+        ax_hist_vol = fig.add_subplot(gs[1, 3])
         base_vols = list(self.baseline.flooding_volumes.values())
         sol_vols = list(solution.flooding_volumes.values())
         self._plot_hist(ax_hist_vol, base_vols, sol_vols, "Flood Vol (m³)")
@@ -1240,36 +1320,28 @@ class ScenarioComparator:
             plt.close(fig)
 
     def _overlay_annotations(self, ax, derivations, annotations_data):
-        """Helper to draw annotations on existing map ax."""
+        """Helper to draw simple numbered labels on derivation lines."""
         from shapely.geometry import LineString
         for i, item in enumerate(annotations_data):
             if i >= len(derivations): break
             
-            q = item['q_peak']
-            d = item['diameter']
-            vol = item['tank_vol']
-            stored = item.get('stored_vol', 0)  # Get stored volume if available
+            row_num = i + 1  # Table row number (1-indexed)
+            predio_id = item.get('predio_id', '?')
             
             geom = derivations[i]
             if isinstance(geom, LineString):
-                 # Midpoint for label
-                 mid_pt = geom.interpolate(0.5, normalized=True)
-                 mx, my = mid_pt.x, mid_pt.y
-                 
-                 # Calculate Length
-                 length_m = geom.length
-                 
-                 # Show both design and stored volume
-                 if stored > 0:
-                     pct = (stored / vol * 100) if vol > 0 else 0
-                     label = f"Q: {q:.2f} cms\nD: {d}\nL: {length_m:.0f} m\nDis: {vol:.0f} m³\nCap: {stored:.0f} m³ ({pct:.0f}%)"
-                 else:
-                     label = f"Q: {q:.2f} cms\nD: {d}\nL: {length_m:.0f} m\nVol: {vol:.0f} m³"
-                 
-                 # Add text with box
-                 ax.text(mx, my, label, fontsize=8, fontweight='bold',
-                             bbox=dict(facecolor='white', alpha=0.9, edgecolor='black', boxstyle='round,pad=0.3'),
-                             zorder=20, ha='center')
+                # Midpoint for label
+                mid_pt = geom.interpolate(0.5, normalized=True)
+                mx, my = mid_pt.x, mid_pt.y
+                
+                # Simple label: just the row number
+                label = str(row_num)
+                
+                # Add compact text with box
+                ax.text(mx, my, label, fontsize=11, fontweight='bold',
+                        bbox=dict(boxstyle='circle,pad=0.3', facecolor='white', 
+                                 edgecolor='blue', linewidth=2),
+                        zorder=20, ha='center', va='center', color='blue')
 
 
 

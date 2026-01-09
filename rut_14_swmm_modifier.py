@@ -936,13 +936,47 @@ class SWMMModifier:
         print(f"Adding designed pipeline ({len(designed_gdf)} links)...")
         connection_map = connection_map or {}
         
-        # Identify nodes that should NOT be created (they effectively exist)
-        existing_targets = set(connection_map.values())
+        # --- 1. BUILD EXISTING NODE INDEX (ID and Spatial) ---
+        # Get all existing nodes from the model
+        existing_nodes_df = self.swmm_model.nodes.dataframe
+        existing_ids = set(existing_nodes_df.index)
         
-        # Track IDs we have added in this batch to avoid duplicates
+        # Add connection_map targets to existing set (trust user mapping)
+        existing_ids.update(connection_map.values())
+        
+        # Build Spatial Index for Coordinate Merging
+        try:
+            from scipy.spatial import cKDTree
+            # Get coordinates. swmmio may have coords in model.inp.coordinates or model.coordinates
+            # We prefer the [COORDINATES] section directly if available via swmmio
+            if hasattr(self.swmm_model, 'inp') and hasattr(self.swmm_model.inp, 'coordinates'):
+                coords_df = self.swmm_model.inp.coordinates.copy()
+            elif hasattr(self.swmm_model, 'coordinates'):
+                coords_df = self.swmm_model.coordinates.copy()
+            else:
+                coords_df = None
+            
+            if coords_df is not None and not coords_df.empty and 'X' in coords_df.columns and 'Y' in coords_df.columns:
+                node_coords = coords_df[['X', 'Y']].values
+                node_indices = coords_df.index.tolist()
+                spatial_tree = cKDTree(node_coords)
+                has_spatial = True
+            else:
+                has_spatial = False
+                print("Warning: Could not build spatial index for SWMM nodes (missing coords). Spatial merging disabled.")
+        except ImportError:
+            has_spatial = False
+            print("Warning: scipy not installed. Spatial merging disabled.")
+        except Exception as e:
+            has_spatial = False
+            print(f"Warning: Error building spatial index: {e}")
+
+        # Track IDs we have added in this batch to avoid duplicates within the GDF itself
         added_nodes = set()
         
         xsections_to_add = []
+        
+        MERGE_TOLERANCE = 0.1 # meters
         
         for idx, row in designed_gdf.iterrows():
             tramo = str(row['Tramo'])
@@ -951,52 +985,62 @@ class SWMMModifier:
             # Robust split handling
             if len(parts) >= 2:
                 u_original = parts[0]
-                v_original = parts[-1] # Handle multi-dash names if any? usually simple.
+                v_original = parts[-1] 
             else:
                 print(f"Skipping malformed Tramo: {tramo}")
                 continue
                 
-            # Remap IDs
-            u_final = connection_map.get(u_original, u_original)
-            v_final = connection_map.get(v_original, v_original)
-            
-            # --- NODES ---
-            # Process U (Start)
-            if u_final not in existing_targets and u_final not in added_nodes:
-                # Get coords from start of geometry
-                if row.geometry.geom_type == 'LineString':
-                    pt = row.geometry.coords[0]
-                    # Add Junction
-                    # ZFI is invert at start of pipe. Node invert should be at least this.
-                    z = float(row.ZFI) if hasattr(row, 'ZFI') else 0.0
-                    self.add_junction(u_final, z)
-                    self.add_coordinate(u_final, pt[0], pt[1])
-                    added_nodes.add(u_final)
-            
-            # Process V (End)
-            if v_final not in existing_targets and v_final not in added_nodes:
-                if row.geometry.geom_type == 'LineString':
-                    pt = row.geometry.coords[-1]
-                    z = float(row.ZFF) if hasattr(row, 'ZFF') else 0.0
-                    self.add_junction(v_final, z)
-                    self.add_coordinate(v_final, pt[0], pt[1])
-                    added_nodes.add(v_final)
+            # Helper to process node
+            def process_node(node_id_orig, geom_pt, z_val):
+                # 1. Remap ID from map
+                final_id = connection_map.get(node_id_orig, node_id_orig)
+                
+                # 2. Check strict ID existence
+                if final_id in existing_ids:
+                    return final_id # Use existing
+                
+                if final_id in added_nodes:
+                    return final_id # Already added in this batch
+                
+                # 3. Check Spatial Existence (Merge)
+                if has_spatial:
+                    dist, idx = spatial_tree.query([geom_pt[0], geom_pt[1]])
+                    if dist < MERGE_TOLERANCE:
+                        matched_id = node_indices[idx]
+                        print(f"  [Merge] Merging new node {final_id} into existing {matched_id} (dist={dist:.2f}m)")
+                        return matched_id
+                
+                # 4. Create New Node
+                self.add_junction(final_id, z_val)
+                self.add_coordinate(final_id, geom_pt[0], geom_pt[1])
+                added_nodes.add(final_id)
+                return final_id
+
+            # --- PROCESS NODES ---
+            # Start Node
+            if row.geometry.geom_type == 'LineString':
+                pt_u = row.geometry.coords[0]
+                z_u = float(row.ZFI) if hasattr(row, 'ZFI') else 0.0
+                u_final = process_node(u_original, pt_u, z_u)
+                
+                # End Node
+                pt_v = row.geometry.coords[-1]
+                z_v = float(row.ZFF) if hasattr(row, 'ZFF') else 0.0
+                v_final = process_node(v_original, pt_v, z_v)
+            else:
+                print(f"Skipping non-LineString geometry: {tramo}")
+                continue
             
             # --- CONDUIT ---
-            # Use Tramo as Name, but maybe prefix to ensure uniqueness?
-            # rut_03 names are usually unique per project.
-            
             length = float(row.L) if hasattr(row, 'L') else row.geometry.length
             n = float(row.Rug) if hasattr(row, 'Rug') else 0.010
             
             self.add_conduit(tramo, u_final, v_final, length, n)
             
             # --- XSECTION ---
-            # Parse 'Seccion' and 'D_int' similar to add_pipeline_from_gpkg
             d_int = str(row.D_int) if hasattr(row, 'D_int') else "0.3"
             seccion_type = str(row.Seccion).lower().strip() if hasattr(row, 'Seccion') else "circular"
             
-            # (Reuse logic from add_pipeline_from_gpkg or refactor. duplicating for safety/speed now)
             try:
                 geom_arr = SeccionLlena.section_str2float([d_int], return_all=True, sep='x')
                 g = geom_arr[0]
@@ -1007,13 +1051,11 @@ class SWMMModifier:
                 if 'circular' in seccion_type:
                     shape_swmm = 'CIRCULAR'
                     geoms[0] = g[0]
-                elif 'rect' in seccion_type and 'closed' in seccion_type: # check rut_03 naming
+                elif 'rect' in seccion_type and 'closed' in seccion_type: 
                      shape_swmm = 'RECT_CLOSED'
                      geoms[0] = g[1] # H
                      geoms[1] = g[0] # W
                 else:
-                     # Fallback to circular if unknown or add other types
-                     # rut_03 usually produces circular for sewers
                      shape_swmm = 'CIRCULAR'
                      geoms[0] = g[0]
                 
@@ -1025,7 +1067,6 @@ class SWMMModifier:
                 
             except Exception as e:
                 print(f"Error parsing section for {tramo}: {e}")
-                # Fallback
                 self.add_xsection(tramo, 'CIRCULAR', [0.3, 0, 0, 0])
 
         # Add all xsections

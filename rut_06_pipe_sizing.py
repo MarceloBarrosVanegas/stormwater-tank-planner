@@ -961,19 +961,15 @@ class SeccionParcialmenteLlena:
                 ) for args_tuple in args_per_section
             ])
 
-        # If brentq fails (e.g., root is not bracketed), fall back
         except Exception as e:
-            print(f'Error in brentq for {root_func.__name__} in Ramal {ramal_id}, falling back to root method. Error: {e}')
-
-            # Use the 'hybr' method, which is generally robust for non-linear problems
-            roots = np.array([
-                opt.root(
-                    root_func,
-                    lower_bound,
-                    args=args_tuple,
-                    method="hybr",
-                ).x[0] for args_tuple in args_per_section
-            ])
+            # NO FALLBACK - fail explicitly with detailed error message
+            raise RuntimeError(
+                f"Error in brentq for {root_func.__name__} in Ramal {ramal_id}.\n"
+                f"  Lower bound: {lower_bound}, Upper bound: {upper_bound}\n"
+                f"  Number of sections: {len(args_per_section)}\n"
+                f"  First section args: {args_per_section[0] if args_per_section else 'N/A'}\n"
+                f"  Original error: {e}"
+            ) from e
 
         return roots
 

@@ -237,12 +237,14 @@ class StormwaterOptimizationRunner:
         # Distance is "bad", so we take (1 - norm) to make it "closeness" (good)
         df_c['Score'] = (w_flow * norm_flow) + (w_gap * norm_gap) + (w_dist * (1.0 - norm_dist))
         
-        # --- NEW: Filter to keep only the Best Predio per Node ---
+        # --- Filter to keep only the Best Predio per Node ---
         print("  Filtering candidates: Keeping only the BEST predio for each node...")
         # Sort by Score descending so the first one for each NodeID is the best
         df_c = df_c.sort_values('Score', ascending=False)
         
-        # Drop duplicates keeping the first (best)
+        # Drop duplicates by NodeID only (keeps best predio for each node)
+        # NOTE: Multiple nodes CAN share the same predio - this allows the greedy
+        # optimizer to pick the best node dynamically during iteration
         df_c = df_c.drop_duplicates(subset='NodeID', keep='first')
         
         # Convert back to list of dicts
@@ -362,7 +364,7 @@ class StormwaterOptimizationRunner:
             print(f"  NSGA Mode: {mode_type} | TRs: {optimization_tr_list}")
             print(f"  Generations: {n_generations} | Population: {pop_size}")
         elif stop_at_breakeven:
-            print(f"  Stopping Criterion: ECONOMIC BREAKEVEN (multiplier={breakeven_multiplier})")
+            print(f"  Stopping Criterion: Stop at Breakeven Enabled (Multiplier: {breakeven_multiplier})")
 
         
         # 1. Setup Environment
@@ -400,7 +402,7 @@ class StormwaterOptimizationRunner:
                 n_generations=n_generations,
                 pop_size=pop_size
             )
-        else:
+        elif optimizer_mode == 'greedy':
             # Greedy Sequential Optimization (default)
             greedy_opt = GreedyTankOptimizer(
                 nodes_gdf=self.nodes_gdf,
@@ -540,7 +542,7 @@ class StormwaterOptimizationRunner:
         self.swmm_file_original = swmm_file
              
         # Update Config with provided parameters
-        import config
+
         config.TANK_DEPTH_M = max_depth
         config.TANK_MIN_VOLUME_M3 = min_tank_vol
         config.TANK_MAX_VOLUME_M3 = max_tank_vol
@@ -622,17 +624,17 @@ if __name__ == "__main__":
 
     # Step 3: Run Sequential Tank Analysis
     runner.step_3_run_sequential_analysis(
-        max_tanks=10,              # Max active tanks (stopping condition 1)
+        max_tanks=config.MAX_TANKS,              # Max active tanks (stopping condition 1)
         max_iterations=100,        # Max iterations (stopping condition 2)
-        min_tank_vol=5000.0,       # Minimum tank size (m³)
-        max_tank_vol=1000000.0,    # Very high - predio area will limit actual size
-        tank_depth=7.0,            # Tank depth (m)
+        min_tank_vol=config.TANK_MIN_VOLUME_M3,       # Minimum tank size (m³)
+        max_tank_vol=config.TANK_MAX_VOLUME_M3,    # Very high - predio area will limit actual size
+        tank_depth=config.TANK_DEPTH_M,            # Tank depth (m)
         stop_at_breakeven=True,    # Stop when cost >= threshold (condition 3)
-        breakeven_multiplier=1000,  # Allow investment up to 1.5x avoided damage
+        breakeven_multiplier=1.5,  # Allow investment up to 1.5x avoided damage
         swmm_file=swmm_file,
         elev_file=elev_file,
 
-        optimizer_mode = 'nsga',  # 'greedy' or 'nsga'
+        optimizer_mode = 'greedy',  # 'greedy' or 'nsga'
         optimization_tr_list = config.TR_LIST,  # For NSGA: [25] or [1,2,5,10,25]
         validation_tr_list= config.VALIDATION_TR_LIST,  # For NSGA final validation
         n_generations = config.N_GENERATIONS,  # NSGA generations
