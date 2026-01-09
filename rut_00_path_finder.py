@@ -56,7 +56,34 @@ class PathFinder:
 
 
         self.graph = None
+        self.used_edges = set()  # Track edges already used by existing pipelines
+        self.junction_node = None  # Set if path ends at a junction with existing pipe
         print("PathFinder initialized with CRS.")
+
+    def mark_edges_used(self, path_nodes: list):
+        """
+        Mark the edges of a path as used by an existing pipeline.
+        Future paths that cross these edges will terminate at the junction.
+        
+        Args:
+            path_nodes: List of node IDs from a completed path
+        """
+        if not path_nodes or len(path_nodes) < 2:
+            return
+        for i in range(len(path_nodes) - 1):
+            edge = (path_nodes[i], path_nodes[i+1])
+            edge_rev = (path_nodes[i+1], path_nodes[i])
+            self.used_edges.add(edge)
+            self.used_edges.add(edge_rev)  # Add both directions
+    
+    def clear_used_edges(self):
+        """Clear all used edges (start fresh for a new optimization run)."""
+        self.used_edges.clear()
+        self.junction_node = None
+    
+    def get_junction_info(self):
+        """Returns info about junction if path ended at one."""
+        return self.junction_node
 
     def _transform_to_latlon(self, point):
         """Converts coordinates from the source CRS to latitude and longitude."""
@@ -441,6 +468,41 @@ class PathFinder:
                                                   source=start_node,
                                                   target=end_node,
                                                   weight='cost')
+            
+            # === JUNCTION DETECTION ===
+            # Check if path crosses any used edges (existing pipelines)
+            # If so, terminate at the junction node (end of smaller flow pipe)
+            self.junction_node = None
+            if self.used_edges:
+                for i in range(len(self.shortest_path) - 1):
+                    u = self.shortest_path[i]
+                    v = self.shortest_path[i + 1]
+                    edge = (u, v)
+                    edge_rev = (v, u)
+                    
+                    # Check if this edge is already used by another pipeline
+                    if edge in self.used_edges or edge_rev in self.used_edges:
+                        # Junction found! Truncate path here
+                        # The path ends at node 'u' (before the used edge)
+                        # Node 'u' becomes an intermediate node on the main pipe
+                        self.junction_node = {
+                            'node_id': u,
+                            'connects_to_edge': (u, v),
+                            'original_target': end_node,
+                            'truncated_at_index': i
+                        }
+                        
+                        # Only truncate if the resulting path has at least 3 nodes (min for viable pipeline)
+                        MIN_PATH_NODES = 3
+                        if i + 1 >= MIN_PATH_NODES:
+                            # Truncate the path to end at the junction
+                            self.shortest_path = self.shortest_path[:i+1]
+                            print(f"  [PathFinder] Junction detected at node {u}! Path truncated (connects to existing pipeline)")
+                        else:
+                            # Path would be too short - don't truncate, let it continue
+                            self.junction_node = None
+                            print(f"  [PathFinder] Junction at node {u} skipped (path too short: {i+1} nodes < {MIN_PATH_NODES})")
+                        break
     
             # Extraer coordenadas y elevaciones reales
             path_distances = []
