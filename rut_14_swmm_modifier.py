@@ -36,12 +36,9 @@ Dependencies
 # SYS PATH APPEND for rut_06 (User provided paths)
 import config
 config.setup_sys_path()
-try:
-    from rut_06_pipe_sizing import SeccionLlena
-    print("Successfully imported SeccionLlena from rut_06_pipe_sizing")
-except ImportError as e:
-    print(f"Warning: Could not import SeccionLlena: {e}")
-    SeccionLlena = None
+
+from rut_06_pipe_sizing import SeccionLlena
+
 
 class SWMMModifier:
     """
@@ -824,9 +821,9 @@ class SWMMModifier:
             data = node_data[end_node]
             self.add_storage_unit(
                 name=f"TK_{end_node}",
-                area=100.0, 
-                max_depth=5.0,
-                node_invert=data['invert']
+                area=config.TANK_MIN_VOLUME_M3 / config.TANK_DEPTH_M,  # Use Min Volume as default size 
+                max_depth=config.TANK_DEPTH_M,
+                node_invert=data['invert'] - config.TANK_DEPTH_M
             )
             self.add_coordinate(f"TK_{end_node}", data['x'], data['y'])
             

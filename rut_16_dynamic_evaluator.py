@@ -18,7 +18,7 @@ import sys
 import swmmio
 import time
 from pathlib import Path
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, Dict
 from dataclasses import dataclass
 import geopandas as gpd
 import pandas as pd
@@ -462,7 +462,7 @@ class DynamicSolutionEvaluator:
         downstream_links = self.node_topology.get(node_id, {}).get('downstream', [])
         
         # Target H/D ratio for downstream pipe capacity (e.g., 0.8)
-        TARGET_H_D = 0.7
+        TARGET_H_D = 0.65
         
         for link_id in downstream_links:
             # Use last_metrics if available (reflects previous iteration), otherwise baseline
@@ -505,8 +505,7 @@ class DynamicSolutionEvaluator:
             'flooding_flow': flooding_flow,
             'excess_downstream': excess_downstream
         }
-        
-
+    
 
     def _calculate_manning_flow(self, link_data: dict, h_over_d: float = 1.0) -> float:
         """
@@ -563,13 +562,8 @@ class DynamicSolutionEvaluator:
         
         return q
 
-        
 
-
-
-
-
-    def _get_active_pairs(self, assignments: List[Tuple[int, float]]) -> List[ActivePair]:
+    def _get_active_pairs(self, assignments: List[Tuple[int, float]], flow_updates: Dict[int, float] = None) -> List[ActivePair]:
         """
         Extract active node-predio pairs from an assignment list.
         Now allows MULTIPLE nodes per predio based on available area.
@@ -584,8 +578,8 @@ class DynamicSolutionEvaluator:
         list of ActivePair
         """
         # Constants for area calculation
-        TANK_DEPTH = 5.0  # meters
-        OCCUPATION_FACTOR = 1.5  # Extra space for access, pumps, maneuvering
+        TANK_DEPTH = config.TANK_DEPTH_M  # meters
+        OCCUPATION_FACTOR = config.TANK_VOLUME_SAFETY_FACTOR  # Extra space for access, pumps, maneuvering
         
         # Pre-calculate available area for each predio
         predio_capacity = {}
@@ -662,7 +656,8 @@ class DynamicSolutionEvaluator:
                 predio_x=predio.geometry.centroid.x,
                 predio_y=predio.geometry.centroid.y,
                 predio_z=float(predio.z) if hasattr(predio, 'z') else 0.0,
-                flooding_flow=node.FloodingFlow,
+                # flooding_flow=node.FloodingFlow,
+                flooding_flow=flow_updates.get(node_idx, node.FloodingFlow) if flow_updates else node.FloodingFlow,
                 node_invert_elev=float(node.InvertElevation) if hasattr(node, 'InvertElevation') else 0.0,
                 node_depth=float(node.NodeDepth) if hasattr(node, 'NodeDepth') else 0.0
             ))
@@ -852,12 +847,15 @@ class DynamicSolutionEvaluator:
     def evaluate_solution(self, 
                           assignments: List[Tuple[int, float]],
                           run_swmm: bool = True,
-                          solution_name: str = None) -> Tuple[float, float]:
+                          solution_name: str = None,
+                          flow_updates=None) -> Tuple[float, float]:
+
+    
         """
         Evaluate a complete solution using SewerPipeline + SWMM.
         """
         # 1. Get Active Pairs
-        active_pairs = self._get_active_pairs(assignments)
+        active_pairs = self._get_active_pairs(assignments, flow_updates)
         if not active_pairs:
             return (0.0, self.nodes_gdf['FloodingVolume'].sum())
             
@@ -895,7 +893,7 @@ class DynamicSolutionEvaluator:
             for i, pair in enumerate(active_pairs):
                 ramal_name = str(i)
                 flows_dict[ramal_name + '.0'] = pair.flooding_flow
-                pozo_hmin_dict[ramal_name +  '.0'] = pair.node_depth + 2.0
+                pozo_hmin_dict[ramal_name +  '.0'] = max(pair.node_depth, 9.0)
 
 
             pipeline = SewerPipeline(
@@ -1046,7 +1044,7 @@ class DynamicSolutionEvaluator:
                 name=tank_name,
                 area=total_vol / config.TANK_DEPTH_M, 
                 max_depth=config.TANK_DEPTH_M,
-                invert_elev=data['z_invert']
+                invert_elev=data['z_invert'] - config.TANK_DEPTH_M
             )
             modifier.add_coordinate(tank_name, data['x'], data['y'])
             
@@ -1268,6 +1266,9 @@ class DynamicSolutionEvaluator:
         
         current_metrics = self.metric_extractor.extract(str(out_file), target_links=target_links, target_nodes=target_nodes)
 
+        print(f"\n  {'NodeID':<12} {'Flood BEFORE':<16} {'Flood AFTER':<16} {'Tank Stored':<12}")
+        print(f"  {'-'*65}")
+
         for pair in active_pairs:
             nid = str(pair.node_id)
             tank_name = f"TK_PREDIO_{pair.predio_id}"
@@ -1278,10 +1279,16 @@ class DynamicSolutionEvaluator:
             # Solution flooding for this node
             sol_flood = current_metrics.flooding_volumes.get(nid, 0.0)
             
-            # Tank inflow (from hydrograph if extracted)
-            tank_inflow = current_metrics.flooding_volumes.get(tank_name, 0.0)
-            
-            print(f"  {nid:<12} {base_flood:<16.1f} {sol_flood:<16.1f} {tank_inflow:<12.1f}")
+            # Tank stored volume (Derived from utilization)
+            stored_vol = 0.0
+            if tank_name in current_metrics.tank_utilization:
+                max_d = current_metrics.tank_utilization[tank_name].get('max_depth', 0.0)
+                # Design depth is constant config.TANK_DEPTH_M
+                # Volume = (MaxDepth / DesignDepth) * DesignVolume
+                if config.TANK_DEPTH_M > 0:
+                    stored_vol = (max_d / config.TANK_DEPTH_M) * pair.volume
+
+            print(f"  {nid:<12} {base_flood:<16.1f} {sol_flood:<16.1f} {stored_vol:<12.1f} (Vol Stored)")
         
         print()
 

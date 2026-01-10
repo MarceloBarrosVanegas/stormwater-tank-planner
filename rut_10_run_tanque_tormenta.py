@@ -156,7 +156,7 @@ class StormwaterOptimizationRunner:
 
         print(f"  Loaded {len(self.nodes_gdf)} nodes and {len(self.predios_gdf)} predios.")
 
-    def step_1_check_elevation_constraints(self, w_flow=0.5, w_dist=0.3, w_gap=0.2):
+    def step_1_check_elevation_constraints(self, w_flow=0.5, w_dist=0.4, w_gap=0.1):
         """
         Step 1: Check Elevation Constraints & Heuristic Ranking
         -----------------------------------------------------

@@ -108,6 +108,7 @@ ELEV_FILE = ELEV_FILE_CARVED  # Use carved DEM for Itzi simulation
 PREDIOS_FILE = VECTOR_DIR / "07_predios_disponibles.shp"
 NETWORK_FILE = VECTOR_DIR / "06_red_principal.gpkg"
 FLOODING_NODES_FILE = FLOODING_STATS_DIR / "00_flooding_nodes.gpkg"
+PREDIOS_DAMAGED_FILE = VECTOR_DIR / "predios_proyecto.gpkg"
 
 # Other
 DEFAULT_NODES_XLSX = FLOODING_STATS_DIR / "00_flooding_nodes.xlsx"
@@ -167,10 +168,10 @@ TANK_VOLUME_ROUND_M3 = 100      # Round volumes to this increment for display
 MAX_TANKS = 15
 
 # Tank Volume Sizing
-TANK_VOLUME_SAFETY_FACTOR = 1.2 # Safety factor applied to flooding volume
+TANK_VOLUME_SAFETY_FACTOR = 2.0 # Safety factor applied to flooding volume
 WEIR_CREST_MIN_M = 0.1         # Minimum weir crest height above tank bottom (m)
 WEIR_DISCHARGE_COEFF = 1.84   # Weir discharge coefficient (Cd) for rectangular sharp-crested weir
-DERIVATION_MIN_DISTANCE_M = 100.0  # Minimum distance (m) between derivation points on same pipe line
+DERIVATION_MIN_DISTANCE_M = 1000.0  # Minimum distance (m) between derivation points on same pipe line
 # =============================================================================
 
 # LAND COST PARAMETERS

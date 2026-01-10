@@ -46,19 +46,16 @@ except ImportError:
     DYNAMIC_EVALUATOR_AVAILABLE = False
     DynamicSolutionEvaluator = None
 
-# Optional: pymoo for NSGA-II (installed separately)
-try:
-    from pymoo.core.problem import Problem
-    from pymoo.core.sampling import Sampling
-    from pymoo.algorithms.moo.nsga2 import NSGA2
-    from pymoo.operators.crossover.sbx import SBX
-    from pymoo.operators.mutation.pm import PM
-    from pymoo.operators.sampling.rnd import IntegerRandomSampling
-    from pymoo.optimize import minimize
-    PYMOO_AVAILABLE = True
-except ImportError:
-    PYMOO_AVAILABLE = False
-    print("Warning: pymoo not installed. Run 'pip install pymoo' for optimization.")
+
+from pymoo.core.problem import Problem
+from pymoo.core.sampling import Sampling
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.operators.crossover.sbx import SBX
+from pymoo.operators.mutation.pm import PM
+from pymoo.operators.sampling.rnd import IntegerRandomSampling
+from pymoo.optimize import minimize
+PYMOO_AVAILABLE = True
+
 
 
 if PYMOO_AVAILABLE:
@@ -1212,6 +1209,9 @@ class GreedyTankOptimizer:
                 n_nodes = len(self.nodes_gdf)
                 n_var = n_nodes * 2
                 gene = np.zeros(n_var)
+
+                # Create dict to pass updates
+                flow_updates_dict = {} 
                 
                 for ac in active_candidates:
                     node_rows = self.nodes_gdf[self.nodes_gdf['NodeID'] == ac['NodeID']]
@@ -1219,6 +1219,8 @@ class GreedyTankOptimizer:
                         node_idx = self.nodes_gdf.index.get_loc(node_rows.index[0])
                         gene[node_idx * 2] = ac['PredioID'] + 1
                         gene[node_idx * 2 + 1] = ac['TankVolume']  # Dynamic volume per tank
+                        # Populate updates using the DYNAMIC FloodingFlow (now peak rate)
+                        flow_updates_dict[node_idx] = ac['FloodingFlow']
                 
                 # Decode for evaluator
                 assignments = []
@@ -1230,7 +1232,8 @@ class GreedyTankOptimizer:
                 print(f"  Evaluating configuration with {len(active_candidates)} tanks...")
                 cost, flooding_vol = self.evaluator.evaluate_solution(
                     assignments, 
-                    solution_name=f"Seq_Iter_{iteration:02d}"
+                    solution_name=f"Seq_Iter_{iteration:02d}",
+                    flow_updates=flow_updates_dict,
                 )
                 
                 results.append({
@@ -1319,7 +1322,9 @@ class GreedyTankOptimizer:
                         new_flood = metrics.flooding_volumes.get(cand['NodeID'], 0.0)
                         if new_flood != cand['FloodingVolume']:
                             updated_count += 1
-                        cand['FloodingFlow'] = new_flood
+                        # Obtener el rate pico real desde metrics
+                        new_peak = metrics.flooding_peak_rates.get(cand['NodeID'], 0.0)
+                        cand['FloodingFlow'] = new_peak    # <--- CORRECCIÓN: Usar caudal pico real
                         cand['FloodingVolume'] = new_flood
                         # Recalculate TankVolume (clamped to min/max)
                         cand['TankVolume'] = max(MIN_TANK_VOLUME, min(new_flood, MAX_TANK_VOLUME))
@@ -1331,7 +1336,7 @@ class GreedyTankOptimizer:
                     print(f"  [Re-Rank] Top candidates after update:")
                     for i, c in enumerate(remaining_candidates[:5]):
                         if c['NodeID'] not in used_nodes:
-                            print(f"    #{i+1}: {c['NodeID']} -> FloodVol: {c['FloodingVolume']:.0f} m³, TankVol: {c['TankVolume']:.0f} m³")
+                            print(f"    #{i+1}: {c['NodeID']} -> Q_peak: {c['FloodingFlow']:.3f} m³/s | Vol: {c['FloodingVolume']:.0f} m³ | Tank: {c['TankVolume']:.0f} m³")
 
                     
                     # === PRUNING: REMOVE TANKS BASED ON UTILIZATION AND SYSTEMIC IMPACT ===

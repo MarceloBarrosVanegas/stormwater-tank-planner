@@ -37,6 +37,7 @@ class SystemMetrics:
     # Detailed Data (NodeID -> Value)
     node_depths: Dict[str, float] = field(default_factory=dict)
     flooding_volumes: Dict[str, float] = field(default_factory=dict)
+    flooding_peak_rates: Dict[str, float] = field(default_factory=dict)  # Peak flooding rate (m³/s) per node
     
     # Time Series for Critical Nodes (NodeID -> {time: [], value: []})
     flood_hydrographs: Dict[str, Dict[str, list]] = field(default_factory=dict)
@@ -191,6 +192,7 @@ class MetricExtractor:
                                 
                         if vol > 0.1:
                             flood_vols[nid] = vol
+                            metrics.flooding_peak_rates[nid] = max_rate  
                             
                             # Only get depth for flooded nodes (OPTIMIZATION)
                             d_vals = list(out.node_series(nid, NodeAttribute.INVERT_DEPTH).values())
@@ -673,7 +675,7 @@ class ScenarioComparator:
         if table_data:
             table = ax_table.table(cellText=table_data, colLabels=table_headers, 
                                    loc='center', cellLoc='center',
-                                   colWidths=[0.06, 0.18, 0.10, 0.12, 0.20, 0.18])
+                                   colWidths=[0.15, 0.20, 0.15, 0.15, 0.25, 0.20])
             table.auto_set_font_size(False)
             table.set_fontsize(8)
             table.scale(1.0, 1.6)
@@ -694,8 +696,8 @@ class ScenarioComparator:
         # === CENTER: SPATIAL MAP (col 1, rows 0-1) ===
         ax_map = fig.add_subplot(gs[:, 1])
         self._plot_spatial_diff(ax_map, nodes_gdf, self.baseline.flooding_volumes, solution.flooding_volumes, inp_path, derivations)
-        if annotations_data and derivations:
-             self._overlay_annotations(ax_map, derivations, annotations_data)
+        # if annotations_data and derivations:
+        #      self._overlay_annotations(ax_map, derivations, annotations_data)
         
         # Add numbered labels on map for tanks
         if tank_details and derivations:
@@ -1345,8 +1347,6 @@ class ScenarioComparator:
 
 
 
-    # ... (other methods) ...
-
     def _plot_detailed_hydrographs_side_by_side(self, ax_sol, ax_base, base_hydros: Dict, sol_hydros: Dict, detailed_links: Dict):
         """
         Plots hydrographs side-by-side:
@@ -1542,8 +1542,28 @@ class ScenarioComparator:
         """
         Maps delta flooding + Background Network + New Derivations.
         """
-        # 1. Background Network (Gray)
-        if inp_path and os.path.exists(inp_path):
+        # 0. Background Predios (Very Light Gray) - New
+        predios = gpd.read_file(config.PREDIOS_DAMAGED_FILE)
+        # Ensure CRS matches project CRS for correct alignment
+        predios = predios.to_crs(config.PROJECT_CRS)
+        # Even Lighter gray (almost white)
+        predios.plot(ax=ax, color='#f2f2f2', edgecolor='#e0e0e0', linewidth=0.25, zorder=-1)
+
+
+        # 1. Background Network (Dark Gray/Black) from Vector File
+        net_gdf = None
+        if hasattr(config, 'NETWORK_FILE') and config.NETWORK_FILE.exists():
+            try:
+                net_gdf = gpd.read_file(config.NETWORK_FILE)
+                if hasattr(config, 'PROJECT_CRS'):
+                     net_gdf = net_gdf.to_crs(config.PROJECT_CRS)
+                
+                # Darker lines for contrast against predios
+                net_gdf.plot(ax=ax, color='#222222', linewidth=1.2, alpha=0.6, zorder=0)
+            except Exception as e:
+                print(f"Background map error (vector): {e}")
+        elif inp_path and os.path.exists(inp_path):
+            # Fallback to SWMMIO if vector not available
             try:
                 import swmmio
                 from shapely.geometry import LineString
@@ -1554,10 +1574,11 @@ class ScenarioComparator:
                     if 'coords' in row and isinstance(row['coords'], list) and len(row['coords']) >= 2:
                         lines.append(LineString(row['coords']))
                 if lines:
-                     gpd.GeoSeries(lines).plot(ax=ax, color='#555555', linewidth=1.5, alpha=0.8, zorder=0)
+                     net_gdf = gpd.GeoDataFrame(geometry=lines) # Create temporary GDF for bounds
+                     gpd.GeoSeries(lines).plot(ax=ax, color='#222222', linewidth=1.2, alpha=0.6, zorder=0)
             except Exception as e:
-                print(f"Background map error: {e}")
-                
+                print(f"Background map error (swmmio): {e}")
+
         # 2. New Derivations (Thick Blue)
         if derivations:
             from shapely.geometry import LineString
@@ -1592,8 +1613,30 @@ class ScenarioComparator:
         gdf['size'] = sizes
         
         gdf.plot(ax=ax, color=gdf['color'], markersize=gdf['size'], alpha=0.7, zorder=2)
+        
+        # Set limits based on Network + Derivations (ignoring huge predios background)
+        bounds_geoms = []
+        if net_gdf is not None and not net_gdf.empty:
+            bounds_geoms.append(net_gdf.unary_union)
+        elif nodes_gdf is not None and not nodes_gdf.empty: # Fallback to filtered nodes if no net
+            bounds_geoms.append(nodes_gdf.unary_union)
+            
+        if derivations:
+            from shapely.ops import unary_union
+            # Add derivations to bounds
+            for d in derivations:
+                bounds_geoms.append(d)
+        
+        if bounds_geoms:
+            from shapely.ops import unary_union
+            unified = unary_union(bounds_geoms)
+            minx, miny, maxx, maxy = unified.bounds
+            margin = 50  # meters margin
+            ax.set_xlim(minx - margin, maxx + margin)
+            ax.set_ylim(miny - margin, maxy + margin)
+            ax.set_aspect('equal')
+
         ax.set_title("Spatial Flooding Delta (Green=Improved, Red=Worsened)")
-        ax.axis('equal') # Equal scaling
         ax.set_axis_off()
 
     def _plot_detailed_row_nx3(self, ax_flow, ax_cap, ax_flood, nid, links, baseline, solution):
@@ -1883,20 +1926,7 @@ class ScenarioComparator:
                 
                 # Try to get design_vol from detailed_links (passed from evaluator)
                 design_vol = util_data.get('design_vol', 0.0)
-                
-                # FIX: If design_vol not available, estimate from stored_volume or max_volume
-                if design_vol <= 0:
-                    stored_vol = util_data.get('stored_volume', 0.0)
-                    max_vol_data = util_data.get('max_volume', 0.0)
-                    if stored_vol > 0:
-                        # Estimate design capacity assuming 80% utilization typically
-                        design_vol = stored_vol / 0.8
-                    elif max_depth > 0:
-                        # Fallback: assume a reasonable tank (default 20000 m³)
-                        # This will at least show SOMETHING instead of nothing
-                        design_vol = 20000.0
-                        print(f"  [TANK-HYDRO] Warning: Using default design_vol={design_vol} for {tk_id}")
-                
+                               
                 times = util_data.get('times', [])
                 depths = util_data.get('depth_series', [])
                 
