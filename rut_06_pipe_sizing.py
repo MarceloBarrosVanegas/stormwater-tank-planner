@@ -9,6 +9,10 @@ from line_profiler import profile
 # append relative paths
 import sys
 
+# Add local modules to path
+import config
+config.setup_sys_path()
+
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'gui'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'util', 'geometry'))
 
@@ -2485,3 +2489,337 @@ class HydraulicConditions:
             m_ramales[i]["indice_abrasion"] = self.indice_abrasion(m_ramales, i)
 
         return m_ramales
+
+
+class CapacidadMaximaTuberia:
+    """
+    Calcula la capacidad máxima de tuberías para un h/D objetivo.
+    Versión completamente vectorizada siguiendo el patrón del código original.
+    """
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def section_str2float(arr, return_b=False, return_all=False, sep="x"):
+        """
+        Convierte strings de dimensiones a arrays numéricos.
+        (Copiado de tu código original)
+        """
+        s = pd.Series(arr)
+        dimensiones_df = s.str.split(sep, expand=True)
+        dimensiones_array = dimensiones_df.to_numpy(dtype=float)
+        l, dims = dimensiones_array.shape
+
+        geom = np.full((l, 4), np.nan)
+
+        if dims == 1:
+            geom[:, 0] = dimensiones_array[:, 0]
+        elif dims == 2:
+            geom[:, 0] = dimensiones_array[:, 0]
+            geom[:, 1] = dimensiones_array[:, 1]
+        elif dims == 4:
+            geom[:, 0] = dimensiones_array[:, 0]
+            geom[:, 1] = dimensiones_array[:, 1]
+            geom[:, 2] = dimensiones_array[:, 2]
+            geom[:, 3] = dimensiones_array[:, 3]
+
+        if return_all:
+            return geom
+
+        geom0 = geom[:, 0]
+        geom1 = geom[:, 1]
+        geom2 = geom[:, 2]
+        geom3 = geom[:, 3]
+
+        circular_index = (geom0 > 0) & np.isnan(geom1) & np.isnan(geom2) & np.isnan(geom3)
+        prismatic_index = ~circular_index
+
+        out = np.zeros(shape=l, dtype=float)
+        out[circular_index] = geom0[circular_index]
+
+        if return_b:
+            base_superior_triangulo = (geom1 / geom2) + (geom1 / geom3)
+            out[prismatic_index] = np.where(geom0[prismatic_index] > 0,
+                                            geom0[prismatic_index],
+                                            base_superior_triangulo)
+        else:
+            out[prismatic_index] = geom1[prismatic_index]
+
+        return out
+
+    @staticmethod
+    def circular_hD_root(ang_v, h_D_objetivo):
+        """
+        Residual para encontrar el ángulo que corresponde a un h/D objetivo.
+
+        Args:
+            ang_v (float): Ángulo en grados
+            h_D_objetivo (float): h/D objetivo
+
+        Returns:
+            float: Residual = h/D_calculado - h/D_objetivo
+        """
+        ang_rad_half = np.radians(ang_v / 2.0)
+        h_D_calculado = 0.5 * (1.0 - np.cos(ang_rad_half))
+        return h_D_calculado - h_D_objetivo
+
+    @staticmethod
+    def _find_roots(root_func, all_args, lower_bound, upper_bound):
+        """
+        Encuentra raíces de forma vectorizada usando brentq.
+        Patrón idéntico al método _find_roots del código original.
+
+        Args:
+            root_func (callable): Función cuya raíz se busca
+            all_args (list[np.ndarray]): Lista de arrays de argumentos
+            lower_bound (float): Límite inferior
+            upper_bound (float): Límite superior
+
+        Returns:
+            np.ndarray: Array de raíces encontradas
+        """
+        args_per_section = list(zip(*all_args))
+
+        try:
+            roots = np.array([
+                opt.brentq(
+                    root_func,
+                    lower_bound,
+                    upper_bound,
+                    xtol=1e-3,
+                    args=args_tuple,
+                ) for args_tuple in args_per_section
+            ])
+        except Exception as e:
+            raise RuntimeError(
+                f"Error en brentq para {root_func.__name__}.\n"
+                f"  Lower bound: {lower_bound}, Upper bound: {upper_bound}\n"
+                f"  Number of sections: {len(args_per_section)}\n"
+                f"  Original error: {e}"
+            ) from e
+
+        return roots
+
+    def calcular_capacidad_maxima(self, D_int, S, Rug, Seccion, h_D_objetivo=0.7):
+        """
+        Calcula la capacidad máxima de tuberías/canales para un h/D objetivo.
+        Completamente vectorizado - procesa múltiples secciones simultáneamente.
+
+        Args:
+            D_int (np.ndarray): Array de dimensiones internas (strings)
+            S (np.ndarray): Array de pendientes [m/m]
+            Rug (np.ndarray): Array de coeficientes de Manning
+            Seccion (np.ndarray): Array de tipos de sección
+            h_D_objetivo (float): Relación h/D objetivo (default: 0.7)
+
+        Returns:
+            tuple: (Q_max, v_max, h_max, ang) donde:
+                - Q_max: Caudales máximos [L/s]
+                - v_max: Velocidades [m/s]
+                - h_max: Calados [m]
+                - ang: Ángulos [°] (solo para circular, 0 para otros)
+        """
+
+        # Inicializar arrays de salida
+        n = len(D_int)
+        Q_max = np.zeros(n)
+        v_max = np.zeros(n)
+        h_max = np.zeros(n)
+        ang_max = np.zeros(n)
+
+        # Obtener secciones únicas
+        secciones = np.unique(Seccion)
+
+        # Parsear dimensiones
+        dimensiones = self.section_str2float(D_int, return_all=True)
+
+        # Procesar cada tipo de sección
+        for seccion in secciones:
+            # Índices de esta sección
+            seccion_index = np.char.equal(Seccion, seccion).nonzero()[0]
+
+            # Extraer parámetros para esta sección
+            S_sec = S[seccion_index]
+            Rug_sec = Rug[seccion_index]
+
+            if seccion == "circular":
+                # Extraer diámetros
+                D = dimensiones[:, 0][seccion_index]
+
+                # Encontrar ángulos para h/D objetivo (vectorizado)
+                h_D_array = np.full(len(seccion_index), h_D_objetivo)
+                angulo_rad = 2.0 * np.arccos(1.0 - 2.0 * h_D_array)
+                angulo_deg = np.degrees(angulo_rad)
+
+                # Limitar ángulo a 360°
+                angulo_deg = np.minimum(angulo_deg, 360.0)
+
+                # Calcular sin(θ) en radianes
+                sin_theta = np.sin(angulo_rad)
+
+                # Calcular caudal usando fórmula de la tabla
+                # q = D^(8/3) / (7257.15·n·(2π·θ°)^(2/3)) · (2π·θ° - 360·sin(θ°))^(5/3) · S^(1/2)
+                numerador = D ** (8.0 / 3.0)
+                denominador = 7257.15 * Rug_sec * ((2.0 * np.pi * angulo_deg) ** (2.0 / 3.0))
+                factor_area = (2.0 * np.pi * angulo_deg - 360.0 * sin_theta) ** (5.0 / 3.0)
+
+                # Caudal en m³/s, luego convertir a L/s
+                Q = (numerador / denominador) * factor_area * np.sqrt(S_sec) * 1000.0
+
+                # Calcular velocidad usando fórmula de la tabla
+                # v = (0.397·D^(2/3) / n) · (1 - 360·sin(θ°)/(2π·θ°))^(2/3) · S^(1/2)
+                factor_velocidad = (1.0 - (360.0 * sin_theta) / (2.0 * np.pi * angulo_deg)) ** (2.0 / 3.0)
+                v = (0.397 * D ** (2.0 / 3.0) / Rug_sec) * factor_velocidad * np.sqrt(S_sec)
+
+                # Calcular calado real
+                h = D * h_D_array
+
+                # Asignar a arrays de salida
+                Q_max[seccion_index] = Q
+                v_max[seccion_index] = v
+                h_max[seccion_index] = h
+
+
+            elif seccion in ["rectangular", "rectangular_abierta"]:
+                base = dimensiones[:, 0][seccion_index]
+                altura_max = dimensiones[:, 1][seccion_index]
+
+                # Calado objetivo
+                h = h_D_objetivo * altura_max
+
+                # Área mojada
+                area = base * h
+
+                # Perímetro mojado
+                if seccion == "rectangular_abierta":
+                    perimetro = base + 2 * h
+                else:
+                    perimetro = base + 2 * h
+
+                # Radio hidráulico
+                R = area / perimetro
+
+                # Velocidad
+                v = (1.0 / Rug_sec) * (R ** (2.0 / 3.0)) * np.sqrt(S_sec)
+
+                # Caudal
+                Q = v * area * 1000.0
+
+                # Asignar
+                Q_max[seccion_index] = Q
+                v_max[seccion_index] = v
+                h_max[seccion_index] = h
+
+            elif seccion == "trapezoidal":
+                base = dimensiones[:, 0][seccion_index]
+                altura_max = dimensiones[:, 1][seccion_index]
+                talud_izq = dimensiones[:, 2][seccion_index]
+                talud_der = dimensiones[:, 3][seccion_index]
+
+                # Calado objetivo
+                h = h_D_objetivo * altura_max
+
+                # Área mojada
+                area = base * h + 0.5 * (talud_izq + talud_der) * h ** 2
+
+                # Perímetro mojado
+                perimetro = base + h * (np.sqrt(talud_izq ** 2 + 1) + np.sqrt(talud_der ** 2 + 1))
+
+                # Radio hidráulico
+                R = area / perimetro
+
+                # Velocidad
+                v = (1.0 / Rug_sec) * (R ** (2.0 / 3.0)) * np.sqrt(S_sec)
+
+                # Caudal
+                Q = v * area * 1000.0
+
+                # Asignar
+                Q_max[seccion_index] = Q
+                v_max[seccion_index] = v
+                h_max[seccion_index] = h
+
+
+            elif seccion == "triangular":
+                altura_max = dimensiones[:, 1][seccion_index]
+                talud_izq = dimensiones[:, 2][seccion_index]
+                talud_der = dimensiones[:, 3][seccion_index]
+
+                # Calado objetivo
+                h = h_D_objetivo * altura_max
+
+                # Área mojada
+                area = 0.5 * (talud_izq + talud_der) * h ** 2
+
+                # Perímetro mojado
+                perimetro = h * (np.sqrt(talud_izq ** 2 + 1) + np.sqrt(talud_der ** 2 + 1))
+
+                # Radio hidráulico
+                R = area / perimetro
+
+                # Velocidad
+                v = (1.0 / Rug_sec) * (R ** (2.0 / 3.0)) * np.sqrt(S_sec)
+
+                # Caudal
+                Q = v * area * 1000.0
+
+                # Asignar
+                Q_max[seccion_index] = Q
+                v_max[seccion_index] = v
+                h_max[seccion_index] = h
+
+            else:
+                # Tipo de sección no soportado
+                Q_max[seccion_index] = np.nan
+                v_max[seccion_index] = np.nan
+                h_max[seccion_index] = np.nan
+
+        return (
+            np.round(Q_max, 2),
+            np.round(v_max, 3),
+            np.round(h_max, 3),
+        )
+
+    def get_capacidad_maxima_ramales(self, m_ramales, h_D_objetivo=0.7, ramal_value=None):
+        """
+        Calcula la capacidad máxima para todos los ramales.
+        Sigue el patrón de get_SLL y get_SPLL del código original.
+
+        Args:
+            m_ramales (dict): Diccionario de ramales
+            h_D_objetivo (float): h/D objetivo
+            ramal_value (str, optional): Ramal específico a procesar
+
+        Returns:
+            dict: m_ramales actualizado con campos:
+                - Q_max_hD: Caudal máximo al h/D objetivo [L/s]
+                - V_max_hD: Velocidad al h/D objetivo [m/s]
+                - h_max_hD: Calado al h/D objetivo [m]
+                - ang_max_hD: Ángulo al h/D objetivo [°]
+        """
+
+        # Determinar ramales a procesar
+        if ramal_value:
+            lista_ramales = [ramal_value]
+        else:
+            lista_ramales = list(m_ramales.keys())
+
+        # Procesar cada ramal
+        for i in lista_ramales:
+            Q_max, V_max, h_max, ang_max = self.calcular_capacidad_maxima(
+                D_int=m_ramales[i]["D_int"],
+                S=m_ramales[i]["S"],
+                Rug=m_ramales[i]["Rug"],
+                Seccion=m_ramales[i]["Seccion"],
+                h_D_objetivo=h_D_objetivo
+            )
+
+            # Agregar resultados al diccionario
+            m_ramales[i]["Q_max_hD"] = Q_max
+            m_ramales[i]["V_max_hD"] = V_max
+            m_ramales[i]["h_max_hD"] = h_max
+            m_ramales[i]["ang_max_hD"] = ang_max
+
+        return m_ramales
+

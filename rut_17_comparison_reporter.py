@@ -1,372 +1,520 @@
-
 import os
 import sys
+import time
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from shapely.ops import unary_union
+from matplotlib.lines import Line2D
+from typing import List, Dict
 from pathlib import Path
-
-# swmm / pyswmm imports
-from pyswmm import Output
-from swmm.toolkit.shared_enum import NodeAttribute, LinkAttribute, SystemAttribute
-
-# Import time limit from config
-
+from line_profiler import profile
+import json
 import config
-PLOT_TIME_LIMIT_HOURS = config.PLOT_TIME_LIMIT_HOURS
-from config import TANK_MIN_UTILIZATION_PCT, TANK_VOLUME_ROUND_M3
+PLOT_TIME_LIMIT_HOURS = config.ITZI_SIMULATION_DURATION_HOURS
+from rut_27_model_metrics import SystemMetrics
 
 plt.style.use('ggplot')
 
-@dataclass
-class SystemMetrics:
-    """
-    Stores system-wide hydraulic metrics and detailed per-node data.
-    """
-    # Scalars (Totals / Averages)
-    total_flooding_volume: float = 0.0          # m3
-    flooding_cost: float = 0.0                  # $
-    flooded_nodes_count: int = 0
-    avg_node_depth: float = 0.0                 # m
-    avg_conduit_velocity: float = 0.0           # m/s
-    
-    # Detailed Data (NodeID -> Value)
-    node_depths: Dict[str, float] = field(default_factory=dict)
-    flooding_volumes: Dict[str, float] = field(default_factory=dict)
-    flooding_peak_rates: Dict[str, float] = field(default_factory=dict)  # Peak flooding rate (m³/s) per node
-    
-    # Time Series for Critical Nodes (NodeID -> {time: [], value: []})
-    flood_hydrographs: Dict[str, Dict[str, list]] = field(default_factory=dict)
-    
-    # SYSTEM-WIDE aggregated series (Time, Value)
-    system_flood_hydrograph: Dict[str, list] = field(default_factory=dict) # {'times': [], 'total_rate': []}
-    
-    # Time Series for Interest Links (LinkID -> {time: [], flow: []})
-    link_hydrographs: Dict[str, Dict[str, list]] = field(default_factory=dict)
-    
-    # Time Series for Link Capacity (LinkID -> {time: [], capacity: []})
-    link_capacities: Dict[str, Dict[str, list]] = field(default_factory=dict)
-    
-    # NEW: Metadata for full network capacity analysis (Avoided Costs)
-    # {LinkID: {'q_peak': float, 'q_full': float, 'length': float, 'geom1': float}}
-    link_capacity_data: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
-    # Arrays for distribution plots (Derived or stored for convenience)
-    conduit_velocities: np.ndarray = field(default_factory=lambda: np.array([]))
-    conduit_capacities: np.ndarray = field(default_factory=lambda: np.array([]))
-    
-    # Tank Utilization (TankID -> {max_depth, max_volume, designed_depth, designed_volume, utilization_pct})
-    tank_utilization: Dict[str, Dict[str, float]] = field(default_factory=dict)
-
-
-class MetricExtractor:
-    """
-    Extracts metrics from SWMM binary output (.out).
-    """
-    def __init__(self, flooding_cost_per_m3: float = 1250.0):
-        self.flooding_cost_per_m3 = flooding_cost_per_m3
-        
-
-    def extract(self, out_file_path: str, top_n_hydrographs: int = 3, target_links: List[str] = None, target_nodes: List[str] = None) -> SystemMetrics:
-        """
-        Parses output file and returns SystemMetrics.
-        Extracts hydrographs for the top N flooded nodes AND specific target links.
-        """
-        if not os.path.exists(out_file_path):
-            print(f"[MetricExtractor] Error: File not found {out_file_path}")
-            return SystemMetrics()
-            
-        import time
-        stats = os.stat(out_file_path)
-        print(f"[MetricExtractor] Reading: {out_file_path} (Size: {stats.st_size} bytes, Mod: {time.ctime(stats.st_mtime)})")
-        
-        metrics = SystemMetrics()
-        
-        # No Try-Except - Fail Hard
-        out_file_path = str(out_file_path)
-        
-        with Output(out_file_path) as out:
-            
-            # --- NEW: Extract full link capacity data for Deferred Invesment Calc ---
-            # We need Q_peak, Q_full, Length, Diameter for ALL links (or at least conduits)
-            link_cap_data = {}
-            
-            for link_item in out.links:
-                if isinstance(link_item, str):
-                    lid = link_item
-                    # Strict access: Expect out.links to be subscriptable
-                    link_obj = out.links[lid] 
-                else:
-                    lid = link_item.id
-                    link_obj = link_item
-                
-                # Strict series extraction - Q_peak (max flow)
-                q_series = out.link_series(lid, LinkAttribute.FLOW_RATE).values()
-                q_peak = max(list(q_series)) if q_series else 0.0
-                
-                # Capacity series (d/D) - this is what DeferredInvestmentCost uses
-                cap_series = out.link_series(lid, LinkAttribute.CAPACITY).values()
-                max_capacity = max(list(cap_series)) if cap_series else 0.0
-                    
-                # Static attributes via .out are unreliable/unavailable in some pyswmm versions.
-                # We will populate these in rut_16 from the INP/Model data.
-                q_full = 0.0
-                length = 0.0
-                geom1 = 0.0
-                
-                link_cap_data[lid] = {
-                    'q_peak': q_peak,
-                    'q_full': q_full,
-                    'length': length,
-                    'geom1': geom1,
-                    'max_capacity': max_capacity  # d/D ratio for surcharge check
-                }
-            
-            metrics.link_capacity_data = link_cap_data
-
-
-            # 1. System Scalars
-            # Note: PySWMM direct access to system stats might be limited, 
-            # so we aggregate from nodes/links or assume we parse .rpt file elsewhere.
-            # Here we aggregate from nodes:
-            
-            # Node Depths & Flooding
-            node_depths = {}
-            flood_vols = {}
-            
-            # System Aggregation Arrays (ONLY ORIGINAL NETWORK NODES)
-            system_flood_ts = None
-            system_times = None
-            
-            def is_original_node(nid):
-                """Check if node is part of original network (not tank or derivation)"""
-                # Tanks start with TK_
-                if nid.startswith('TK_'):
-                    return False
-                # Derivation nodes are format: 0.0, 0.1, 1.0, etc.
-                parts = nid.split('.')
-                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                    return False
-                return True
-            
-            # Calculate flooding and system aggregate for ORIGINAL NODES ONLY
-            for nid in out.nodes:
-                # Skip tank and derivation nodes
-                if not is_original_node(nid):
-                    continue
-                    
-                # Get Flooding Series (This is the key metric)
-                f_series = out.node_series(nid, NodeAttribute.FLOODING_LOSSES)
-                
-                if f_series:
-                    rates = list(f_series.values()) # cms
-                    times = list(f_series.keys())
-                    
-                    # --- SYSTEM AGGREGATION (only for original network nodes) ---
-                    if f_series:
-                        # Create pandas series for this node
-                        # Series index is datetime, values are rates
-                        ts_node = pd.Series(data=list(f_series.values()), index=list(f_series.keys()))
-                        
-                        # Calculate max rate for volume check
-                        max_rate = ts_node.max() if not ts_node.empty else 0.0
-                        
-                        if system_flood_ts is None:
-                            system_flood_ts = ts_node
-                        else:
-                            # Sum with alignment (fill_value=0 ensures we don't lose data if times differ)
-                            system_flood_ts = system_flood_ts.add(ts_node, fill_value=0)
-                    
-                    # Only compute volume if there's actual flooding
-                    if max_rate > 0.001: # Significant flooding threshold
-                        # Vol Calc
-                        vol = 0.0
-                        if len(times) > 1:
-                            for i in range(1, len(times)):
-                                dt = (times[i] - times[i-1]).total_seconds()
-                                vol += rates[i-1] * dt
-                                
-                        if vol > 0.1:
-                            flood_vols[nid] = vol
-                            metrics.flooding_peak_rates[nid] = max_rate  
-                            
-                            # Only get depth for flooded nodes (OPTIMIZATION)
-                            d_vals = list(out.node_series(nid, NodeAttribute.INVERT_DEPTH).values())
-                            if d_vals:
-                                node_depths[nid] = max(d_vals)
-            
-            # Store System Hydrograph (already filtered - only original network nodes)
-            if system_flood_ts is not None:
-                # Sort index just in case
-                system_flood_ts = system_flood_ts.sort_index()
-                
-                system_times = system_flood_ts.index.tolist()
-                system_rates = system_flood_ts.values.tolist()
-                
-                metrics.system_flood_hydrograph = {
-                    'times': system_times,
-                    'total_rate': system_rates
-                }
-                
-                # Calculate total volume from summed filtered hydrograph
-                # This ensures consistency between the plot and the reported number
-                total_vol = 0.0
-                if len(system_times) > 1:
-                    # Use trapezoidal integration or simply step integration strictly consistent with rates
-                    # Using simple retangular (rate * dt) as typically SWMM reports average rate for step or similar
-                    for i in range(1, len(system_times)):
-                        dt = (system_times[i] - system_times[i-1]).total_seconds()
-                        # Use rate at t-1
-                        total_vol += system_rates[i-1] * dt
-                
-                metrics.total_flooding_volume = total_vol
-            else:
-                 metrics.total_flooding_volume = 0.0
-            
-            # Node-level data for detailed analysis 
-            metrics.node_depths = node_depths
-            metrics.flooding_volumes = flood_vols
-            metrics.flooded_nodes_count = len(flood_vols)
-            
-            # Cost calc
-            metrics.flooding_cost = metrics.total_flooding_volume * self.flooding_cost_per_m3
-            
-            if node_depths:
-                metrics.avg_node_depth = np.mean(list(node_depths.values()))
-            
-            # 2. Extract Hydrographs for Critical Nodes + Target Nodes
-            # Sort flooding volumes desc
-            sorted_flood = sorted(flood_vols.items(), key=lambda x: x[1], reverse=True)
-            top_nodes = [x[0] for x in sorted_flood[:top_n_hydrographs]]
-            
-            nodes_to_extract = set(top_nodes)
-            if target_nodes:
-                nodes_to_extract.update(target_nodes)
-            
-            for nid in nodes_to_extract:
-                try:
-                    # Get depth hydrograph (Depth vs Time)
-                    # We could also get Flowing Losses vs Time
-                    depth_series = out.node_series(nid, NodeAttribute.INVERT_DEPTH)
-                    # Convert datetimes to relative hours or similar? Keep as is for now.
-                    times = list(depth_series.keys())
-                    vals = list(depth_series.values())
-                    
-                    # Store as simple list of tuples or separate arrays
-                    # Let's simple lists of timestamps and values
-                    metrics.flood_hydrographs[nid] = {
-                        'times': times,
-                        'depths': vals,
-                        'flood_vol': flood_vols.get(nid, 0.0),
-                        'flood_rate': list(out.node_series(nid, NodeAttribute.FLOODING_LOSSES).values())
-                    }
-                except Exception as e:
-                     print(f"[MetricExtractor] Warning: Could not extract hydrograph for node {nid}: {e}")
-
-            # 3. Links Analysis (Velocity and Capacity)
-            velocities = []
-            capacities = []
-            
-            for lid in out.links:
-                 # Velocity data
-                 v_vals = list(out.link_series(lid, LinkAttribute.FLOW_VELOCITY).values())
-                 if v_vals:
-                     velocities.append(max(v_vals))
-                 
-                 # Capacity data (d/D)
-                 c_vals = list(out.link_series(lid, LinkAttribute.CAPACITY).values())
-                 if c_vals:
-                     capacities.append(max(c_vals))
-                     
-            metrics.conduit_velocities = np.array(velocities)
-            metrics.conduit_capacities = np.array(capacities)
-            
-            if velocities:
-                metrics.avg_conduit_velocity = np.mean(velocities)
-                
-            # 4. Extract Hydrographs for Target Links
-            if target_links:
-                 for lid in target_links:
-                     try:
-                         # Get Flow and Velocity
-                         link_flow = list(out.link_series(lid, LinkAttribute.FLOW_RATE).values())
-                         link_depth = list(out.link_series(lid, LinkAttribute.FLOW_DEPTH).values())
-                         times = list(out.link_series(lid, LinkAttribute.FLOW_RATE).keys())
-                         
-                         metrics.link_hydrographs[lid] = {
-                             'times': times,
-                             'flow': link_flow,
-                             'depth': link_depth
-                         }
-                         
-                         # Capacity (Fraction Full or similar)
-                         cap_series = list(out.link_series(lid, LinkAttribute.CAPACITY).values())
-                         metrics.link_capacities[lid] = {
-                             'times': times,
-                             'capacity': cap_series
-                         }
-                     except Exception as e:
-                         print(f"[MetricExtractor] Warning: Could not extract hydrograph for link {lid}: {e}")
-
-            # 5. EXTRACT TANK UTILIZATION (New Logic)
-            # Look for all nodes starting with TK_
-            for nid in out.nodes:
-                if nid.startswith("TK_"):
-                    try:
-                        # Get full depth series for tank
-                        depth_series_raw = out.node_series(nid, NodeAttribute.INVERT_DEPTH)
-                        times = list(depth_series_raw.keys())
-                        depths = list(depth_series_raw.values())
-                        max_depth = max(depths) if depths else 0.0
-                        
-                        metrics.tank_utilization[nid] = {
-                            'max_depth': max_depth,
-                            'max_volume': 0.0,
-                            'depth_series': depths,
-                            'times': times
-                        }
-                    except Exception as e:
-                        print(f"[MetricExtractor] Warning: Error processing tank {nid}: {e}")
-
-
-            return metrics
-        # (End of with Output block)
-        return metrics
 
 class ScenarioComparator:
     """
     Compares two SystemMetrics (Baseline vs Solution) and generates reports/plots.
     """
-    def __init__(self, baseline_metrics: SystemMetrics):
+    def __init__(self, baseline_metrics: SystemMetrics, baseline_inp_path: str = None):
         self.baseline = baseline_metrics
+        self.baseline_inp_path = baseline_inp_path
+        self._predios_gdf_cache = None  # Cache for lazy loading
         
-    def generate_comparison_plots(self, solution: SystemMetrics, solution_name: str, save_dir: Path, 
-                                  nodes_gdf: gpd.GeoDataFrame, inp_path: str, derivations: List,
-                                  annotations_data: List[Dict], detailed_links: Dict, designed_gdf: gpd.GeoDataFrame = None,
-                                  tank_details: List[Dict] = None):
+    @profile
+    def generate_comparison_plots(self,
+                                  solution: SystemMetrics,
+                                  solution_name: str,
+                                  save_dir: Path,
+                                  nodes_gdf: gpd.GeoDataFrame,
+                                  derivations: gpd.GeoDataFrame = None,
+                                  detailed_links: Dict=None,
+                                  tank_details: List[Dict] = None,
+                                  show_predios: bool = False,
+                                  ):
+
         """Generates all comparison plots for a given solution."""
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # 1. Combined Map (Spatial + Scatter + Hydro + Hists + Tank Table)
-        self.generate_combined_map(solution, solution_name, save_dir, nodes_gdf, inp_path, derivations, annotations_data, detailed_links, tank_details)
+        self.generate_combined_map(solution=solution,
+                                   save_dir=save_dir,
+                                   nodes_gdf=nodes_gdf,
+                                   derivations=derivations,
+                                   tank_details=tank_details,
+                                   show_predios=show_predios)
         
+
+
+        # 1.1 Capacity Comparison Maps (Baseline, Solution, Delta) - Single 2x2 figure
+        self.generate_capacity_comparison_maps(solution,
+                                               solution_name,
+                                               save_dir,
+                                               nodes_gdf=nodes_gdf,
+                                               derivations=derivations,
+                                               tank_details=tank_details,
+                                               show_predios=show_predios)
+
+
+        # 1.2 Velocity Comparison Maps (Baseline, Solution, Delta) - Single 2x2 figure
+        self.generate_velocity_comparison_maps(solution,
+                                               solution_name,
+                                               save_dir,
+                                               nodes_gdf=nodes_gdf,
+                                               show_predios=show_predios,
+                                               derivations=derivations,
+                                               tank_details=tank_details)
+
+
         # 2. Hydrographs (3x3 grid)
-        if detailed_links:
+        if len(detailed_links) > 0:
             self.generate_hydrograph_pages(solution, solution_name, save_dir, detailed_links)
             # 2.1 Tank Hydrographs (Specific Inflow/Weir plots)
             self.generate_tank_hydrograph_plots(solution, solution_name, save_dir, detailed_links)
-            
-        # 3. Longitudinal Profiles (3 per page)
-        if designed_gdf is not None:
-             self.generate_profile_plots(solution, solution_name, save_dir, designed_gdf)
-        
+
+        # # # 3. Longitudinal Profiles (3 per page)
+        # if designed_gdf is not None:
+        #      self.generate_profile_plots(solution, solution_name, save_dir, designed_gdf)
+
         # 4. Unified Statistical Dashboard (Depth, Flooding, Capacity)
         self.generate_unified_statistical_dashboard(solution, solution_name, save_dir)
+        
+
+
+#-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+    @profile
+    def generate_combined_map(self,
+                              solution: SystemMetrics,
+                              save_dir: Path,
+                              nodes_gdf: gpd.GeoDataFrame,
+                              derivations: gpd.GeoDataFrame,
+                              tank_details: List[Dict] = None,
+                              show_predios: bool = False):
+
+        """
+        Dashboard Layout:
+        ┌─────────┬──────────────────────┬─────────────────────────┐
+        │  Table  │        Map           │  Scatter  │ Cumulative  │
+        │         │                      ├───────────┼─────────────┤
+        │         │                      │  Hydro    │  Histogram  │
+        └─────────┴──────────────────────┴─────────────────────────┘
+        """
+        fig = plt.figure(figsize=(22, 9))
+        # Grid: 2 rows, 4 cols - Table | Map | 4 plots in 2x2 (last 2 columns)
+        gs = fig.add_gridspec(2, 4, width_ratios=[0.6, 2.0, 0.8, 0.8])
+
+        # === LEFT: TANK TABLE (col 0, rows 0-1) ===
+        ax_table = fig.add_subplot(gs[:, 0])
+        ax_table.axis('off')
+        ax_table.set_title('Tank Details', fontsize=12, fontweight='bold', pad=5)
+
+        # Build table data - compact format
+        # L in km, Vol = actual volume rounded, Util% with warning color if low
+        table_headers = ['#', 'Predio', 'Q\n[m³/s]', 'L\n[km]', 'D\n[m]', 'Volume\n[m³]', '%Predio\n[ha]']
+        table_data = []
+        tank_positions = {}  # To store positions for map labels
+        low_util_rows = []  # Track rows with low utilization
+
+        # Get config values
+        if tank_details:
+            for i, tank in enumerate(tank_details):
+                # Support both dataclass (CandidatePair) and dict access
+                def get_val(obj, key, default):
+                    if hasattr(obj, key):
+                        return getattr(obj, key, default)
+                    elif hasattr(obj, 'get'):
+                        return obj.get(key, default)
+                    return default
+                
+                node_id = get_val(tank, 'node_id', '?')
+                q_derivacion = get_val(tank, 'total_flow', 0)
+                longitud_km = get_val(tank, 'pipeline_length', 0) / 1000  # From designed_gdf if available
+                diametro = get_val(tank, 'diameter', 'N/A')  # From designed_gdf if available
+                vol_used = get_val(tank, 'tank_volume_simulation', 0)
+                vol_design = get_val(tank, 'total_volume', 0)
+                util_pct = vol_used / vol_design if vol_design > 0 else 0.0
+                predio_id = get_val(tank, 'predio_id', '')
+                # Calculate used_area from volume and config
+                used_area = (vol_design / config.TANK_DEPTH_M) * config.TANK_OCCUPATION_FACTOR
+                percentage_used_area =  used_area / tank['predio_area'] if tank['predio_area'] > 0 else 0.0
+
+                # Round volume to configured increment
+                vol_rounded = round(vol_used / config.TANK_VOLUME_ROUND_M3) * config.TANK_VOLUME_ROUND_M3
+
+                # Track low utilization
+                if util_pct < config.TANK_MIN_UTILIZATION_PCT:
+                    low_util_rows.append(i)
+
+                table_data.append([
+                    str(i),
+                    predio_id,
+                    f"{q_derivacion:.1f}",
+                    f"{longitud_km:.2f}",
+                    f"{float(diametro):.2f}" if str(diametro).replace('.', '', 1).isdigit() else (
+                        f"{float(str(diametro).split('x')[0]):.2f}x{float(str(diametro).split('x')[1]):.2f}"
+                        if 'x' in str(diametro).lower() else str(diametro)[:9]
+                    ),
+                    f"{vol_rounded:,.0f}",
+                    f"{percentage_used_area:,.2f}",
+                ])
+                tank_positions[node_id] = i  # Map node to number
+
+        if table_data:
+            table = ax_table.table(cellText=table_data,
+                                   colLabels=table_headers,
+                                   loc='center',
+                                   cellLoc='center',
+                                   colWidths=[0.15, 0.20, 0.15, 0.15, 0.25, 0.20, 0.2])
+
+            table.auto_set_font_size(False)
+            table.set_fontsize(8)
+            table.scale(1.0, 1.6)
+
+            # Style header row
+            for j in range(len(table_headers)):
+                table[(0, j)].set_facecolor('#3498db')
+                table[(0, j)].set_text_props(color='white', fontweight='bold')
+
+        else:
+            ax_table.text(0.5, 0.5, 'No tank data\navailable', ha='center', va='center', fontsize=11, color='gray', transform=ax_table.transAxes)
+
+        # === spatial map (col 1, rows 0-1) ===
+        ax_map = fig.add_subplot(gs[:, 1])
+        self._plot_spatial_diff(ax_map, nodes_gdf, self.baseline.node_data, solution.node_data, derivations, show_predios=show_predios)
+
+        # Add numbered labels and derivation lines on map (Dashboard style)
+        self._plot_derivations_and_labels(ax_map, derivations, tank_details)
+
+        # === RIGHT: 2x2 PLOTS (cols 2-3) ===
+        # Row 0, Col 2: Scatter Plot
+        ax_scatter = fig.add_subplot(gs[0, 2])
+        self._plot_volume_scatter(ax_scatter, self.baseline.node_data, solution.node_data)
+
+        # Row 0, Col 3: Cumulative Volume
+        ax_cumulative = fig.add_subplot(gs[0, 3])
+        self._plot_cumulative_volume(ax_cumulative, self.baseline, solution)
+
+        # Row 1, Col 2: System Flooding Hydrograph
+        ax_flood = fig.add_subplot(gs[1, 2])
+        self._plot_system_flood_hydrograph(ax_flood, self.baseline, solution)
+
+        # Row 1, Col 3: Flood Volume Histogram
+        ax_hist_vol = fig.add_subplot(gs[1, 3])
+        base_vols = list(self.baseline.system_flood_hydrograph['total_rate'])
+        sol_vols = list(solution.system_flood_hydrograph['total_rate'])
+        self._plot_hist(ax_hist_vol, base_vols, sol_vols, "Flood Vol (m³)")
+
+        plt.tight_layout()
+        plt.savefig(save_dir / "00_dashboard_map.png", dpi=100)
+        plt.close(fig)
+
+    @profile
+    def _plot_spatial_diff(self, ax, nodes_gdf: gpd.GeoDataFrame, base_vols: Dict, sol_vols: Dict, derivations: gpd.GeoDataFrame, show_predios: bool = False):
+        """
+        Maps delta flooding + Background Network + New Derivations - Vectorized.
+        """
+
+        # 0. Optional Predios Background (Lazy loaded)
+        if show_predios:
+            predios_gdf = self._get_predios_gdf()
+            if predios_gdf is not None and not predios_gdf.empty:
+                predios_gdf.plot(ax=ax, color='#f5f5f5', edgecolor='#e0e0e0', linewidth=0.1, zorder=0)
+
+        # 1. Background Network
+        net_gdf = self.baseline.swmm_gdf.copy()
+        net_gdf.plot(ax=ax, color='#222222', linewidth=1.2, alpha=0.6, zorder=1)
+
+        if not derivations.empty:
+            derivations.plot(ax=ax, color='blue', linewidth=2.5, alpha=0.8, zorder=5)
+
+        # 3. Nodes (Colored by Delta) - Vectorized
+        base_df = pd.DataFrame.from_dict(base_vols, orient='index')[['flooding_volume']]
+        sol_df = pd.DataFrame.from_dict(sol_vols, orient='index')[['flooding_volume']]
+
+        gdf = nodes_gdf.copy()
+        gdf['NodeID_s'] = gdf['node_id'].astype(str)
+
+        # Merge metrics
+        gdf = gdf.merge(base_df, left_on='NodeID_s', right_index=True, how='left')
+        gdf = gdf.merge(sol_df, left_on='NodeID_s', right_index=True, how='left')
+
+        gdf['v_base'] = gdf['flooding_volume_x'].fillna(0)
+        gdf['v_sol'] = gdf['flooding_volume_y'].fillna(0)
+        gdf['delta'] = gdf['v_base'] - gdf['v_sol']
+
+        # Vectorized color logic
+        gdf['color'] = '#444444'  # Dark gray for insignficant change
+        gdf.loc[gdf['delta'] > 1.0, 'color'] = 'green'
+        gdf.loc[gdf['delta'] < -1.0, 'color'] = 'red'
+
+        # Vectorized size logic
+        gdf['markersize'] = 5
+        gdf.loc[gdf['delta'] > 1.0, 'markersize'] = 15 + gdf['delta'].clip(0, 100) * 0.5
+        # Note: delta < -1.0 means sol > base (worsened)
+        gdf.loc[gdf['delta'] < -1.0, 'markersize'] = 30 + gdf['delta'].abs().clip(0, 100) * 0.5
+
+        # Plot nodes layer
+        gdf.plot(ax=ax, color=gdf['color'], markersize=gdf['markersize'], alpha=0.7, zorder=2)
+
+        # Set limits based on Network + Derivations (ignoring huge predios background)
+        bounds_geoms = []
+        if net_gdf is not None and not net_gdf.empty:
+            bounds_geoms.append(net_gdf.unary_union)
+        elif nodes_gdf is not None and not nodes_gdf.empty:  # Fallback to filtered nodes if no net
+            bounds_geoms.append(nodes_gdf.unary_union)
+
+        geoms = list(derivations.geometry) if hasattr(derivations, "geometry") else list(derivations)
+        bounds_geoms.extend(geoms)
+
+        # Calculate the total bounding box of the network + new derivations
+        unified = unary_union(bounds_geoms)
+        minx, miny, maxx, maxy = unified.bounds
+
+        margin = 50  # meters margin
+        ax.set_xlim(minx - margin, maxx + margin)  # Now properly setting X limits
+        ax.set_ylim(miny - margin, maxy + margin)
+        ax.set_aspect('equal')
+
+        ax.set_title("Spatial Flooding Delta (Green=Improved, Red=Worsened)")
+        ax.set_axis_off()
+
+    @staticmethod
+    def get_cumulative(ax, metrics_obj, color, label):
+        data = getattr(metrics_obj, "system_flood_hydrograph", None)
+        if not data or "total_rate" not in data or "times" not in data:
+            return None, None
+
+        rates = np.asarray(data["total_rate"], dtype=float)  # m³/s
+        times = np.asarray(data["times"])
+
+        if len(times) < 2 or len(rates) < 2:
+            return None, None
+
+        # Convert times -> hours since start, and dt seconds between samples
+        t0 = times[0]
+
+        if isinstance(t0, pd.Timestamp):
+            t_idx = pd.to_datetime(times)
+            hrs = ((t_idx - t_idx[0]).total_seconds().to_numpy()) / 3600.0
+            dt_secs = t_idx.to_series().diff().dt.total_seconds().fillna(0.0).to_numpy()
+        else:
+            # numpy datetime64 (or anything convertible to it)
+            t64 = times.astype("datetime64[ns]")
+            diffs_sec = (t64 - t64[0]).astype("timedelta64[s]").astype(float)
+            hrs = diffs_sec / 3600.0
+            dt_secs = np.empty_like(diffs_sec)
+            dt_secs[0] = 0.0
+            dt_secs[1:] = np.diff(diffs_sec)
+
+        # Rectangular integration using previous sample rate:
+        # volume[i] = volume[i-1] + rates[i-1] * dt[i]
+        cumulative = np.zeros(len(rates), dtype=float)
+        cumulative[1:] = np.cumsum(rates[:-1] * dt_secs[1:])
+
+        ax.plot(
+            hrs,
+            cumulative,
+            linestyle="-" if "Solution" in label else "--",
+            color=color,
+            alpha=0.8,
+            linewidth=2,
+            label=label,
+        )
+
+        # Final value annotation
+        final_vol = cumulative[-1]
+        ax.annotate(
+            f"{final_vol:,.0f} m³",
+            xy=(hrs[-1], final_vol),
+            xytext=(-50, 5),
+            textcoords="offset points",
+            color=color,
+            fontsize=9,
+            fontweight="bold",
+        )
+
+        return hrs, cumulative
+
+    def _plot_cumulative_volume(self, ax, baseline, solution):
+        """Plots cumulative flooding volume over time (integral of rate)."""
+
+        hrs_b, cum_b = self.get_cumulative(ax, baseline, "red", "Baseline Cumulative")
+        hrs_s, cum_s = self.get_cumulative(ax, solution, "blue", "Solution Cumulative")
+
+        ax.set_title("Cumulative Flooding Volume Over Time")
+        ax.set_ylabel("Cumulative Volume (m³)")
+        ax.set_xlabel("Time (hours)")
+        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
+        ax.legend(loc="upper left")
+        ax.grid(True, alpha=0.3)
+
+        if cum_b is not None and cum_s is not None and cum_b[-1] > 0:
+            reduction = cum_b[-1] - cum_s[-1]
+            pct = (reduction / cum_b[-1]) * 100.0
+            ax.text(
+                0.98,
+                0.05,
+                f"Reduction: {reduction:,.0f} m³ ({pct:.1f}%)",
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment="bottom",
+                horizontalalignment="right",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.9),
+            )
+
+    @staticmethod
+    def plot_series(ax, metrics_obj, color, label):
+            data = metrics_obj.system_flood_hydrograph
+                
+            y = np.array(data['total_rate'])
+            times = np.array(data['times'])
+            
+            # Vectorized time conversion
+            hrs = np.array([])
+            if len(times) > 0:
+                t0 = times[0]
+                if isinstance(t0, (pd.Timestamp, pd.DatetimeIndex)) or hasattr(t0, 'total_seconds'):
+                    # Handle both pandas/datetime objects
+                    hrs = np.array([(t - t0).total_seconds() / 3600.0 for t in times])
+                elif isinstance(t0, np.datetime64):
+                    # Fast numpy datetime64 conversion
+                    hrs = (times - t0).astype('timedelta64[s]').astype(float) / 3600.0
+                else:
+                    # Fallback if already numeric
+                    hrs = np.array(times)
+
+            ax.plot(hrs, y, linestyle='-' if label=='Solution' else '--', color=color, alpha=0.8, label=label)
+            
+            # Peak Label
+            if len(y) > 0:
+                ymax = np.max(y)
+                if ymax > 0:
+                    idx = np.argmax(y)
+                    ax.annotate(f'{ymax:.2f}', xy=(hrs[idx], ymax), xytext=(0, 5),
+                                textcoords="offset points", color=color, fontsize=9, fontweight='bold')
+            return hrs, y
+    
+    def _plot_system_flood_hydrograph(self, ax, baseline, solution):
+        """Sums up flooding rates (cms) for extracted nodes to show system stress."""
+        
+
+
+        # Plot
+        t_b, y_b = self.plot_series(ax, baseline, 'red', 'Baseline Total Flood Rate')
+        t_s, y_s = self.plot_series(ax, solution, 'blue', 'Solution Total Flood Rate')
+
+        ax.set_title("Total System Flooding Rate (All Nodes)")
+        ax.set_ylabel("Flooding Rate (cms)")
+        ax.set_xlabel("Time (hours)")
+        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+
+        # Explicit Difference Verification for User
+        if y_b is not None and y_s is not None:
+             # Use PRE-CALCULATED volumes from metrics to ensure consistency with report
+             vol_b_reported = baseline.total_flooding_volume
+             vol_s_reported = solution.total_flooding_volume
+             
+             # Also calculate INTEGRATED volume from the plot data to check for consistency
+             # Assuming x_b is in hours, convert to seconds
+             # Simple trapz integration
+             try:
+                 # Convert hours to seconds
+                 t_sec = np.array(t_b) * 3600.0
+                 vol_b_integ = np.trapz(y_b, t_sec)
+                 
+                 t_sec_s = np.array(t_s) * 3600.0
+                 vol_s_integ = np.trapz(y_s, t_sec_s)
+             except:
+                 vol_b_integ = 0
+                 vol_s_integ = 0
+             
+             vol_diff = vol_b_reported - vol_s_reported # Reduction
+             
+             # Print STATS on the plot (Showing match/mismatch)
+             stats_text = (f"SWMM Vol Base: {vol_b_reported:,.0f} m3\n"
+                           f"Plot Vol Base: {vol_b_integ:,.0f} m3\n"
+                           f"----------------\n"
+                           f"SWMM Vol Sol:  {vol_s_reported:,.0f} m3\n"
+                           f"Plot Vol Sol:  {vol_s_integ:,.0f} m3\n"
+                           f"----------------\n"
+                           f"Reduc (SWMM): {vol_diff:,.0f} m3")
+             
+             ax.text(0.98, 0.95, stats_text, transform=ax.transAxes,
+                     fontsize=9, verticalalignment='top', horizontalalignment='right',
+                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec='black', alpha=0.9))
+
+    @staticmethod
+    def _plot_hist(ax, data_base, data_sol, xlabel):
+        if not data_base and not data_sol: return
+        # Use KDE lines with transparent fill
+        if data_base:
+            sns.kdeplot(data_base, ax=ax, color='red', linewidth=2, label='Baseline', fill=True, alpha=0.15)
+        if data_sol:
+            sns.kdeplot(data_sol, ax=ax, color='blue', linewidth=2, label='Solution', fill=True, alpha=0.15)
+        ax.set_xlabel(xlabel)
+        ax.legend()
+        ax.set_title(f"Distribution: {xlabel}")
+
+    @staticmethod
+    def _plot_derivations_and_labels(ax, derivations, tank_details=None):
+        """Helper to plot blue derivation lines and numbered labels (Dashboard style)."""
+        # 1. Blue Lines (Vectorized)
+        derivations.plot(ax=ax, color='blue', linewidth=2.5, alpha=0.9, zorder=5)
+
+        # 2. Numbered Labels & Predio Labels
+        for r_id, df in derivations.groupby('Ramal'):
+            row = df.iloc[0]
+            target_node_metadata = json.loads(row.get('Obs', '').split('|')[1])
+            target_type =  target_node_metadata['target_type']
+
+            # First point (Diversion Node)
+            start_pt = np.array(df.geometry.iloc[0].xy).T[0]
+
+            # Plot Ramal ID (Blue Circle)
+            ax.annotate(str(r_id), xy=start_pt,
+                        fontsize=10, fontweight='bold', color='white',
+                        ha='center', va='center',
+                        bbox=dict(boxstyle='circle,pad=0.2',
+                                  facecolor='blue',
+                                  edgecolor='white',
+                                  linewidth=0.5,
+                                  alpha=1.0),
+                        zorder=10)
+            
+            # Plot Predio '0' (Black Circle) - only if it's a tank
+            if target_type == 'tank':
+                # Last point of the last segment in this ramal
+                end_pt = np.array(df.geometry.iloc[-1].xy).T[-1]
+                ax.annotate('t', xy=end_pt,
+                            fontsize=8, fontweight='bold', color='white',
+                            ha='center', va='center',
+                            bbox=dict(boxstyle='circle,pad=0.2',
+                                      facecolor='black',
+                                      edgecolor='black',
+                                      linewidth=0.25,
+                                      alpha=1.0),
+                            zorder=10)
+            else:
+                # print(f"  [Plot-Debug] Ramal {r_id}: Skipping '0' label (is a node connection)")
+                pass
+
+
+
+
+#-----------------------------------------------------------------------------------------------------------------------------------------------------------------
 
     def generate_profile_plots(self, metrics: SystemMetrics, sol_name: str, save_dir: Path, designed_gdf: gpd.GeoDataFrame):
         """Generates SWMM-style hydraulic longitudinal profiles for the new derivations."""
@@ -423,7 +571,7 @@ class ScenarioComparator:
                     d = 0.3  # Default
                     if hasattr(row, 'D_int') and not pd.isna(row.D_int):
                         try:
-                            d = float(row.D_int)
+                            d = row.D_ext
                         except:
                             d = 0.3
                     
@@ -496,7 +644,7 @@ class ScenarioComparator:
                     d = diameters[p_idx]
                     
                     n_start = node_labels[p_idx]
-                    depth = metrics.node_depths.get(n_start, d * 0.7)  # Default 70% fill
+                    depth = metrics.node_data.get(n_start, {}).get('max_depth', d * 0.7)  # Default 70% fill
                     hgl_y.append(z_bot + min(depth, d))  # Cap at crown
                     
                     # Annotate Start Invert
@@ -509,7 +657,7 @@ class ScenarioComparator:
                     z_bot = z_invert_end[-1]
                     d = diameters[-1]
                     n_end = node_labels[-1]
-                    depth = metrics.node_depths.get(n_end, d * 0.7)
+                    depth = metrics.node_data.get(n_end, {}).get('max_depth', d * 0.7)
                     hgl_y.append(z_bot + min(depth, d))
                     # Annotate End Invert
                     invert_annotations.append((x_positions[-1], z_bot, f"HF:{z_bot:.2f}", 'HF'))
@@ -562,31 +710,37 @@ class ScenarioComparator:
             plt.savefig(out_path, dpi=150, facecolor='white')
             plt.close(fig)
             print(f"  Saved: {out_path}")
+    
     def generate_unified_statistical_dashboard(self, solution: SystemMetrics, solution_name: str, save_dir: Path):
         """Generates dashboard_statistical_combined.png: 4x2 layout with all stats."""
         fig = plt.figure(figsize=(16, 20)) # Taller figure for 4 rows
         gs = fig.add_gridspec(4, 2)
         
         # Prepare Data
-        base_depths = list(self.baseline.node_depths.values())
-        sol_depths = list(solution.node_depths.values())
+        base_depths = self.base_depths = [__['max_depth'] for _, __ in self.baseline.node_data.items()]
+        sol_depths = self.sol_depths = [__['max_depth'] for _, __ in solution.node_data.items()]
         
-        base_vols = list(self.baseline.flooding_volumes.values())
-        sol_vols = list(solution.flooding_volumes.values())
+        base_vols = self.base_vols = [__['flooding_volume'] for _, __ in self.baseline.node_data.items()]
+        sol_vols = self.sol_vols =  [__['flooding_volume'] for _, __ in solution.node_data.items()]
         
-        base_caps = list(self.baseline.conduit_capacities) if len(self.baseline.conduit_capacities) > 0 else []
-        sol_caps = list(solution.conduit_capacities) if len(solution.conduit_capacities) > 0 else []
+        base_caps = self.base_caps = [__['max_capacity'] for _, __ in self.baseline.link_data.items()]
+        sol_caps = self.sol_caps = [__['max_capacity'] for _, __ in solution.link_data.items()]
         
-        # Row 1: Scalars (Left) | Velocity ECDF (Right)
+        base_velocity = self.base_velocity = [__['max_velocity'] for _, __ in self.baseline.link_data.items()]
+        sol_velocity = self.sol_velocity = [__['max_velocity'] for _, __ in solution.link_data.items()]
+        
+        
+        # Row 1: Scalars (Left) | Absolute Comparison (Right)
         ax_scalar = fig.add_subplot(gs[0, 0])
-        self._plot_scalar_comparison(ax_scalar, solution, solution_name)
+        self._plot_scalar_comparison(ax_scalar, solution, solution_name) #ok
         
-        ax_vel = fig.add_subplot(gs[0, 1])
-        self._plot_ecdf(ax_vel, self.baseline.conduit_velocities, solution.conduit_velocities, "Max Pipe Vel (m/s)", "CDF")
+        ax_abs = fig.add_subplot(gs[0, 1])
+        self._plot_absolute_summary(ax_abs, solution, solution_name) 
+
         
         # Row 2: Node Depths (Hist | ECDF)
         ax_depth_hist = fig.add_subplot(gs[1, 0])
-        self._plot_hist(ax_depth_hist, base_depths, sol_depths, "Node Max Depths (m)")
+        self._plot_hist(ax_depth_hist, base_depths, sol_depths, "Node Max Depths (m)")#ok
         
         ax_depth_ecdf = fig.add_subplot(gs[1, 1])
         self._plot_ecdf(ax_depth_ecdf, base_depths, sol_depths, "Node Max Depths (m)", "CDF")
@@ -603,511 +757,23 @@ class ScenarioComparator:
         self._plot_hist(ax_cap_hist, base_caps, sol_caps, "Max Capacity (d/D)")
         
         ax_cap_ecdf = fig.add_subplot(gs[3, 1])
-        self._plot_ecdf(ax_cap_ecdf, base_caps, sol_caps, "Max Capacity (d/D)", "CDF")
+        self._plot_ecdf(ax_cap_ecdf, base_caps, sol_caps, "Max Capacity (h/D)", "CDF")
         
         fig.suptitle(f"Unified Statistical Analysis: {solution_name}", fontsize=18, y=0.99)
         plt.tight_layout(rect=[0, 0.02, 1, 0.98])
-        plt.savefig(save_dir / "dashboard_statistical_combined.png", dpi=100)
+        plt.savefig(save_dir / "05_dashboard_statistical_combined.png", dpi=100)
         plt.close(fig)
         print("  [Stats] Saved dashboard_statistical_combined.png")
 
 
-    
-    def generate_combined_map(self, solution: SystemMetrics, solution_name: str, save_dir: Path, 
-                              nodes_gdf: gpd.GeoDataFrame, inp_path: str, derivations: List,
-                              annotations_data: List[Dict] = None,
-                              detailed_links: Dict = None,
-                              tank_details: List[Dict] = None):
-        """
-        Dashboard Layout:
-        ┌─────────┬──────────────────────┬─────────────────────────┐
-        │  Table  │        Map           │  Scatter  │ Cumulative  │
-        │         │                      ├───────────┼─────────────┤
-        │         │                      │  Hydro    │  Histogram  │
-        └─────────┴──────────────────────┴───────────────────────────┘
-        """
-        fig = plt.figure(figsize=(22, 9))
-        # Grid: 2 rows, 4 cols - Table | Map | 4 plots in 2x2 (last 2 columns)
-        gs = fig.add_gridspec(2, 4, width_ratios=[0.7, 1.8, 1, 1])
-        
-        # === LEFT: TANK TABLE (col 0, rows 0-1) ===
-        ax_table = fig.add_subplot(gs[:, 0])
-        ax_table.axis('off')
-        ax_table.set_title('Tank Details', fontsize=12, fontweight='bold', pad=5)
-        
-        # Build table data - compact format
-        # L in km, Vol = actual volume rounded, Util% with warning color if low
-        table_headers = ['#', 'Node', 'Q\n(m³/s)', 'L\n(km)', 'D', 'Vol\n(m³)']
-        table_data = []
-        tank_positions = {}  # To store positions for map labels
-        low_util_rows = []   # Track rows with low utilization
-        
-        # Get config values
 
-        if tank_details:
-            for i, tank in enumerate(tank_details[:12], 1):  # Limit to 12 rows
-                node_id = tank.get('NodeID', '?')
-                q_derivacion = tank.get('FloodingFlow', 0)
-                longitud_km = tank.get('PipelineLength', 0) / 1000.0  # Convert to km
-                diametro = tank.get('Diameter', 'N/A')
-                vol_used = tank.get('StoredVolume', 0)
-                vol_design = tank.get('TankVolume', 0)
-                util_pct = vol_used / vol_design
 
-                
-                # Round volume to configured increment
-                vol_rounded = round(vol_used / TANK_VOLUME_ROUND_M3) * TANK_VOLUME_ROUND_M3
-                
-                # Track low utilization
-                if util_pct < TANK_MIN_UTILIZATION_PCT:
-                    low_util_rows.append(i)
-                
-                table_data.append([
-                    str(i),
-                    node_id[-7:] if len(node_id) > 7 else node_id,
-                    f"{q_derivacion:.1f}",
-                    f"{longitud_km:.2f}",
-                    str(diametro)[:9],  # Truncate diameter string
-                    f"{vol_rounded:,.0f}",
-                ])
-                tank_positions[node_id] = i  # Map node to number
-        
-        if table_data:
-            table = ax_table.table(cellText=table_data, colLabels=table_headers, 
-                                   loc='center', cellLoc='center',
-                                   colWidths=[0.15, 0.20, 0.15, 0.15, 0.25, 0.20])
-            table.auto_set_font_size(False)
-            table.set_fontsize(8)
-            table.scale(1.0, 1.6)
-            
-            # Style header row
-            for j in range(len(table_headers)):
-                table[(0, j)].set_facecolor('#3498db')
-                table[(0, j)].set_text_props(color='white', fontweight='bold')
-            
-            # Highlight low utilization rows in orange
-            for row_idx in low_util_rows:
-                for col_idx in range(len(table_headers)):
-                    table[(row_idx, col_idx)].set_facecolor('#ffebcc')  # Light orange
-        else:
-            ax_table.text(0.5, 0.5, 'No tank data\navailable', ha='center', va='center',
-                         fontsize=10, color='gray', transform=ax_table.transAxes)
-        
-        # === CENTER: SPATIAL MAP (col 1, rows 0-1) ===
-        ax_map = fig.add_subplot(gs[:, 1])
-        self._plot_spatial_diff(ax_map, nodes_gdf, self.baseline.flooding_volumes, solution.flooding_volumes, inp_path, derivations)
-        # if annotations_data and derivations:
-        #      self._overlay_annotations(ax_map, derivations, annotations_data)
-        
-        # Add numbered labels on map for tanks
-        if tank_details and derivations:
-            for i, tank in enumerate(tank_details[:12], 1):
-                node_id = tank.get('NodeID', '?')
-                # Find the derivation geometry for this node
-                for deriv in derivations:
-                    if hasattr(deriv, 'centroid'):
-                        # Check if this derivation belongs to this tank
-                        if deriv is derivations[i-1] if i-1 < len(derivations) else False:
-                            centroid = deriv.centroid
-                            ax_map.annotate(str(i), xy=(centroid.x, centroid.y), 
-                                          fontsize=12, fontweight='bold', color='black',
-                                          ha='center', va='center',
-                                          bbox=dict(boxstyle='circle,pad=0.2', facecolor='white', 
-                                                   edgecolor='black', alpha=0.9))
-                            break
-        
-        # === RIGHT: 2x2 PLOTS (cols 2-3) ===
-        # Row 0, Col 2: Scatter Plot
-        ax_scatter = fig.add_subplot(gs[0, 2])
-        self._plot_volume_scatter(ax_scatter, self.baseline.flooding_volumes, solution.flooding_volumes)
-        
-        # Row 0, Col 3: Cumulative Volume
-        ax_cumulative = fig.add_subplot(gs[0, 3])
-        self._plot_cumulative_volume(ax_cumulative, self.baseline, solution)
-        
-        # Row 1, Col 2: System Flooding Hydrograph
-        ax_flood = fig.add_subplot(gs[1, 2])
-        self._plot_system_flood_hydrograph(ax_flood, self.baseline, solution)
-        
-        # Row 1, Col 3: Flood Volume Histogram
-        ax_hist_vol = fig.add_subplot(gs[1, 3])
-        base_vols = list(self.baseline.flooding_volumes.values())
-        sol_vols = list(solution.flooding_volumes.values())
-        self._plot_hist(ax_hist_vol, base_vols, sol_vols, "Flood Vol (m³)")
-        
-        plt.tight_layout()
-        plt.savefig(save_dir / "dashboard_map.png", dpi=100)
-        plt.close(fig)
 
-    def _plot_system_flood_hydrograph(self, ax, baseline, solution):
-        """Sums up flooding rates (cms) for extracted nodes to show system stress."""
-        
-        def plot_series(metrics_obj, color, label):
-            data = metrics_obj.system_flood_hydrograph
-            if not data or 'total_rate' not in data:
-                print(f"  [HYDRO-DEBUG] {label}: No system hydrograph found.")
-                return None, None
-                
-            y = np.array(data['total_rate'])
-            times = data['times']
-            
-            # Convert time to hours
-            hrs = []
-            if times:
-                t0 = times[0]
-                if hasattr(t0, 'total_seconds'):
-                    hrs = [(t - t0).total_seconds()/3600.0 for t in times]
-                elif hasattr(t0, 'hour'):
-                    hrs = [(t - t0).total_seconds()/3600.0 for t in times]
-                else:
-                    hrs = times
 
-            ax.plot(hrs, y, linestyle='-' if label=='Solution' else '--', color=color, alpha=0.8, label=label)
-            
-            # Peak Label
-            if len(y) > 0:
-                ymax = np.max(y)
-                if ymax > 0:
-                    idx = np.argmax(y)
-                    ax.annotate(f'{ymax:.2f}', xy=(hrs[idx], ymax), xytext=(0, 5), 
-                                textcoords="offset points", color=color, fontsize=9, fontweight='bold')
-            return hrs, y
-
-        # Plot
-        t_b, y_b = plot_series(baseline, 'red', 'Baseline Total Flood Rate')
-        t_s, y_s = plot_series(solution, 'blue', 'Solution Total Flood Rate')
-
-        ax.set_title("Total System Flooding Rate (All Nodes)")
-        ax.set_ylabel("Flooding Rate (cms)")
-        ax.set_xlabel("Time (hours)")
-        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-
-        # Explicit Difference Verification for User
-        if y_b is not None and y_s is not None:
-             # Use PRE-CALCULATED volumes from metrics to ensure consistency with report
-             vol_b_reported = baseline.total_flooding_volume
-             vol_s_reported = solution.total_flooding_volume
-             
-             # Also calculate INTEGRATED volume from the plot data to check for consistency
-             # Assuming x_b is in hours, convert to seconds
-             # Simple trapz integration
-             try:
-                 # Convert hours to seconds
-                 t_sec = np.array(t_b) * 3600.0
-                 vol_b_integ = np.trapz(y_b, t_sec)
-                 
-                 t_sec_s = np.array(t_s) * 3600.0
-                 vol_s_integ = np.trapz(y_s, t_sec_s)
-             except:
-                 vol_b_integ = 0
-                 vol_s_integ = 0
-             
-             vol_diff = vol_b_reported - vol_s_reported # Reduction
-             
-             # Print STATS on the plot (Showing match/mismatch)
-             stats_text = (f"SWMM Vol Base: {vol_b_reported:,.0f} m3\n"
-                           f"Plot Vol Base: {vol_b_integ:,.0f} m3\n"
-                           f"----------------\n"
-                           f"SWMM Vol Sol:  {vol_s_reported:,.0f} m3\n"
-                           f"Plot Vol Sol:  {vol_s_integ:,.0f} m3\n"
-                           f"----------------\n"
-                           f"Reduc (SWMM): {vol_diff:,.0f} m3")
-             
-             ax.text(0.98, 0.95, stats_text, transform=ax.transAxes, 
-                     fontsize=9, verticalalignment='top', horizontalalignment='right',
-                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec='black', alpha=0.9))
-
-        # Sanity Check for User Reassurance
-        if y_b is not None and y_s is not None and len(y_b) > 0 and len(y_s) > 0:
-            if len(y_b) == len(y_s):
-                if np.allclose(y_b, y_s, atol=1e-3):
-                    ax.text(0.5, 0.5, "!! IDENTICAL SERIES DETECTED !!", 
-                            transform=ax.transAxes, color='red', fontsize=14, 
-                            ha='center', va='center', fontweight='bold',
-                            bbox=dict(facecolor='yellow', alpha=0.8))
-                    print("  [HYDRO-WARNING] Baseline and Solution system hydrographs are IDENTICAL!")
-                else:
-                    # Calculate difference stats
-                    diff = np.sum(y_s) - np.sum(y_b)
-                    pct = (diff / np.sum(y_b) * 100) if np.sum(y_b) > 0 else 0
-                    print(f"  [HYDRO-CHECK] Hydrographs differ. Diff Sum: {diff:.2f} ({pct:.1f}%)")
-            else:
-                 print(f"  [HYDRO-CHECK] Hydrographs have different lengths ({len(y_b)} vs {len(y_s)}). They are different.")
-
-    def _plot_cumulative_volume(self, ax, baseline, solution):
-        """Plots cumulative flooding volume over time (integral of rate)."""
-        
-        def get_cumulative(metrics_obj, color, label):
-            data = metrics_obj.system_flood_hydrograph
-            if not data or 'total_rate' not in data:
-                return None, None
-                
-            rates = np.array(data['total_rate'])  # m³/s
-            times = data['times']
-            
-            if not times or len(times) < 2:
-                return None, None
-                
-            # Convert times to hours and calculate dt in seconds
-            t0 = times[0]
-            hrs = []
-            dt_secs = []
-            for i, t in enumerate(times):
-                hrs.append((t - t0).total_seconds() / 3600.0)
-                if i > 0:
-                    dt_secs.append((times[i] - times[i-1]).total_seconds())
-            
-            # Calculate cumulative volume
-            cumulative = np.zeros(len(rates))
-            for i in range(1, len(rates)):
-                # Volume = rate * dt
-                cumulative[i] = cumulative[i-1] + rates[i-1] * dt_secs[i-1]
-            
-            ax.plot(hrs, cumulative, linestyle='-' if 'Solution' in label else '--', 
-                    color=color, alpha=0.8, linewidth=2, label=label)
-            
-            # Final value annotation
-            final_vol = cumulative[-1]
-            ax.annotate(f'{final_vol:,.0f} m³', xy=(hrs[-1], final_vol), 
-                       xytext=(-50, 5), textcoords="offset points", 
-                       color=color, fontsize=9, fontweight='bold')
-            
-            return hrs, cumulative
-        
-        hrs_b, cum_b = get_cumulative(baseline, 'red', 'Baseline Cumulative')
-        hrs_s, cum_s = get_cumulative(solution, 'blue', 'Solution Cumulative')
-        
-        ax.set_title("Cumulative Flooding Volume Over Time")
-        ax.set_ylabel("Cumulative Volume (m³)")
-        ax.set_xlabel("Time (hours)")
-        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
-        ax.legend(loc='upper left')
-        ax.grid(True, alpha=0.3)
-        
-        # Add reduction annotation
-        if cum_b is not None and cum_s is not None:
-            reduction = cum_b[-1] - cum_s[-1]
-            pct = (reduction / cum_b[-1] * 100) if cum_b[-1] > 0 else 0
-            ax.text(0.98, 0.05, f"Reduction: {reduction:,.0f} m³ ({pct:.1f}%)", 
-                   transform=ax.transAxes, fontsize=10, ha='right', va='bottom',
-                   bbox=dict(facecolor='lightgreen', alpha=0.8, edgecolor='green'))
-
-    def generate_tank_hydrograph_plots(self, solution: SystemMetrics, solution_name: str, 
-                                        save_dir: Path, detailed_links: Dict = None):
-        """
-        Generate tank hydrograph plots with 3 columns per tank:
-        - Col 1: Weir (derivation) flow hydrograph
-        - Col 2: Cumulative volume in tank (integral of inflow)
-        - Col 3: Tank depth/level with % utilization
-        
-        One row per tank, saved as {solution_name}_tank_hydrographs.png
-        """
-        tank_data = solution.tank_utilization
-        if not tank_data:
-            print("  [Tanks] No tank utilization data available.")
-            return
-            
-        n_tanks = len(tank_data)
-        if n_tanks == 0:
-            return
-            
-        fig, axes = plt.subplots(n_tanks, 3, figsize=(15, 4 * n_tanks))
-        if n_tanks == 1:
-            axes = axes.reshape(1, -1)
-            
-        fig.suptitle(f'{solution_name}: Tank Hydrographs', fontsize=14, fontweight='bold', y=1.02)
-        
-        designed_depth = 5.0  # meters (tank design depth)
-        
-        for i, (tank_id, tank_info) in enumerate(tank_data.items()):
-            # Get time series data
-            times = tank_info.get('times', [])
-            depths = tank_info.get('depth_series', [])
-            
-            if not times or not depths:
-                for j in range(3):
-                    axes[i, j].text(0.5, 0.5, 'No data', transform=axes[i, j].transAxes,
-                                   ha='center', va='center', fontsize=12, color='gray')
-                continue
-                
-            # Convert times to hours
-            t0 = times[0]
-            hrs = [(t - t0).total_seconds() / 3600.0 for t in times]
-            
-            # Extract node ID from tank ID (TK_P0061405_4 -> P0061405)
-            parts = tank_id.split('_')
-            source_node = parts[1] if len(parts) > 1 else tank_id
-            
-            # ===== COL 1: WEIR FLOW HYDROGRAPH =====
-            ax1 = axes[i, 0]
-            weir_flow = None
-            weir_hrs = None
-            
-            # DEBUG: Print to console AND write to file
-            debug_path = save_dir / "tank_hydro_debug.txt"
-            print(f"\n  [TANK-DEBUG] === Tank: {tank_id}, source_node: {source_node} ===")
-            print(f"  [TANK-DEBUG] detailed_links keys: {list(detailed_links.keys()) if detailed_links else 'None'}")
-            print(f"  [TANK-DEBUG] source_node in detailed_links: {source_node in detailed_links if detailed_links else 'N/A'}")
-            if detailed_links and source_node in detailed_links:
-                print(f"  [TANK-DEBUG] derivation for this node: {detailed_links[source_node].get('derivation', [])}")
-            print(f"  [TANK-DEBUG] link_hydrographs keys (first 30): {list(solution.link_hydrographs.keys())[:30]}")
-            with open(debug_path, 'a') as f:
-                f.write(f"\n=== Tank: {tank_id}, source_node: {source_node} ===\n")
-                f.write(f"detailed_links keys: {list(detailed_links.keys()) if detailed_links else 'None'}\n")
-                f.write(f"source_node in detailed_links: {source_node in detailed_links if detailed_links else 'N/A'}\n")
-                if detailed_links and source_node in detailed_links:
-                    f.write(f"derivation for this node: {detailed_links[source_node].get('derivation', [])}\n")
-                f.write(f"link_hydrographs keys (first 30): {list(solution.link_hydrographs.keys())[:30]}\n")
-            
-            # CRITICAL FIX: We need to find the derivation pipe flow (like "0.0-0.1")
-            # NOT the weir flow (like "WR_P0061405_0") which has zero values
-            
-            # Strategy 1: Use derivation link from detailed_links (most reliable)
-            if detailed_links and source_node in detailed_links:
-                derivation_links = detailed_links[source_node].get('derivation', [])
-                for deriv_link in derivation_links:
-                    if deriv_link in solution.link_hydrographs:
-                        link_data = solution.link_hydrographs[deriv_link]
-                        link_times = link_data.get('times', [])
-                        link_flow = link_data.get('flow', [])
-                        if link_times and link_flow and len(link_flow) > 0:
-                            weir_hrs = [(t - link_times[0]).total_seconds() / 3600.0 for t in link_times]
-                            weir_flow = link_flow
-                            with open(debug_path, 'a') as f:
-                                f.write(f"FOUND via Strategy 1: {deriv_link}, max_flow={max(link_flow)}\n")
-                            break
-            
-            # Strategy 2: Find ramal links (format "X.Y-X.Z") with actual flow
-            # These are the derivation pipes that carry water to tanks
-            if weir_flow is None:
-                best_flow = None
-                best_max = 0
-                best_lid = None
-                for lid, link_data in solution.link_hydrographs.items():
-                    # Match ramal pattern: "0.0-0.1", "0.1-0.2", "1.0-1.1", etc
-                    if '-' in lid and lid.count('.') >= 2:
-                        parts = lid.split('-')
-                        if len(parts) == 2:
-                            # Verify both parts have the ramal.node format
-                            try:
-                                p0 = parts[0].split('.')
-                                p1 = parts[1].split('.')
-                                if len(p0) == 2 and len(p1) == 2:
-                                    link_times = link_data.get('times', [])
-                                    link_flow = link_data.get('flow', [])
-                                    if link_times and link_flow and len(link_flow) > 0:
-                                        max_flow = max(link_flow)
-                                        # Keep track of the link with highest flow
-                                        if max_flow > best_max:
-                                            best_max = max_flow
-                                            best_flow = link_flow
-                                            best_lid = lid
-                                            best_times = link_times
-                            except:
-                                pass
-                
-                if best_flow is not None and best_max > 0.01:
-                    weir_hrs = [(t - best_times[0]).total_seconds() / 3600.0 for t in best_times]
-                    weir_flow = best_flow
-            # Strategy 3: Search for WEIR flow (WR_{source_node}_*) - now captured during simulation
-            if weir_flow is None:
-                for lid, link_data in solution.link_hydrographs.items():
-                    if lid.startswith(f'WR_{source_node}_'):
-                        link_times = link_data.get('times', [])
-                        link_flow = link_data.get('flow', [])
-                        if link_times and link_flow and len(link_flow) > 0:
-                            weir_hrs = [(t - link_times[0]).total_seconds() / 3600.0 for t in link_times]
-                            weir_flow = link_flow
-                            print(f"  [TANK-DEBUG] FOUND via Strategy 3 (Weir): {lid}, max_flow={max(link_flow)}")
-                            with open(debug_path, 'a') as f:
-                                f.write(f"FOUND via Strategy 3 (Weir): {lid}, max_flow={max(link_flow)}\n")
-                            break
-            
-            # Final debug output
-            if weir_flow is not None:
-                print(f"  [TANK-DEBUG] SUCCESS: Found flow data with {len(weir_flow)} points, max={max(weir_flow):.4f}")
-            else:
-                print(f"  [TANK-DEBUG] FAILED: All 3 strategies failed to find flow data for tank {tank_id}")
-            
-            if weir_flow is not None:
-                ax1.plot(weir_hrs, weir_flow, 'b-', linewidth=1.5)
-                ax1.fill_between(weir_hrs, weir_flow, alpha=0.3, color='blue')
-                peak_q = max(weir_flow)
-                ax1.axhline(y=peak_q, color='darkblue', linestyle='--', alpha=0.5)
-                ax1.text(0.98, 0.95, f'Peak: {peak_q:.2f} m³/s', transform=ax1.transAxes,
-                        ha='right', va='top', fontsize=9, bbox=dict(facecolor='white', alpha=0.8))
-            else:
-                ax1.text(0.5, 0.5, 'Weir data\nnot available', transform=ax1.transAxes,
-                        ha='center', va='center', fontsize=10, color='gray')
-            
-            ax1.set_title(f'{tank_id}\nWeir Flow (Inflow)')
-            ax1.set_xlabel('Time (hours)')
-            ax1.set_ylabel('Flow (m³/s)')
-            ax1.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
-            ax1.grid(True, alpha=0.3)
-            
-            # ===== COL 2: CUMULATIVE VOLUME =====
-            ax2 = axes[i, 1]
-            if weir_flow is not None and len(weir_hrs) > 1:
-                # Calculate cumulative volume (integral of flow)
-                t_sec = np.array(weir_hrs) * 3600.0
-                cumulative_vol = np.zeros(len(weir_flow))
-                for k in range(1, len(weir_flow)):
-                    dt = t_sec[k] - t_sec[k-1]
-                    cumulative_vol[k] = cumulative_vol[k-1] + weir_flow[k] * dt
-                
-                ax2.plot(weir_hrs, cumulative_vol, 'g-', linewidth=2)
-                ax2.fill_between(weir_hrs, cumulative_vol, alpha=0.3, color='green')
-                final_vol = cumulative_vol[-1]
-                ax2.text(0.98, 0.95, f'Total: {final_vol:,.0f} m³', transform=ax2.transAxes,
-                        ha='right', va='top', fontsize=9, bbox=dict(facecolor='white', alpha=0.8))
-            else:
-                ax2.text(0.5, 0.5, 'Volume data\nnot available', transform=ax2.transAxes,
-                        ha='center', va='center', fontsize=10, color='gray')
-            
-            ax2.set_title('Cumulative Volume')
-            ax2.set_xlabel('Time (hours)')
-            ax2.set_ylabel('Volume (m³)')
-            ax2.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
-            ax2.grid(True, alpha=0.3)
-            
-            # ===== COL 3: TANK DEPTH (FILLING CURVE) =====
-            ax3 = axes[i, 2]
-            ax3.plot(hrs, depths, 'r-', linewidth=2)
-            ax3.fill_between(hrs, depths, alpha=0.3, color='red')
-            
-            # Add designed depth line
-            ax3.axhline(y=designed_depth, color='darkred', linestyle='--', 
-                       linewidth=1.5, label=f'Design: {designed_depth}m')
-            
-            max_depth = max(depths) if depths else 0
-            utilization_pct = (max_depth / designed_depth * 100) if designed_depth > 0 else 0
-            
-            # Annotation box with key metrics
-            ax3.text(0.98, 0.95, 
-                    f'Max: {max_depth:.2f} m\nDesign: {designed_depth:.1f} m\nUtil: {utilization_pct:.0f}%', 
-                    transform=ax3.transAxes, ha='right', va='top', fontsize=9,
-                    bbox=dict(facecolor='lightyellow', alpha=0.9, edgecolor='orange'))
-            
-            ax3.set_title('Tank Depth (Filling Curve)')
-            ax3.set_xlabel('Time (hours)')
-            ax3.set_ylabel('Depth (m)')
-            ax3.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
-            ax3.set_ylim(0, max(designed_depth * 1.2, max_depth * 1.1))
-            ax3.legend(loc='upper left', fontsize=8)
-            ax3.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        save_path = Path(save_dir) / f'{solution_name}_tank_hydrographs.png'
-        plt.savefig(save_path, dpi=100, bbox_inches='tight')
-        plt.close(fig)
-        print(f"  [Tanks] Saved: {save_path}")
-
-    def generate_metric_maps(self, solution: SystemMetrics, solution_name: str, save_dir: Path,
-                             nodes_gdf: gpd.GeoDataFrame, inp_path: str):
+    def generate_metric_maps(self, solution: SystemMetrics,
+                             solution_name: str,
+                             save_dir: Path,
+                             nodes_gdf: gpd.GeoDataFrame, ):
         """
         Generates spatial metric map files showing Baseline vs Solution comparison.
         Currently generates:
@@ -1130,8 +796,8 @@ class ScenarioComparator:
         nodes_gdf.plot(ax=ax, color='lightgray', markersize=5, alpha=0.3)
         
         # Plot flooding difference (Improved vs Worsened)
-        base_vols = self.baseline.flooding_volumes
-        sol_vols = solution.flooding_volumes
+        base_vols = {nid: d.get('flooding_volume', 0) for nid, d in self.baseline.node_data.items()}
+        sol_vols = {nid: d.get('flooding_volume', 0) for nid, d in solution.node_data.items()}
         
         # Debug: Verify data is actually different
         base_total = sum(base_vols.values())
@@ -1146,14 +812,14 @@ class ScenarioComparator:
         # Iterate over all known node IDs from flooding volumes
         all_nids = set(base_vols.keys()) | set(sol_vols.keys())
         
-        # Create a lookup from node ID to geometry using 'NodeID' column (like _plot_spatial_diff)
+        # Create a lookup from node ID to geometry using 'node_id' column (like _plot_spatial_diff)
         name_to_geom = {}
         for idx in nodes_gdf.index:
             row = nodes_gdf.loc[idx]
             geom = row['geometry']
-            # Use 'NodeID' column which contains names like P0070286
-            if 'NodeID' in nodes_gdf.columns:
-                name_to_geom[str(row['NodeID'])] = geom
+            # Use 'node_id' column which contains names like P0070286
+            if 'node_id' in nodes_gdf.columns:
+                name_to_geom[str(row['node_id'])] = geom
             # Fallback to index
             name_to_geom[str(idx)] = geom
         
@@ -1205,46 +871,314 @@ class ScenarioComparator:
         plt.close(fig)
         
         print(f"  [MetricMaps] Saved dashboard_map_flooding.png (Improved: {len(improved_geoms)}, Worsened: {len(worsened_geoms)})")
+
+    @profile
+    def generate_capacity_comparison_maps(self, solution: SystemMetrics, solution_name: str, save_dir: Path, nodes_gdf: gpd.GeoDataFrame, show_predios: bool = False, derivations: List = None, tank_details: List[Dict] = None):
+        """Generates a single 2x2 figure with capacity maps (h/D)."""
+        save_dir = Path(save_dir)
+        
+        # Use swmm_gdf from metrics
+        links_sol_gdf = solution.swmm_gdf
+        links_base_gdf = self.baseline.swmm_gdf
+        
+        # Load predios using lazy cache
+        predios_gdf = self._get_predios_gdf() if show_predios else None
+        if show_predios and (predios_gdf is None or predios_gdf.empty):
+            show_predios = False
+
+        # Compute bounds
+        bounds = None
+        ref_gdf = links_sol_gdf if links_sol_gdf is not None else links_base_gdf
+        if ref_gdf is not None and not ref_gdf.empty:
+            bounds = ref_gdf.total_bounds
+        
+        # Create 2x2 figure
+        fig, axes = plt.subplots(2, 2, figsize=(20, 16))
+        axes = axes.flatten()
+        
+        # 1. BASELINE CAPACITY MAP (No derivations)
+        self._plot_absolute_capacity_map(axes[0], links_base_gdf, self.baseline,
+                                            "Baseline (h/D)", predios_gdf, bounds, show_predios)
+
+        # 2. SOLUTION CAPACITY MAP (With derivations)
+        self._plot_absolute_capacity_map(axes[1], links_sol_gdf, solution,
+                                            f"{solution_name} (h/D)", predios_gdf, bounds, show_predios)
+        # # Overlay derivations on solution plot
+        # self._plot_derivations_and_labels(axes[1], derivations, tank_details)
+
+        # 3. DELTA MAP (With derivations, enhanced colors)
+        self._plot_capacity_map(axes[2], links_sol_gdf, self.baseline, solution, predios_gdf, bounds, show_predios, derivations, tank_details, nodes_gdf=nodes_gdf)
+        axes[2].set_title(f"Delta Categories: Baseline vs {solution_name}", fontsize=12)
+
+        # 4. QUANTITATIVE MAGNITUDE MAP
+        base_caps = self.baseline.swmm_gdf['Capacity']
+        sol_caps = solution.swmm_gdf['Capacity']
+        self._plot_delta_magnitude_map(axes[3], links_sol_gdf, base_caps, sol_caps,
+                                       f"Quantitative Delta (h/D change)", predios_gdf, bounds, show_predios, derivations, tank_details, nodes_gdf=nodes_gdf)
+
+        fig.suptitle("Pipe Capacity Usage Comparison (h/D)", fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=(0, 0, 1, 0.96))
+        plt.savefig(save_dir / "01_dashboard_map_capacity.png", dpi=150)
+        plt.close(fig)
     
-    def _plot_capacity_map(self, ax, links_gdf, baseline, solution):
-        """Plots pipe capacity usage on map. Green=improved, Red=worsened."""
+    @profile
+    def generate_velocity_comparison_maps(self, solution: SystemMetrics, solution_name: str, save_dir: Path, nodes_gdf: gpd.GeoDataFrame, show_predios: bool = False, derivations: List = None, tank_details: List[Dict] = None):
+        """Generates a single 2x2 figure with velocity maps (m/s)."""
+        save_dir = Path(save_dir)
+        
+        # Use swmm_gdf from metrics
+        links_sol_gdf = solution.swmm_gdf if solution.swmm_gdf is not None and not solution.swmm_gdf.empty else None
+        links_base_gdf = self.baseline.swmm_gdf if self.baseline.swmm_gdf is not None and not self.baseline.swmm_gdf.empty else None
+        
+        # Load predios using lazy cache
+        predios_gdf = self._get_predios_gdf() if show_predios else None
+        if show_predios and (predios_gdf is None or predios_gdf.empty):
+            show_predios = False
+        
+        # Compute bounds
+        bounds = None
+        ref_gdf = links_sol_gdf if links_sol_gdf is not None else links_base_gdf
+        if ref_gdf is not None and not ref_gdf.empty:
+            bounds = ref_gdf.total_bounds
+        
+        # Create 2x2 figure
+        fig, axes = plt.subplots(2, 2, figsize=(20, 16))
+        axes = axes.flatten()
+        
+        # 1. BASELINE VELOCITY MAP (No derivations)
+        if links_base_gdf is not None:
+            self._plot_absolute_velocity_map(axes[0], links_base_gdf, self.baseline, 
+                                            "Baseline (m/s)", predios_gdf, bounds, show_predios)
+        else:
+            axes[0].text(0.5, 0.5, "No Baseline Data", ha='center', va='center', transform=axes[0].transAxes)
+            axes[0].set_title("Baseline (m/s)")
+
+        # 2. SOLUTION VELOCITY MAP (With derivations)
+        if links_sol_gdf is not None:
+            self._plot_absolute_velocity_map(axes[1], links_sol_gdf, solution, 
+                                            f"{solution_name} (m/s)", predios_gdf, bounds, show_predios)
+            # self._plot_derivations_and_labels(axes[1], derivations, tank_details)
+        else:
+            axes[1].text(0.5, 0.5, "No Solution Data", ha='center', va='center', transform=axes[1].transAxes)
+            axes[1].set_title(f"{solution_name} (m/s)")
+
+        # 3. DELTA MAP (With derivations, enhanced colors)
+        if links_sol_gdf is not None:
+            self._plot_velocity_delta_map(axes[2], links_sol_gdf, self.baseline, solution, predios_gdf, bounds, show_predios, derivations, tank_details, nodes_gdf=nodes_gdf)
+            axes[2].set_title(f"Delta Categories: Baseline vs {solution_name}", fontsize=12)
+
+        # 4. QUANTITATIVE MAGNITUDE MAP
+        if links_sol_gdf is not None:
+            base_vels = self.baseline.swmm_gdf['MaxVel']
+            sol_vels = solution.swmm_gdf['MaxVel']
+            self._plot_delta_magnitude_map(axes[3], links_sol_gdf, base_vels, sol_vels,
+                                           f"Quantitative Delta (Velocity change)", predios_gdf, bounds, show_predios, derivations, tank_details, nodes_gdf=nodes_gdf)
+
+        fig.suptitle("Pipe Velocity Comparison (m/s)", fontsize=16, fontweight='bold')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.savefig(save_dir / "02_dashboard_map_velocity.png", dpi=150)
+        plt.close(fig)
+        print("  [MetricMaps] Saved dashboard_map_velocity_comparison.png (2x2)")
+
+    @profile
+    def _plot_absolute_capacity_map(self, ax, links_gdf, metrics, title, predios_gdf=None, bounds=None, show_predios: bool = False):
+        """Plots absolute pipe capacity usage (d/D) using colormap."""
+        if links_gdf is None or links_gdf.empty:
+            raise ValueError(f"_plot_absolute_capacity_map: links_gdf is None or empty for '{title}'")
+        
+        # Plot predios background first (very light gray) if requested
+        if show_predios and predios_gdf is not None and not predios_gdf.empty:
+            predios_gdf.plot(ax=ax, color='#f0f0f0', edgecolor='#d0d0d0', linewidth=0.2, zorder=0)
+        
+        # Background network
+        links_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.3, zorder=1)
+        
+        # Use existing Capacity column from swmm_gdf (already calculated)
+        plot_gdf = links_gdf.copy()
+        plot_gdf['cap_val'] = plot_gdf['Capacity']
+        
+        # 3 discrete color levels based on capacity usage (d/D)
+        # Level 1: ≤ 0.65 (Green - Good)
+        # Level 2: 0.65 - 0.80 (Orange - Caution)
+        # Level 3: > 0.80 (Red - Critical)
+        level_1 = plot_gdf[plot_gdf['cap_val'] <= 0.65]
+        level_2 = plot_gdf[(plot_gdf['cap_val'] > 0.65) & (plot_gdf['cap_val'] <= 0.80)]
+        level_3 = plot_gdf[plot_gdf['cap_val'] > 0.80]
+        
+        # Plot each level with its color
+        if not level_1.empty:
+            level_1.plot(ax=ax, color='#2ecc71', linewidth=2.0, alpha=0.9, zorder=2)  # Green
+        if not level_2.empty:
+            level_2.plot(ax=ax, color='#f39c12', linewidth=2.5, alpha=0.9, zorder=3)  # Orange
+        if not level_3.empty:
+            level_3.plot(ax=ax, color='#e74c3c', linewidth=3.0, alpha=0.9, zorder=4)  # Red
+        
+        # Custom legend for the 3 levels
+        
+        legend_elements = [
+            Line2D([0], [0], color='#2ecc71', lw=3, label='≤ 0.65 (Bueno)'),
+            Line2D([0], [0], color='#f39c12', lw=3, label='0.65-0.80 (Precaución)'),
+            Line2D([0], [0], color='#e74c3c', lw=3, label='> 0.80 (Crítico)')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=7, framealpha=0.9)
+        
+        # Set extent to pipeline bounds with small margin
+        if bounds is not None:
+            margin = 50  # meters
+            ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+            ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
+        
+        ax.set_title(title, fontsize=12)
+        ax.set_axis_off()
+        ax.set_aspect('equal')
+    
+    def _get_predios_gdf(self):
+        """Lazy loads and caches the predios GeoDataFrame."""
+        if self._predios_gdf_cache is not None:
+            return self._predios_gdf_cache
+            
+        import config
+        if hasattr(config, 'PREDIOS_DAMAGED_FILE') and config.PREDIOS_DAMAGED_FILE.exists():
+            print(f"  [Reporter] Loading predios from {config.PREDIOS_DAMAGED_FILE.name}...")
+            start_t = time.time()
+            self._predios_gdf_cache = gpd.read_file(config.PREDIOS_DAMAGED_FILE)
+            self._predios_gdf_cache = self._predios_gdf_cache.to_crs(config.PROJECT_CRS)
+            print(f"  [Reporter] Loaded {len(self._predios_gdf_cache)} predios in {time.time() - start_t:.1f}s")
+        else:
+            raise FileNotFoundError(f"PREDIOS_DAMAGED_FILE not found in config: {getattr(config, 'PREDIOS_DAMAGED_FILE', 'N/A')}")
+            
+        return self._predios_gdf_cache
+
+    def _plot_delta_magnitude_map(self, ax, links_gdf, baseline_vals, solution_vals, title, predios_gdf=None, bounds=None, show_predios: bool = False, derivations=None, tank_details=None, nodes_gdf=None):
+        """Plots quantitative delta (Solution - Baseline) using colormap."""
+        if links_gdf is None or links_gdf.empty:
+            ax.text(0.5, 0.5, "No Link Data", ha='center')
+            return
+
+        # 1. Fondo de predios (opcional)
+        if show_predios and predios_gdf is not None and not predios_gdf.empty:
+            predios_gdf.plot(ax=ax, color='#f0f0f0', edgecolor='#d0d0d0', linewidth=0.2, zorder=0)
+
+        # 2. Red de fondo (Gris muy tenue para que resalten los colores del Delta)
+        links_gdf.plot(ax=ax, color='black', linewidth=1, alpha=0.3, zorder=1)
+
+        # Preparación de datos
+        base_s = pd.Series(baseline_vals)
+        sol_s = pd.Series(solution_vals)
+        plot_gdf = links_gdf.copy()
+        plot_gdf.index = plot_gdf.index.astype(str).str.strip().str.upper()
+
+        # Cálculo del Delta (Solución - Base)
+        plot_gdf['delta'] = plot_gdf.index.map(sol_s).fillna(0) - plot_gdf.index.map(base_s).fillna(0)
+
+        # Usamos el percentil 98 en lugar del máximo absoluto. Esto evita que un solo
+        # valor extremo haga que todos los demás parezcan amarillos pálidos.
+        vmax = plot_gdf['delta'].abs().quantile(0.98)
+        if vmax < 0.05: vmax = 0.1  # Asegura un rango mínimo para la leyenda
+
+        # Filtrar solo tramos con cambios significativos para dibujar encima
+        significant_changes = plot_gdf[plot_gdf['delta'].abs() > 1e-4]
+
+        if not significant_changes.empty:
+            significant_changes.plot(
+                ax=ax,
+                column='delta',
+                cmap='rocket',  # Rojo (Peor) - Amarillo (Igual) - Verde (Mejor)
+                linewidth=2,  # Línea mucho más gruesa
+                alpha=1.0,  # Sin transparencia para máximo contraste
+                vmin=-vmax,
+                vmax=vmax,
+                zorder=3,
+                legend=True,
+                legend_kwds={
+                    'label': "Delta h/D ((-) Mejora | (+) Peor)",
+                    'orientation': "horizontal",
+                    'pad': 0.08,
+                    'shrink': 0.6,
+                    'aspect': 40  # La hace más bajita
+                }
+            )
+
+        # # 3. Dibujar derivaciones (si existen)
+        # if not derivations.empty:
+        #     self._plot_derivations_and_labels(ax, derivations, tank_details)
+
+        # 4. Ajuste de zoom/extensión
+        if bounds is not None:
+            margin = 50
+            ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+            ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
+        elif not links_gdf.empty:
+            minx, miny, maxx, maxy = links_gdf.total_bounds
+            margin = 50
+            ax.set_xlim(minx - margin, maxx + margin)
+            ax.set_ylim(miny - margin, maxy + margin)
+
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_axis_off()
+        ax.set_aspect('equal')
+
+
+    def _plot_capacity_map(self, ax, links_gdf, baseline, solution, predios_gdf=None, bounds=None, show_predios: bool = False, derivations=None, tank_details=None, nodes_gdf=None):
+        """Plots pipe capacity usage on map. Green=improved, Red=worsened, DarkGray=Unchanged."""
         if links_gdf is None or links_gdf.empty:
             ax.text(0.5, 0.5, "No Link Data", ha='center')
             return
         
+        # Plot predios background
+        if show_predios and predios_gdf is not None and not predios_gdf.empty:
+            predios_gdf.plot(ax=ax, color='#f0f0f0', edgecolor='#d0d0d0', linewidth=0.2, zorder=0)
+        
         # Background network
-        links_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.5)
+        links_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.5, zorder=1)
         
-        # Compute max capacity for each link
-        base_caps = {}
-        for lid, data in baseline.link_capacities.items():
-            if data.get('capacity'):
-                base_caps[lid] = max(data['capacity'])
+        # Vectorized calculation
+        base_caps = pd.Series(baseline.swmm_gdf['Capacity'])
+        sol_caps = pd.Series(solution.swmm_gdf['Capacity'])
         
-        sol_caps = {}
-        for lid, data in solution.link_capacities.items():
-            if data.get('capacity'):
-                sol_caps[lid] = max(data['capacity'])
+        # Use a copy and normalize index
+        plot_gdf = links_gdf.copy()
+        plot_gdf.index = plot_gdf.index.astype(str).str.strip().str.upper()
         
-        # Common links
-        common_lids = set(base_caps.keys()) & set(sol_caps.keys())
+        # Map values
+        plot_gdf['delta'] = plot_gdf.index.map(sol_caps).fillna(0) - plot_gdf.index.map(base_caps).fillna(0)
         
-        for lid in common_lids:
-            if lid in links_gdf.index:
-                geom = links_gdf.loc[lid, 'geometry']
-                diff = sol_caps[lid] - base_caps[lid]
-                color = 'green' if diff < 0 else 'red' if diff > 0 else 'gray'
-                lw = 1 + abs(diff) * 3
-                gpd.GeoSeries([geom]).plot(ax=ax, color=color, linewidth=min(lw, 4), alpha=0.7)
+        # Unchanged
+        unchanged = plot_gdf[abs(plot_gdf['delta']) <= 0.01]
+        if not unchanged.empty:
+            unchanged.plot(ax=ax, color='#444444', linewidth=0.8, alpha=0.4, zorder=2)
+
+        # Improved (Green)
+        # Improved (Green)
+        improved = plot_gdf[plot_gdf['delta'] < -0.01]
+        if not improved.empty:
+            improved.plot(ax=ax, color='green', linewidth=3.5, alpha=0.9, zorder=3)
+ 
+        # Worsened (Red)
+        worsened = plot_gdf[plot_gdf['delta'] > 0.01]
+        if not worsened.empty:
+            worsened.plot(ax=ax, color='red', linewidth=3.5, alpha=0.9, zorder=3)
+        
+        # # Plot derivations if requested
+        # if not derivations.empty:
+        #     self._plot_derivations_and_labels(ax, derivations, tank_details)
+
+        # Set extent
+        if bounds is not None:
+            margin = 50
+            ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+            ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
         
         # Legend
         from matplotlib.lines import Line2D
         legend_elements = [
-            Line2D([0], [0], color='green', lw=3, label='Improved (Lower Usage)'),
-            Line2D([0], [0], color='red', lw=3, label='Worsened (Higher Usage)'),
-            Line2D([0], [0], color='gray', lw=1, label='Unchanged')
+            Line2D([0], [0], color='green', lw=3, label='Improved'),
+            Line2D([0], [0], color='red', lw=3, label='Worsened'),
+            Line2D([0], [0], color='#444444', lw=2, label='Unchanged'),
         ]
-        ax.legend(handles=legend_elements, loc='upper right')
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=8)
+        ax.set_axis_off()
+        ax.set_aspect('equal')
     
     def _plot_flooding_map(self, ax, nodes_gdf, base_vols, sol_vols):
         """Plots node flooding volume difference on map. Green=reduced, Red=increased."""
@@ -1255,17 +1189,24 @@ class ScenarioComparator:
         # Background nodes
         nodes_gdf.plot(ax=ax, color='lightgray', markersize=5, alpha=0.3)
         
-        for nid in nodes_gdf.index:
-            nid_str = str(nid)
-            base_v = base_vols.get(nid_str, 0)
-            sol_v = sol_vols.get(nid_str, 0)
-            diff = sol_v - base_v
-            
-            if abs(diff) > 1:  # Threshold for visibility
-                geom = nodes_gdf.loc[nid, 'geometry']
-                color = 'green' if diff < 0 else 'red'
-                size = min(10 + abs(diff) * 0.1, 50)
-                gpd.GeoSeries([geom]).plot(ax=ax, color=color, markersize=size, alpha=0.7)
+        # Vectorized delta calculation
+        base_s = pd.Series(base_vols)
+        sol_s = pd.Series(sol_vols)
+        
+        gdf = nodes_gdf.copy()
+        gdf['NodeID_s'] = gdf.index.astype(str)
+        
+        gdf['v_base'] = gdf['NodeID_s'].map(base_s).fillna(0)
+        gdf['v_sol'] = gdf['NodeID_s'].map(sol_s).fillna(0)
+        gdf['delta'] = gdf['v_sol'] - gdf['v_base']
+        
+        # Filter for visibility
+        sig_gdf = gdf[gdf['delta'].abs() > 1].copy()
+        
+        if not sig_gdf.empty:
+            sig_gdf['color'] = sig_gdf['delta'].apply(lambda x: 'green' if x < 0 else 'red')
+            sig_gdf['markersize'] = (10 + sig_gdf['delta'].abs() * 0.1).clip(0, 50)
+            sig_gdf.plot(ax=ax, color=sig_gdf['color'], markersize=sig_gdf['markersize'], alpha=0.7)
         
         # Legend
         from matplotlib.lines import Line2D
@@ -1275,6 +1216,7 @@ class ScenarioComparator:
         ]
         ax.legend(handles=legend_elements, loc='upper right')
     
+    @profile
     def _plot_velocity_map(self, ax, links_gdf, baseline, solution):
         """Plots conduit velocity change on map. Green=decreased, Red=increased."""
         if links_gdf is None or links_gdf.empty:
@@ -1290,6 +1232,124 @@ class ScenarioComparator:
         # For demonstration, we'll show a placeholder message
         ax.text(0.5, 0.5, "Velocity comparison requires link-level velocity data\\n(Currently only aggregate velocities available)",
                 ha='center', va='center', fontsize=12, transform=ax.transAxes)
+    
+    @profile
+    def _plot_absolute_velocity_map(self, ax, links_gdf, metrics, title, predios_gdf=None, bounds=None, show_predios: bool = False):
+        """Plots absolute pipe velocity (m/s) using colormap."""
+        if links_gdf is None or links_gdf.empty:
+            ax.text(0.5, 0.5, "No Link Data", ha='center')
+            return
+        
+        # Plot predios background first (very light gray) if requested
+        if show_predios and predios_gdf is not None and not predios_gdf.empty:
+            predios_gdf.plot(ax=ax, color='#f0f0f0', edgecolor='#d0d0d0', linewidth=0.2, zorder=0)
+        
+        # Background network
+        links_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.3, zorder=1)
+        
+        # Get velocity mapping from link_data
+        velocities = metrics.swmm_gdf['MaxVel']
+        
+        # Create a Copy of GDF for plotting values
+        plot_gdf = links_gdf.copy()
+        # Normalizar índices para mapeo robusto
+        plot_gdf.index = plot_gdf.index.astype(str).str.strip().str.upper()
+        plot_gdf['vel_val'] = plot_gdf.index.map(velocities).fillna(0.0)
+        
+        # 3 discrete color levels based on velocity (m/s)
+        # Level 1: ≤ 1.5 (Green - Good)
+        # Level 2: 1.5 - 3.0 (Orange - Caution)
+        # Level 3: > 3.0 (Red - Critical/Erosion)
+        level_1 = plot_gdf[plot_gdf['vel_val'] <= 3.5]
+        level_2 = plot_gdf[(plot_gdf['vel_val'] > 3.5) & (plot_gdf['vel_val'] <= 6.0)]
+        level_3 = plot_gdf[plot_gdf['vel_val'] > 6]
+        
+        # Plot each level with its color
+        if not level_1.empty:
+            level_1.plot(ax=ax, color='#2ecc71', linewidth=2.0, alpha=0.9, zorder=2)  # Green
+        if not level_2.empty:
+            level_2.plot(ax=ax, color='#f39c12', linewidth=2.5, alpha=0.9, zorder=3)  # Orange
+        if not level_3.empty:
+            level_3.plot(ax=ax, color='#e74c3c', linewidth=3.0, alpha=0.9, zorder=4)  # Red
+        
+        # Custom legend for the 3 levels
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color='#2ecc71', lw=3, label='≤ 3.5 m/s (Baja)'),
+            Line2D([0], [0], color='#f39c12', lw=3, label='3.5-6.0 m/s (Media)'),
+            Line2D([0], [0], color='#e74c3c', lw=3, label='> 6.0 m/s (Alta)')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=7, framealpha=0.9)
+        
+        # Set extent to pipeline bounds with small margin
+        if bounds is not None:
+            margin = 50  # meters
+            ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+            ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
+        
+        ax.set_title(title, fontsize=12)
+        ax.set_axis_off()
+        ax.set_aspect('equal')
+    
+    def _plot_velocity_delta_map(self, ax, links_gdf, baseline, solution, predios_gdf=None, bounds=None, show_predios: bool = False, derivations=None, tank_details=None, nodes_gdf=None):
+        """Plots pipe velocity change on map. Green=decreased (better), Red=increased, DarkGray=Unchanged."""
+        if links_gdf is None or links_gdf.empty:
+            ax.text(0.5, 0.5, "No Link Data", ha='center')
+            return
+        
+        # Plot predios background
+        if show_predios and predios_gdf is not None and not predios_gdf.empty:
+            predios_gdf.plot(ax=ax, color='#f0f0f0', edgecolor='#d0d0d0', linewidth=0.2, zorder=0)
+        
+        # Background network
+        links_gdf.plot(ax=ax, color='lightgray', linewidth=0.5, alpha=0.5, zorder=1)
+        
+        # Vectorized calculation
+        base_vels = pd.Series(baseline.swmm_gdf['MaxVel'])
+        sol_vels = pd.Series(solution.swmm_gdf['MaxVel'])
+        
+        # Normalize index
+        plot_gdf = links_gdf.copy()
+        plot_gdf.index = plot_gdf.index.astype(str).str.strip().str.upper()
+        
+        # Map values
+        plot_gdf['delta'] = plot_gdf.index.map(sol_vels).fillna(0) - plot_gdf.index.map(base_vels).fillna(0)
+        
+        # Unchanged
+        unchanged = plot_gdf[abs(plot_gdf['delta']) <= 0.05]
+        if not unchanged.empty:
+            unchanged.plot(ax=ax, color='#444444', linewidth=0.8, alpha=0.4, zorder=2)
+
+        # Improved (Decreased velocity, Green)
+        improved = plot_gdf[plot_gdf['delta'] < -0.05]
+        if not improved.empty:
+            improved.plot(ax=ax, color='green', linewidth=3.5, alpha=0.9, zorder=3)
+
+        # Worsened (Increased velocity, Red)
+        worsened = plot_gdf[plot_gdf['delta'] > 0.05]
+        if not worsened.empty:
+            worsened.plot(ax=ax, color='red', linewidth=3.0, alpha=0.8, zorder=3)
+        
+        # # Plot derivations if requested
+        # if not derivations.empty:
+        #     self._plot_derivations_and_labels(ax, derivations, tank_details)
+
+        # Set extent
+        if bounds is not None:
+            margin = 50
+            ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+            ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
+        
+        # Legend
+
+        legend_elements = [
+            Line2D([0], [0], color='green', lw=3, label='Decreased'),
+            Line2D([0], [0], color='red', lw=3, label='Increased'),
+            Line2D([0], [0], color='#444444', lw=2, label='Unchanged'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=8)
+        ax.set_axis_off()
+        ax.set_aspect('equal')
 
     def generate_hydrograph_pages(self, solution: SystemMetrics, solution_name: str, save_dir: Path, detailed_links: Dict):
         """Generates multiple pages of 3x3 hydrograph grids."""
@@ -1318,7 +1378,7 @@ class ScenarioComparator:
                 
             fig.suptitle(f"Hydrograph Analysis ({i+1}-{i+len(batch_nodes)}): {solution_name}", fontsize=16)
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-            plt.savefig(save_dir / f"dashboard_comparison_batch_{batch_idx+1}.png", dpi=100)
+            plt.savefig(save_dir / f"03_dashboard_comparison_batch_{batch_idx+1}.png", dpi=100)
             plt.close(fig)
 
     def _overlay_annotations(self, ax, derivations, annotations_data):
@@ -1328,9 +1388,7 @@ class ScenarioComparator:
             if i >= len(derivations): break
             
             row_num = i + 1  # Table row number (1-indexed)
-            predio_id = item.get('predio_id', '?')
-            
-            geom = derivations[i]
+            geom = derivations.geometry.iloc[i]
             if isinstance(geom, LineString):
                 # Midpoint for label
                 mid_pt = geom.interpolate(0.5, normalized=True)
@@ -1382,20 +1440,20 @@ class ScenarioComparator:
         for lid in up_ids:
             if lid in sol_hydros:
                 d = sol_hydros[lid]
-                ax_sol.plot(get_hrs(d), d['flow'], color='darkorange', linewidth=2, label=f'Antes: {lid}')
+                ax_sol.plot(d['flow_series'].index, d['flow_series'].to_numpy(), color='darkorange', linewidth=2, label=f'Antes: {lid}')
         
         # 2. Derivation (La Derivacion) - Make it standout
         for lid in deriv_ids:
             if lid in sol_hydros:
                 d = sol_hydros[lid]
-                ax_sol.plot(get_hrs(d), d['flow'], color='blue', linewidth=3, label=f'Derivación: {lid}')
+                ax_sol.plot(d['flow_series'].index, d['flow_series'].to_numpy(), color='blue', linewidth=3, label=f'Derivación: {lid}')
                 
         # 3. Downstream (Despues)
         for lid in down_ids:
             if lid in sol_hydros:
                 d = sol_hydros[lid]
                 # Use dashed or lighter for downstream in solution
-                ax_sol.plot(get_hrs(d), d['flow'], color='green', linestyle='-', linewidth=2, label=f'Después: {lid}')
+                ax_sol.plot(d['flow_series'].index, d['flow_series'].to_numpy(), color='green', linestyle='-', linewidth=2, label=f'Después: {lid}')
                 
         ax_sol.set_xlabel("Time (h)")
         ax_sol.set_ylabel("Flow (CMS)")
@@ -1410,13 +1468,13 @@ class ScenarioComparator:
         for lid in up_ids:
             if lid in base_hydros:
                 d = base_hydros[lid]
-                ax_base.plot(get_hrs(d), d['flow'], color='darkorange', linestyle='--', alpha=0.7, label=f'Base Antes: {lid}')
+                ax_base.plot(d['flow_series'].index, d['flow_series'].to_numpy(), color='darkorange', linestyle='--', alpha=0.7, label=f'Base Antes: {lid}')
 
         # 2. Downstream Base
         for lid in down_ids:
             if lid in base_hydros:
                 d = base_hydros[lid]
-                ax_base.plot(get_hrs(d), d['flow'], color='green', linestyle='--', alpha=0.7, label=f'Base Después: {lid}')
+                ax_base.plot(d['flow_series'].index, d['flow_series'].to_numpy(), color='green', linestyle='--', alpha=0.7, label=f'Base Después: {lid}')
                 
         ax_base.set_xlabel("Time (h)")
         ax_base.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
@@ -1477,60 +1535,187 @@ class ScenarioComparator:
              ax.legend(fontsize='small', ncol=2)
         ax.grid(True, alpha=0.3)
 
+
+
     def _plot_scalar_comparison(self, ax, sol: SystemMetrics, name: str):
-        """Bar chart of % reduction."""
-        metrics = ["Volume", "Cost", "Nodes", "Avg Depth"]
-        def get_pct(base, curr):
-            if base <= 0: return 0.0
-            return (base - curr) / base * 100.0
+        """Bar chart of % reduction for specific system metrics."""
         
-        reductions = [
-            get_pct(self.baseline.total_flooding_volume, sol.total_flooding_volume),
-            get_pct(self.baseline.flooding_cost, sol.flooding_cost),
-            get_pct(self.baseline.flooded_nodes_count, sol.flooded_nodes_count),
-            get_pct(self.baseline.avg_node_depth, sol.avg_node_depth)
+        # 1. Total Flooding Volume (m3)
+        b_flood = self.baseline.total_flooding_volume
+        s_flood = sol.total_flooding_volume
+        
+        # 2. Peak Flooding Flow (cms)
+        b_peak = self.baseline.total_max_flooding_flow
+        s_peak = sol.total_max_flooding_flow
+
+        # 3. Total Outfall Volume (m3)
+        b_outfall = self.baseline.total_outfall_volume
+        s_outfall = sol.total_outfall_volume
+        
+        # 4. System Pipe Capacity (Avg h/D)
+        b_caps = [v.get('max_capacity', 0) for v in self.baseline.link_data.values()]
+        s_caps = [v.get('max_capacity', 0) for v in sol.link_data.values()]
+        b_cap = np.mean(b_caps) if b_caps else 0
+        s_cap = np.mean(s_caps) if s_caps else 0
+        
+        # 5. Total Flooded Nodes (Count)
+        b_nodes = self.baseline.flooded_nodes_count
+        s_nodes = sol.flooded_nodes_count
+        
+        # 6. System Water Level (Avg max depth m)
+        b_depths = [v.get('max_depth', 0) for v in self.baseline.node_data.values()]
+        s_depths = [v.get('max_depth', 0) for v in sol.node_data.values()]
+        b_depth = np.mean(b_depths) if b_depths else 0
+        s_depth = np.mean(s_depths) if s_depths else 0
+
+        # Mappings (Clearer names for the user)
+        metrics = [
+            "Total Flood Vol", 
+            "Peak Flood Flow", 
+            "Total Outfall", 
+            "System Cap.", 
+            "Flood Nodes", 
+            "Water Depth"
         ]
         
-        colors = ['green' if r >= 0 else 'red' for r in reductions]
-        bars = ax.bar(metrics, reductions, color=colors, alpha=0.7)
-        ax.axhline(0, color='black', linewidth=0.8)
-        ax.set_ylabel("% Improvement")
-        ax.set_title("System Improvements")
-        ax.set_ylim(bottom=min(min(reductions, default=0), -12) * 1.3, top=105) # More space at bottom
-        for bar, val in zip(bars, reductions):
-            height = bar.get_height()
-            # If negative (Red), put text inside/above bottom if possible or below with enough space?
-            # User complained about overlap with axis labels (likely at bottom spine).
-            # Putting text just below zero line (top of negative bar) is cleaner if bar is long enough.
-            # But let's stick to bar end, just ensure limits are wide enough.
-            
-            if height >= 0:
-                 offset = 3
-                 va = 'bottom'
+        def get_stats(base, curr, higher_is_better=False):
+            delta = curr - base
+            if base <= 0:
+                pct = 100.0 if curr > 0 else 0.0
             else:
-                 offset = -2 # Slightly below bar end
-                 va = 'top' # Hang below
-            
-            ax.text(bar.get_x() + bar.get_width()/2., height + offset, f'{val:.1f}%', ha='center', va=va, fontweight='bold', fontsize=9)
+                pct = (delta / base) * 100.0
+            is_improvement = delta < 0
+            if higher_is_better: is_improvement = delta > 0
+            imp_pct = -pct 
+            if higher_is_better: imp_pct = pct
+            return imp_pct, is_improvement
+
+        results = [
+            get_stats(b_flood, s_flood),
+            get_stats(b_peak, s_peak),
+            get_stats(b_outfall, s_outfall),
+            get_stats(b_cap, s_cap),
+            get_stats(b_nodes, s_nodes),
+            get_stats(b_depth, s_depth)
+        ]
+        
+        reductions = [r[0] for r in results]
+        improvements = [r[1] for r in results]
+        
+        colors = ['#2ecc71' if ok else '#e74c3c' for ok in improvements]
+        bars = ax.bar(metrics, reductions, color=colors, alpha=0.8, edgecolor='black', linewidth=0.5)
+        ax.axhline(0, color='black', linewidth=1.0)
+        
+        ax.set_ylabel("% Improvement")
+        ax.set_title("System Improvements (%)", fontsize=14, fontweight='bold')
+        ax.set_ylim(bottom=min(min(reductions, default=0), -15) * 1.4, top=115)
+        ax.grid(axis='y', linestyle='--', alpha=0.3)
+
+        for bar, pct, ok in zip(bars, reductions, improvements):
+            h = bar.get_height()
+            va = 'bottom' if h >= 0 else 'top'
+            offset = 3 if h >= 0 else -3
+            status = "Mejor" if ok else "Peor"
+            label = f"{pct:.1f}%\n({status})"
+            ax.text(bar.get_x() + bar.get_width()/2., h + offset, label, 
+                    ha='center', va=va, fontweight='bold', fontsize=9)
+
+    def _plot_absolute_summary(self, ax, sol: SystemMetrics, name: str):
+        """Grouped bar chart for absolute value comparison (Baseline vs Solution)."""
+        metrics = ["Flooding Vol\n(m3)", "Peak Flood\n(cms)", "Outfall Vol\n(m3)", "Total Storage\n(m3)"]
+        
+        # Collect Data
+        b_flood = self.baseline.total_flooding_volume
+        s_flood = sol.total_flooding_volume
+        
+        b_peak = self.baseline.total_max_flooding_flow
+        s_peak = sol.total_max_flooding_flow
+        
+        b_out = self.baseline.total_outfall_volume
+        s_out = sol.total_outfall_volume
+        
+        # Storage is only in Solution
+        s_store =  np.sum([__['max_stored_volume'] for _, __ in sol.tank_data.items()])
+        b_store = np.sum([__['max_stored_volume'] for _, __ in self.baseline.tank_data.items()])
+        
+        base_vals = [b_flood, b_peak, b_out, b_store]
+        sol_vals = [s_flood, s_peak, s_out, s_store]
+        
+        x = np.arange(len(metrics))
+        width = 0.35
+        
+        # Scaling: Since volumes are HUGE and peak flow is SMALL, we use a trick or log scale.
+        # But for visibility, let's use a dual axis or just normalize for plotting but label with real values.
+        # Or just two subplots inside? Let's try twinx for Flow? No, that's messy.
+        
+        # Better: Group them but use log scale if necessary?
+        
+        ax.bar(x - width/2, base_vals, width, label='Baseline', color='#e74c3c', alpha=0.9)
+        ax.bar(x + width/2, sol_vals, width, label='Solution', color='#3498db', alpha=0.9)
+        
+        ax.set_yscale('symlog', linthresh=10) # Log scale for large ranges
+        ax.set_title("Absolute Totals: Baseline vs Solution", fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(metrics)
+        ax.legend()
+        ax.grid(True, alpha=0.2)
+        
+        def format_val(val):
+            if abs(val) >= 1_000_000:
+                return f"{val/1_000_000:.1f}M"
+            if abs(val) >= 1_000:
+                return f"{val/1_000:.1f}k"
+            return f"{val:.1f}"
+
+        # Labels
+        for i, (b_v, s_v) in enumerate(zip(base_vals, sol_vals)):
+            # Base Label
+            ax.text(i - width/2, b_v, format_val(b_v), 
+                    ha='center', va='bottom', fontsize=8, color='darkred', fontweight='bold',
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.6))
+            # Sol Label
+            ax.text(i + width/2, s_v, format_val(s_v), 
+                    ha='center', va='bottom', fontsize=8, color='darkblue', fontweight='bold',
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.6))
+
+
+
+
+
+
 
     def _plot_volume_scatter(self, ax, base_vols: Dict, sol_vols: Dict):
-        """Scatter plot of Baseline vs Solution Volume (Log-Log)."""
-        all_nodes = set(base_vols.keys()) | set(sol_vols.keys())
-        x_vals, y_vals, colors = [], [], []
+        """Scatter plot of Baseline vs Solution Volume (Log-Log) - Vectorized."""
+        # Convert dicts to DataFrames for fast merging
+
+        base_df = pd.DataFrame.from_dict(base_vols, orient='index')
+        sol_df = pd.DataFrame.from_dict(sol_vols, orient='index')
         
-        for nid in all_nodes:
-            v_base = base_vols.get(nid, 0.0)
-            v_sol = sol_vols.get(nid, 0.0)
-            if v_base < 0.1 and v_sol < 0.1: continue
+        if base_df.empty or sol_df.empty:
+            ax.text(0.5, 0.5, "No Volume Data", ha='center')
+            return
             
-            x_vals.append(v_base)
-            y_vals.append(v_sol)
-            if v_sol < v_base * 0.99: colors.append('green')
-            elif v_sol > v_base * 1.01: colors.append('red')
-            else: colors.append('gray')
+        # Merge on NodeID (index)
+        df = pd.merge(base_df[['flooding_volume']], 
+                      sol_df[['flooding_volume']], 
+                      left_index=True, right_index=True, suffixes=('_base', '_sol'))
+        
+        # Filter significant flooding (> 0.1 m3)
+        df = df[(df['flooding_volume_base'] >= 0.1) | (df['flooding_volume_sol'] >= 0.1)]
+        
+        if df.empty:
+            ax.text(0.5, 0.5, "No significant flooding nodes", ha='center')
+            return
             
-        ax.scatter(x_vals, y_vals, c=colors, alpha=0.6, edgecolors='k', s=40)
-        max_val = max(max(x_vals, default=1), max(y_vals, default=1))
+        # Calculate colors in bulk
+        df['color'] = 'gray'
+        df.loc[df['flooding_volume_sol'] < df['flooding_volume_base'] * 0.99, 'color'] = 'green'
+        df.loc[df['flooding_volume_sol'] > df['flooding_volume_base'] * 1.01, 'color'] = 'red'
+        
+        # Plot in a single call
+        ax.scatter(df['flooding_volume_base'], df['flooding_volume_sol'], 
+                   c=df['color'], alpha=0.6, edgecolors='k', s=20)
+        max_val = max(df['flooding_volume_base'].max(), df['flooding_volume_sol'].max())
         ax.plot([0, max_val], [0, max_val], 'k--', alpha=0.5)
         ax.set_xlabel('Baseline Flooding (m3)')
         ax.set_ylabel('Solution Flooding (m3)')
@@ -1538,195 +1723,56 @@ class ScenarioComparator:
         ax.loglog()
         ax.grid(True, which="both", alpha=0.3)
 
-    def _plot_spatial_diff(self, ax, nodes_gdf: gpd.GeoDataFrame, base_vols: Dict, sol_vols: Dict, inp_path: str, derivations: List):
-        """
-        Maps delta flooding + Background Network + New Derivations.
-        """
-        # 0. Background Predios (Very Light Gray) - New
-        predios = gpd.read_file(config.PREDIOS_DAMAGED_FILE)
-        # Ensure CRS matches project CRS for correct alignment
-        predios = predios.to_crs(config.PROJECT_CRS)
-        # Even Lighter gray (almost white)
-        predios.plot(ax=ax, color='#f2f2f2', edgecolor='#e0e0e0', linewidth=0.25, zorder=-1)
 
-
-        # 1. Background Network (Dark Gray/Black) from Vector File
-        net_gdf = None
-        if hasattr(config, 'NETWORK_FILE') and config.NETWORK_FILE.exists():
-            try:
-                net_gdf = gpd.read_file(config.NETWORK_FILE)
-                if hasattr(config, 'PROJECT_CRS'):
-                     net_gdf = net_gdf.to_crs(config.PROJECT_CRS)
-                
-                # Darker lines for contrast against predios
-                net_gdf.plot(ax=ax, color='#222222', linewidth=1.2, alpha=0.6, zorder=0)
-            except Exception as e:
-                print(f"Background map error (vector): {e}")
-        elif inp_path and os.path.exists(inp_path):
-            # Fallback to SWMMIO if vector not available
-            try:
-                import swmmio
-                from shapely.geometry import LineString
-                model = swmmio.Model(inp_path)
-                conduits = model.conduits()
-                lines = []
-                for _, row in conduits.iterrows():
-                    if 'coords' in row and isinstance(row['coords'], list) and len(row['coords']) >= 2:
-                        lines.append(LineString(row['coords']))
-                if lines:
-                     net_gdf = gpd.GeoDataFrame(geometry=lines) # Create temporary GDF for bounds
-                     gpd.GeoSeries(lines).plot(ax=ax, color='#222222', linewidth=1.2, alpha=0.6, zorder=0)
-            except Exception as e:
-                print(f"Background map error (swmmio): {e}")
-
-        # 2. New Derivations (Thick Blue)
-        if derivations:
-            from shapely.geometry import LineString
-            for geom in derivations:
-                if isinstance(geom, LineString):
-                    x, y = geom.xy
-                    ax.plot(x, y, color='blue', linewidth=2, zorder=5)
-                    # END POINT BLACK (Predio) - User request
-                    ax.scatter([x[-1]], [y[-1]], color='black', s=80, marker='o', zorder=6, label='Predio (Terreno)')
-
-        # 3. Nodes (Colored by Delta)
-        gdf = nodes_gdf.copy()
-        deltas = []
-        colors = []
-        sizes = []
-        
-        for idx, row in gdf.iterrows():
-            nid = str(row['NodeID'])
-            v_base = base_vols.get(nid, 0.0)
-            v_sol = sol_vols.get(nid, 0.0)
-            delta = v_base - v_sol
-            
-            if abs(delta) < 1.0: 
-                c = 'gray'; s = 5; alpha=0.2
-            elif delta > 0: # Improved
-                c = 'green'; s = 30 + min(delta, 100)*0.5; alpha=0.8
-            else: # Worsened
-                c = 'red'; s = 30 + min(abs(delta), 100)*0.5; alpha=0.8
-            colors.append(c); sizes.append(s)
-        
-        gdf['color'] = colors
-        gdf['size'] = sizes
-        
-        gdf.plot(ax=ax, color=gdf['color'], markersize=gdf['size'], alpha=0.7, zorder=2)
-        
-        # Set limits based on Network + Derivations (ignoring huge predios background)
-        bounds_geoms = []
-        if net_gdf is not None and not net_gdf.empty:
-            bounds_geoms.append(net_gdf.unary_union)
-        elif nodes_gdf is not None and not nodes_gdf.empty: # Fallback to filtered nodes if no net
-            bounds_geoms.append(nodes_gdf.unary_union)
-            
-        if derivations:
-            from shapely.ops import unary_union
-            # Add derivations to bounds
-            for d in derivations:
-                bounds_geoms.append(d)
-        
-        if bounds_geoms:
-            from shapely.ops import unary_union
-            unified = unary_union(bounds_geoms)
-            minx, miny, maxx, maxy = unified.bounds
-            margin = 50  # meters margin
-            ax.set_xlim(minx - margin, maxx + margin)
-            ax.set_ylim(miny - margin, maxy + margin)
-            ax.set_aspect('equal')
-
-        ax.set_title("Spatial Flooding Delta (Green=Improved, Red=Worsened)")
-        ax.set_axis_off()
-
-    def _plot_detailed_row_nx3(self, ax_flow, ax_cap, ax_flood, nid, links, baseline, solution):
+    @staticmethod
+    def _plot_detailed_row_nx3(ax_flow, ax_cap, ax_flood, nid, links, baseline, solution):
         """Plots one row (3 cols) for a specific intervention node."""
         
         up_ids = links.get('upstream', [])
         down_ids = links.get('downstream', [])
         deriv_ids = links.get('derivation', [])
-        
-        def get_hrs(data):
-            if not data or not data['times']: return []
-            t0 = data['times'][0]
-            return [(t - t0).total_seconds()/3600.0 for t in data['times']]
 
         # --- COL 1: FLOW (Caudal) ---
         ax_flow.set_title(f"Node {nid}: Caudal (Flow)", fontsize=10)
-        ax_flow.set_ylabel("Caudal (cms)")
+        ax_flow.set_ylabel("Caudal (m3/s)")
         
         # All lines solid for Solution to see them clearly
         for lid in up_ids:
-            if lid in solution.link_hydrographs:
-                d = solution.link_hydrographs[lid]
-                ax_flow.plot(get_hrs(d), d['flow'], color='orange', label='Antes (Sol)')
+            if lid in solution.link_data:
+                d = solution.link_data[lid]
+                ax_flow.plot(d['flow_series'].index, d['flow_series'].to_numpy(), color='orange', label='Antes Derivacion')
         for lid in down_ids:
-            if lid in solution.link_hydrographs:
-                d = solution.link_hydrographs[lid]
-                ax_flow.plot(get_hrs(d), d['flow'], color='green', label='Después (Sol)')
+            if lid in solution.link_data:
+                d = solution.link_data[lid]
+                ax_flow.plot(d['flow_series'].index, d['flow_series'].to_numpy(), color='green', label='Después Derivacion')
         for lid in deriv_ids:
-            if lid in solution.link_hydrographs:
-                d = solution.link_hydrographs[lid]
-                ax_flow.plot(get_hrs(d), d['flow'], color='blue', linewidth=3, label='Derivación')
-        
-        # Add Baseline flows (Dashed) for comparison
-        for lid in up_ids:
-            if lid in baseline.link_hydrographs:
-                d = baseline.link_hydrographs[lid]
-                ax_flow.plot(get_hrs(d), d['flow'], color='grey', linestyle='--', alpha=0.9, label='Antes (Base)') # Darker grey
-        for lid in down_ids:
-            if lid in baseline.link_hydrographs:
-                d = baseline.link_hydrographs[lid]
-                ax_flow.plot(get_hrs(d), d['flow'], color='lightgreen', linestyle='--', alpha=0.9, label='Después (Base)')
-                
+            if lid in solution.link_data:
+                d = solution.link_data[lid]
+                ax_flow.plot(d['flow_series'].index, d['flow_series'].to_numpy(), color='blue', linewidth=3, label='Derivación')
+
         ax_flow.legend(fontsize=8)
         ax_flow.grid(True, alpha=0.3)
-        
-        # --- IDENTITY CHECK ---
-        # Check if Upstream/Downstream flow is identical to baseline
-        is_identical = False
-        diff_msg = ""
-        
-        # Check first upstream link as proxy
-        if up_ids and up_ids[0] in solution.link_hydrographs and up_ids[0] in baseline.link_hydrographs:
-            sol_d = solution.link_hydrographs[up_ids[0]]['flow']
-            base_d = baseline.link_hydrographs[up_ids[0]]['flow']
-            
-            # Simple length check first
-            if len(sol_d) == len(base_d):
-                if np.allclose(sol_d, base_d, atol=1e-4):
-                    is_identical = True
-                    diff_msg = " [IDENTICAL TO BASELINE]"
-                else:
-                    diff_sum = np.sum(np.abs(np.array(sol_d) - np.array(base_d)))
-                    diff_msg = f" [Diff Sum: {diff_sum:.2f}]"
-            else:
-                diff_msg = f" [Len Diff: {len(sol_d)}vs{len(base_d)}]"
 
-        if is_identical:
-             ax_flow.set_title(f"Node {nid}: Caudal (Flow) - WARNING: IDENTICAL DATA!", fontsize=10, color='red', fontweight='bold')
-             ax_flow.text(0.5, 0.5, "IDENTICAL DATA\n(Solution = Baseline)", 
-                          transform=ax_flow.transAxes, ha='center', va='center', 
-                          color='red', fontsize=12, fontweight='bold', bbox=dict(facecolor='yellow', alpha=0.5))
-        else:
-             ax_flow.set_title(f"Node {nid}: Caudal (Flow){diff_msg}", fontsize=10)
+        ax_flow.set_title(f"Node {nid}: Caudal [m3/s]", fontsize=10)
+        ax_flow.legend(fontsize=8)
+        ax_flow.grid(True, alpha=0.3)
         
         # --- COL 2: CAPACITY (Capacidad / Usage) ---
         ax_cap.set_title(f"Capacidad (Uso [0-1])", fontsize=10)
         
         # Plot Link Capacities (Usage fraction)
         for lid in up_ids:
-            if lid in solution.link_capacities:
-                d = solution.link_capacities[lid]
-                ax_cap.plot(get_hrs(d), d['capacity'], color='orange', linestyle='--', label='Antes')
+            if lid in solution.link_data:
+                d = solution.link_data[lid]
+                ax_cap.plot(d['capacity_series'].index, d['capacity_series'].to_numpy(), color='orange', linestyle='--', label='Antes')
         for lid in down_ids:
-            if lid in solution.link_capacities:
-                d = solution.link_capacities[lid]
-                ax_cap.plot(get_hrs(d), d['capacity'], color='green', linestyle='--', label='Después')
+            if lid in solution.link_data:
+                d = solution.link_data[lid]
+                ax_cap.plot(d['capacity_series'].index, d['capacity_series'].to_numpy(), color='green', linestyle='--', label='Después')
         for lid in deriv_ids:
-            if lid in solution.link_capacities:
-                d = solution.link_capacities[lid]
-                ax_cap.plot(get_hrs(d), d['capacity'], color='blue', linewidth=2, linestyle='-', label='Derivación')
+            if lid in solution.link_data:
+                d = solution.link_data[lid]
+                ax_cap.plot(d['capacity_series'].index, d['capacity_series'].to_numpy(), color='blue', linewidth=2, linestyle='-', label='Derivación')
                 
         ax_cap.set_ylim(0, 1.1)
         ax_cap.grid(True, alpha=0.3)
@@ -1734,25 +1780,27 @@ class ScenarioComparator:
         # --- COL 3: FLOOD HYDROGRAPH (Node) ---
         ax_flood.set_title(f"Inundación Nodo {nid}", fontsize=10)
         ax_flood.set_ylabel("Profundidad (m)")
+        ax_flood.legend(fontsize=8)
+        ax_flood.grid(True, alpha=0.3)
         
         # Baseline Flood
-        if nid in baseline.flood_hydrographs:
-            d = baseline.flood_hydrographs[nid]
-            ax_flood.plot(get_hrs(d), d['depths'], color='red', linestyle='--', label='Base Depth')
+        if nid in baseline.node_data:
+            d = baseline.node_data[nid]
+            ax_flood.plot(d['depth_series'].index, d['depth_series'].to_numpy(), color='red', linestyle='--', label='Base Depth')
             
         # Solution Flood
-        if nid in solution.flood_hydrographs:
-            d = solution.flood_hydrographs[nid]
-            ax_flood.plot(get_hrs(d), d['depths'], color='blue', label='Sol Depth')
+        if nid in solution.node_data:
+            d = solution.node_data[nid]
+            ax_flood.plot(d['depth_series'].index, d['depth_series'].to_numpy(), color='blue', label='Sol Depth')
             
     def _plot_system_capacity_hist(self, ax, baseline, solution):
         """Plots overlaid histograms of max pipe capacity usage for entire system."""
         
         def get_max_capacities(metrics_obj):
             caps = []
-            for lid, data in metrics_obj.link_capacities.items():
-                if data.get('capacity'):
-                    caps.append(max(data['capacity']))
+            for lid, data in metrics_obj.link_data.items():
+                if data.get('capacity_series'):
+                    caps.append(max(data['capacity_series']))
             return caps
         
         base_caps = get_max_capacities(baseline)
@@ -1822,16 +1870,7 @@ class ScenarioComparator:
         plt.savefig(save_dir / "dashboard_annotations.png", dpi=100)
         plt.close(fig)
 
-    def _plot_hist(self, ax, data_base, data_sol, xlabel):
-        if not data_base and not data_sol: return
-        # Use KDE lines with transparent fill
-        if data_base:
-            sns.kdeplot(data_base, ax=ax, color='red', linewidth=2, label='Baseline', fill=True, alpha=0.15)
-        if data_sol:
-            sns.kdeplot(data_sol, ax=ax, color='blue', linewidth=2, label='Solution', fill=True, alpha=0.15)
-        ax.set_xlabel(xlabel)
-        ax.legend()
-        ax.set_title(f"Distribution: {xlabel}")
+
         
     def _plot_hydrographs(self, ax, base_hydros: Dict, sol_hydros: Dict):
         """Plots hydrographs for the most critical nodes found in baseline."""
@@ -1897,12 +1936,13 @@ class ScenarioComparator:
         ax.legend(loc='lower right')
         ax.set_title(f"ECDF: {xlabel}")
 
-    def generate_tank_hydrograph_plots(self, solution: SystemMetrics, solution_name: str, save_dir: Path, detailed_links: Dict = None):
+    @staticmethod
+    def generate_tank_hydrograph_plots_old(solution: SystemMetrics, solution_name: str, save_dir: Path, detailed_links: Dict = None):
         """Generates plots for detailed tank hydrographs (Inflow, Volume, Depth). Max 4 per page."""
-        if not solution.tank_utilization:
+        if not solution.tank_data:
             return
-            
-        tank_ids = list(solution.tank_utilization.keys())
+
+        tank_ids = list(solution.tank_data.keys())
         tank_ids.sort()
         
         batch_size = 4
@@ -1916,96 +1956,149 @@ class ScenarioComparator:
             gs = fig.add_gridspec(n_rows, 3)
             
             for row_idx, tk_id in enumerate(batch_tanks):
-                util_data = solution.tank_utilization[tk_id]
-                max_depth = util_data.get('max_depth', 0)
-                design_depth = 5.0
-                
-                # Extract source_node from tank_id (TK_P0061405_4 -> P0061405)
-                parts = tk_id.split('_')
-                source_node = parts[1] if len(parts) > 1 else tk_id
-                
-                # Try to get design_vol from detailed_links (passed from evaluator)
-                design_vol = util_data.get('design_vol', 0.0)
-                               
-                times = util_data.get('times', [])
-                depths = util_data.get('depth_series', [])
+                util_data = solution.tank_data[tk_id]
+                design_vol = util_data.get('total_volume', 0.0)
                 
                 # Axes
                 ax_flow = fig.add_subplot(gs[row_idx, 0])
                 ax_vol = fig.add_subplot(gs[row_idx, 1])
                 ax_depth = fig.add_subplot(gs[row_idx, 2])
-                
-                if times and depths:
-                     # Time axis
-                     if hasattr(times[0], 'hour'):
-                          hrs = [(t - times[0]).total_seconds()/3600.0 for t in times]
-                     else:
-                          hrs = times 
-                     
-                     # 1. Calculate Volume Series
-                     # Area = DesignVol / DesignDepth
-                     area = (design_vol / design_depth) if design_depth > 0 else 0
-                     vols = [d * area for d in depths]
-                     max_vol_reached = max(vols) if vols else 0
-                     
-                     # 2. Calculate Inflow (Approx dV/dt)
-                     inflow = [0.0] * len(vols)
-                     if len(vols) > 1:
-                         for k in range(1, len(vols)):
-                             dt_sec = (hrs[k] - hrs[k-1]) * 3600.0
-                             if dt_sec > 0:
-                                 # Q = dV / dt
-                                 val = (vols[k] - vols[k-1]) / dt_sec
-                                 # Smooth out noise/negative flows (sloshing)
-                                 inflow[k] = max(0, val) 
-                     
-                     # --- PLOT 1: INFLOW (Derived) ---
-                     ax_flow.plot(hrs, inflow, color='blue', linewidth=1.5, label='Est. Inflow')
-                     ax_flow.set_title(f"{tk_id}\nWeir Flow (Inflow)", fontweight='bold')
-                     ax_flow.set_ylabel("Flow (m³/s)")
-                     ax_flow.fill_between(hrs, inflow, color='blue', alpha=0.1)
-                     ax_flow.grid(True, alpha=0.3)
-                     ax_flow.text(0.95, 0.95, f"Peak: {max(inflow):.2f} m³/s", transform=ax_flow.transAxes, ha='right', va='top', fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
 
-                     # --- PLOT 2: VOLUME ---
-                     ax_vol.plot(hrs, vols, color='green', linewidth=2, label='Volume')
-                     ax_vol.set_title("Cumulative Volume")
-                     ax_vol.set_ylabel("Volume (m³)")
-                     ax_vol.fill_between(hrs, vols, color='green', alpha=0.2)
-                     ax_vol.axhline(design_vol, color='darkgreen', linestyle='--', label='Capacity')
-                     ax_vol.grid(True, alpha=0.3)
-                     ax_vol.text(0.95, 0.95, f"Stored: {max_vol_reached:,.0f} m³", transform=ax_vol.transAxes, ha='right', va='top', fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
-
-                     # --- PLOT 3: DEPTH ---
-                     ax_depth.plot(hrs, depths, color='tab:red', linewidth=2, label='Depth')
-                     ax_depth.axhline(design_depth, color='darkred', linestyle='--', label='Design (5m)')
-                     ax_depth.fill_between(hrs, depths, color='tab:red', alpha=0.2)
-                     
-                     # Label
-                     vol_str = f"{design_vol:,.0f} m³" if design_vol > 0 else "N/A"
-                     label_text = (f"Design Vol: {vol_str}\n"
-                                   f"Design Depth: {design_depth} m\n"
-                                   f"Max Depth: {max_depth:.2f} m\n"
-                                   f"Util: {(max_depth/design_depth)*100:.0f}%")
-                     ax_depth.text(0.98, 0.95, label_text, transform=ax_depth.transAxes, 
-                                   ha='right', va='top', fontsize=10,
-                                   bbox=dict(facecolor='lemonchiffon', alpha=0.7, edgecolor='orange'))
-                     ax_depth.set_title("Tank Depth (Filling Curve)")
-                     ax_depth.set_ylabel("Depth (m)")
+                # --- PLOT 1: INFLOW (Calculado) ---
+                variable = 'flow_series'
+                # CONVERSIÓN A HORAS RELATIVAS (X-axis fix)
+                t0 = util_data[variable].index[0]
+                hrs = [(t - t0).total_seconds() / 3600.0 for t in util_data[variable].index]
                 
-                # Common X-Axis Label
+                ax_flow.plot(hrs, util_data[variable].to_numpy(), color='blue', linewidth=1.5, label='Est. Inflow')
+                ax_flow.set_title(f"{tk_id}\nInflow", fontweight='bold')
+                ax_flow.set_ylabel("Flow (m³/s)")
+                ax_flow.fill_between(hrs, util_data[variable].to_numpy(), color='blue', alpha=0.1)
+                ax_flow.grid(True, alpha=0.3)
+                ax_flow.text(0.95, 0.95, f"Peak: {util_data['max_flow']:.2f} m³/s", transform=ax_flow.transAxes, ha='right', va='top', fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
+                
+                # --- PLOT 2: VOLUME ---
+                variable = 'volume_series'
+                ax_vol.plot(hrs, util_data[variable].to_numpy(), color='green', linewidth=2, label='Volume')
+                ax_vol.set_title("Cumulative Volume")
+                ax_vol.set_ylabel("Volume (m³)")
+                ax_vol.fill_between(hrs, util_data[variable].to_numpy(), color='green', alpha=0.2)
+                ax_vol.axhline(design_vol, color='darkgreen', linestyle='--', label='Capacity')
+                ax_vol.grid(True, alpha=0.3)
+                ax_vol.text(0.95, 0.95, f"Stored: {util_data['max_stored_volume']:,.0f} m³", transform=ax_vol.transAxes, ha='right', va='top', fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
+                
+                # --- PLOT 3: DEPTH ---
+                variable = 'depth_series'
+                ax_depth.plot(hrs, util_data[variable].to_numpy(), color='tab:red', linewidth=2, label='Depth')
+                ax_depth.axhline(config.TANK_DEPTH_M, color='darkred', linestyle='--', label=f'Design ({config.TANK_DEPTH_M}m)')
+                ax_depth.fill_between(hrs, util_data[variable].to_numpy(), color='tab:red', alpha=0.2)
+                
+                # Etiquetas de texto
+                vol_str = f"{util_data['total_volume']:,.0f} m³"
+                label_text = (f"Design Vol: {vol_str}\n"
+                           f"Design Depth: {config.TANK_DEPTH_M} m\n"
+                           f"Max Depth: {util_data['max_depth']:.2f} m\n"
+                           f"Util: {(util_data['max_depth']/config.TANK_DEPTH_M)*100:.0f}%")
+                ax_depth.text(0.98, 0.95, label_text, transform=ax_depth.transAxes,
+                           ha='right', va='top', fontsize=10,
+                           bbox=dict(facecolor='lemonchiffon', alpha=0.7, edgecolor='orange'))
+                ax_depth.set_title("Tank Depth (Filling Curve)")
+                ax_depth.set_ylabel("Depth (m)")
+                
+                # Etiquetas de ejes comunes
                 ax_flow.set_xlabel("Time (h)")
                 ax_vol.set_xlabel("Time (h)")
                 ax_depth.set_xlabel("Time (h)")
                 
-                # Limit X-axis to configured duration
+                # Límites del eje X (Ahora coinciden perfectamente)
                 ax_flow.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
                 ax_vol.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
                 ax_depth.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
                 
             fig.suptitle(f"{solution_name}: Tank Hydrographs (Page {batch_idx+1})", fontsize=16)
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-            fig.savefig(save_dir / f"{solution_name}_tank_hydrographs_page_{batch_idx+1}.png", dpi=100)
+            fig.savefig(save_dir / f"04_{solution_name}_tank_hydrographs_page_{batch_idx+1}.png", dpi=100)
+            plt.close(fig)
+            print(f"  [Tanks] Saved page {batch_idx+1}")
+
+    @staticmethod
+    def generate_tank_hydrograph_plots(solution: SystemMetrics, solution_name: str, save_dir: Path, detailed_links: Dict = None):
+        """Generates plots for detailed tank hydrographs (Inflow, Volume, Depth). Max 4 per page."""
+        if not solution.tank_data:
+            return
+
+        tank_ids = list(solution.tank_data.keys())
+        tank_ids.sort()
+        
+        batch_size = 4
+        
+        for batch_idx, i in enumerate(range(0, len(tank_ids), batch_size)):
+            batch_tanks = tank_ids[i : i + batch_size]
+            
+            n_rows = len(batch_tanks)
+            # 3 Columns: Inflow (calc), Volume (calc), Depth (measured)
+            fig = plt.figure(figsize=(24, 5 * n_rows))
+            gs = fig.add_gridspec(n_rows, 3)
+            
+            for row_idx, tk_id in enumerate(batch_tanks):
+                util_data = solution.tank_data[tk_id]
+                design_vol = util_data.get('total_volume', 0.0)
+                
+                # Axes
+                ax_flow = fig.add_subplot(gs[row_idx, 0])
+                ax_vol = fig.add_subplot(gs[row_idx, 1])
+                ax_depth = fig.add_subplot(gs[row_idx, 2])
+
+                # --- PLOT 1: INFLOW (Calculado) ---
+                variable = 'flow_series'
+                # CONVERSIÓN A HORAS RELATIVAS (X-axis fix)
+                t0 = util_data[variable].index[0]
+                hrs = [(t - t0).total_seconds() / 3600.0 for t in util_data[variable].index]
+                
+                ax_flow.plot(hrs, util_data[variable].to_numpy(), color='blue', linewidth=1.5, label='Est. Inflow')
+                ax_flow.set_title(f"{tk_id}\nInflow", fontweight='bold', fontsize=18)
+                ax_flow.set_ylabel("Flow (m³/s)", fontsize=14)
+                ax_flow.fill_between(hrs, util_data[variable].to_numpy(), color='blue', alpha=0.1)
+                ax_flow.grid(True, alpha=0.3)
+                ax_flow.text(0.95, 0.95, f"Peak: {util_data['max_flow']:.2f} m³/s", transform=ax_flow.transAxes, ha='right', va='top', fontsize=14, bbox=dict(facecolor='white', alpha=0.7))
+                
+                # --- PLOT 2: VOLUME ---
+                variable = 'volume_series'
+                ax_vol.plot(hrs, util_data[variable].to_numpy(), color='green', linewidth=2, label='Volume')
+                ax_vol.set_title("Cumulative Volume", fontsize=18)
+                ax_vol.set_ylabel("Volume (m³)", fontsize=14)
+                ax_vol.fill_between(hrs, util_data[variable].to_numpy(), color='green', alpha=0.2)
+                # ax_vol.axhline(design_vol, color='darkgreen', linestyle='--', label='Capacity')
+                ax_vol.grid(True, alpha=0.3)
+                ax_vol.text(0.95, 0.95, f"Stored: {util_data['max_stored_volume']:,.0f} m³", transform=ax_vol.transAxes, ha='right', va='top', fontsize=14, bbox=dict(facecolor='white', alpha=0.7))
+                
+                # --- PLOT 3: DEPTH ---
+                variable = 'depth_series'
+                ax_depth.plot(hrs, util_data[variable].to_numpy(), color='tab:red', linewidth=2, label='Depth')
+                ax_depth.axhline(config.TANK_DEPTH_M, color='darkred', linestyle='--', label=f'Design ({config.TANK_DEPTH_M}m)')
+                ax_depth.fill_between(hrs, util_data[variable].to_numpy(), color='tab:red', alpha=0.2)
+                
+                # Etiquetas de texto mejoradas
+                vol_str = f"{util_data['total_volume']:,.0f} m³"
+                label_text = (f"Design Vol: {vol_str}\n"
+                           f"Design Depth: {config.TANK_DEPTH_M} m\n"
+                           f"Max Depth: {util_data['max_depth']:.2f} m\n"
+                           f"Util: {(util_data['max_depth']/config.TANK_DEPTH_M)*100:.0f}%")
+                ax_depth.text(0.98, 0.95, label_text, transform=ax_depth.transAxes,
+                           ha='right', va='top', fontsize=15,
+                           bbox=dict(facecolor='lemonchiffon', alpha=0.7, edgecolor='orange'))
+                ax_depth.set_title("Tank Depth (Filling Curve)", fontsize=18)
+                ax_depth.set_ylabel("Depth (m)", fontsize=14)
+                
+                # Configuración común de ejes
+                for ax in [ax_flow, ax_vol, ax_depth]:
+                    ax.set_xlabel("Time (h)", fontsize=14)
+                    ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
+                    ax.tick_params(axis='both', which='major', labelsize=12)
+                
+            fig.suptitle(f"{solution_name}: Tank Hydrographs (Page {batch_idx+1})", fontsize=24)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.92]) # Ajustado para que el título grande no choque
+            fig.savefig(save_dir / f"04_{solution_name}_tank_hydrographs_page_{batch_idx+1}.png", dpi=100)
             plt.close(fig)
             print(f"  [Tanks] Saved page {batch_idx+1}")
 

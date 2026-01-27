@@ -8,8 +8,6 @@ import os
 import shutil
 from pathlib import Path
 import unicodedata
-import numpy as np
-import shapely
 from pyswmm import Simulation, Output, LinkSeries
 
 import config
@@ -54,47 +52,70 @@ class PhysicalNetwork:
     def build(self):
         # print("Building Physical Network...")
         # Load links and ensure we don't carry over bad results from swmmio auto-parsing
-        self.links_df = self.model.links.dataframe.copy()
+        raw_links = self.model.links.dataframe.copy()
+        # Drop potential result columns if they exist to avoid confusion
+        bad_cols = []
+        self.links_df = raw_links.drop(columns=[c for c in bad_cols if c in raw_links.columns], errors='ignore')
+        
         nodes_df = self.model.nodes.dataframe.copy()
         coords_df = self.model.inp.coordinates.copy()
-        nodes_df.loc[coords_df.index, 'X' ] = coords_df['X']
-        nodes_df.loc[coords_df.index, 'Y' ] = coords_df['Y']
         
-        self.links_df['InletNode_InvertElev'] = nodes_df.loc[self.links_df['InletNode'], 'InvertElev'].to_numpy()
-        self.links_df['OutletNode_InvertElev'] = nodes_df.loc[self.links_df['OutletNode'], 'InvertElev'].to_numpy()
-        self.links_df['InletNode_MaxDepth'] = nodes_df.loc[self.links_df['InletNode'], 'MaxDepth'].to_numpy()
-        self.links_df['OutletNode_MaxDepth'] = nodes_df.loc[self.links_df['OutletNode'], 'MaxDepth'].to_numpy()
-        self.links_df['X1'] = nodes_df.loc[self.links_df['InletNode'], 'X'].to_numpy()
-        self.links_df['Y1'] = nodes_df.loc[self.links_df['InletNode'], 'Y'].to_numpy()
-        self.links_df['X2'] = nodes_df.loc[self.links_df['OutletNode'], 'X'].to_numpy()
-        self.links_df['Y2'] = nodes_df.loc[self.links_df['OutletNode'], 'Y'].to_numpy()
+        # 1. Enrich Nodes
+        node_cols = ['InvertElev', 'MaxDepth']
+        # Inlet
+        self.links_df = self.links_df.merge(nodes_df[node_cols], left_on='InletNode', right_index=True, how='left')
+        self.links_df.rename(columns={'InvertElev': 'InletNode_InvertElev', 'MaxDepth': 'InletNode_MaxDepth'}, inplace=True)
+        # Outlet
+        self.links_df = self.links_df.merge(nodes_df[node_cols], left_on='OutletNode', right_index=True, how='left')
+        self.links_df.rename(columns={'InvertElev': 'OutletNode_InvertElev', 'MaxDepth': 'OutletNode_MaxDepth'}, inplace=True)
         
-        self.links_df['Slope'] = (self.links_df['InletNode_InvertElev'] - self.links_df['OutletNode_InvertElev']) / self.links_df['Length'].to_numpy()
+        # 2. Add Geometry
+        nodes_in_xy = coords_df[['X', 'Y']].rename(columns={'X': 'X1', 'Y': 'Y1'})
+        self.links_df = self.links_df.merge(nodes_in_xy, left_on='InletNode', right_index=True, how='left')
+        
+        nodes_out_xy = coords_df[['X', 'Y']].rename(columns={'X': 'X2', 'Y': 'Y2'})
+        self.links_df = self.links_df.merge(nodes_out_xy, left_on='OutletNode', right_index=True, how='left')
+        
+        # Drop missing
+        self.links_df = self.links_df.dropna(subset=['X1', 'Y1', 'X2', 'Y2'])
+        
+        # LineStrings
+        self.links_df['geometry'] = self.links_df.apply(lambda row: LineString([(row.X1, row.Y1), (row.X2, row.Y2)]), axis=1)
+        
+
+        # Calculate Slope
+        # Fill offsets with 0 if missing
+        self.links_df['InOffset'] = pd.to_numeric(self.links_df.get('InOffset', 0), errors='coerce').fillna(0)
+        self.links_df['OutOffset'] = pd.to_numeric(self.links_df.get('OutOffset', 0), errors='coerce').fillna(0)
+        
+        z_in = self.links_df['InletNode_InvertElev'] + self.links_df['InOffset']
+        z_out = self.links_df['OutletNode_InvertElev'] + self.links_df['OutOffset']
+        
+        # Calculate geometric length if explicit 'Length' is missing
+        geom_length = self.links_df['geometry'].apply(lambda x: x.length)
+        length = self.links_df.get('Length', geom_length)
+        
+        # Avoid division by zero
+        length = length.replace(0, 0.01)
+        
+        self.links_df['Slope'] = (z_in - z_out) / length
         
         # 3. Identify Collectors
         self._identify_ramales()
         
-       
-        # Esto une todas las listas en una sola secuencia continua.
-        flat_coords = np.concatenate(self.links_df['coords'].tolist())
-        # 2. Calcular los Offsets (índices donde empieza cada geometría)
-        lengths = self.links_df['coords'].map(len)
-        # Offsets: [0, len1, len1+len2, ...]
-        offsets = np.insert(np.cumsum(lengths), 0, 0)
-        # 3. Crear LineStrings Vectorizados
-        # 'from_ragged_array' reconstruye las líneas usando los offsets.
-        # Nota: offsets debe pasarse como tupla: (offsets,)
-        geoms = shapely.from_ragged_array(shapely.GeometryType.LINESTRING, flat_coords, (offsets,))
-        # 4. Crear GeoDataFrame
-        gdf = gpd.GeoDataFrame(self.links_df, geometry=geoms, index=self.links_df['coords'].index, crs=config.PROJECT_CRS)
-        return gdf
-    
-    
+        self.gdf = gpd.GeoDataFrame(self.links_df, geometry='geometry')
+        # print("Physical Network built.")
+        return self.gdf
+
+
+
+
+
     def _identify_ramales(self):
         # print("Identifying Ramales (Collectors)...")
         G = nx.DiGraph()
         for idx, row in self.links_df.iterrows():
-            G.add_edge(row['InletNode'], row['OutletNode'], length=row.get('Length', row.Length))
+            G.add_edge(row['InletNode'], row['OutletNode'], length=row.get('Length', row.geometry.length))
             
         memo_dist = {}
         def get_upstream_dist(node):
@@ -145,8 +166,6 @@ class PhysicalNetwork:
         self.links_df['Ramal'] = self.links_df.apply(
             lambda row: edge_ids.get((row['InletNode'], row['OutletNode']), 0), axis=1
         ).astype('U256')
-
-
 
 
 class HydraulicNetwork:
@@ -315,6 +334,16 @@ class NetworkExporter:
             else:
                 # print("Skipping Hydraulic Simulation (run_hydraulics=False).")
                 pass
+            
+            # 4. Clean formatting
+            for col in gdf.columns:
+                if gdf[col].dtype == 'object' and col != 'geometry':
+                    gdf[col] = gdf[col].astype(str)
+            
+            # 5. Set CRS if provided
+            if crs:
+                gdf.set_crs(crs, inplace=True, allow_override=True)
+                # print(f"CRS set to: {crs}")
                     
             if output_gpkg:
                 print(f"Saving to {output_gpkg}...")

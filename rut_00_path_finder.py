@@ -6,37 +6,24 @@ from pyproj import CRS, Transformer
 import math
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-import numpy as np
 from rasterio.warp import transform_bounds
-from shapely.ops import linemerge
-import sys
-import pandas as pd
 import numpy as np
 from shapely.geometry import LineString
 import geopandas as gpd
 from shapely.geometry import Point, MultiPoint
 from shapely.ops import split, linemerge, unary_union
 
-
-# Add local modules to path
-sys.path.append(r'C:\Users\Alienware\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\src')
-sys.path.append(r'C:\Users\Alienware\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\gui')
-sys.path.append(r'C:\Users\chelo\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\src')
-sys.path.append(r'C:\Users\chelo\OneDrive\ALCANTARILLADO_PyQt5\00_MODULOS\pypiper\gui')
+import config
+config.setup_sys_path()
 
 from rut_02_elevation import ElevationGetter, ElevationSource
-from utils_pypiper import DirTree
-
-
-
-
 
 class PathFinder:
     """
     Finds the least-cost path between two points considering distance and elevation.
     """
 
-    def __init__(self, start_point, end_point, proj_to):
+    def __init__(self, start_point=None, end_point=None, proj_to=None):
         """
         Initializes the PathFinder with start and end points.
 
@@ -50,15 +37,16 @@ class PathFinder:
         self.source_crs = CRS.from_user_input(proj_to)
         self.target_crs = CRS.from_user_input("EPSG:4326")  # WGS84 Lat/Lon
 
-        # Convert input coordinates to Lat/Lon for internal use with osmnx
-        self.start_point_latlon = self._transform_to_latlon(start_point)
-        self.end_point_latlon = self._transform_to_latlon(end_point)
+        if start_point is not  None or end_point is not None:
+            # Convert input coordinates to Lat/Lon for internal use with osmnx
+            self.start_point_latlon = self._transform_to_latlon(start_point)
+            self.end_point_latlon = self._transform_to_latlon(end_point)
 
 
         self.graph = None
         self.used_edges = set()  # Track edges already used by existing pipelines
         self.junction_node = None  # Set if path ends at a junction with existing pipe
-        print("PathFinder initialized with CRS.")
+        
 
     def mark_edges_used(self, path_nodes: list):
         """
@@ -119,8 +107,10 @@ class PathFinder:
             print(f"Loading OSM data from cache: {cache_path}...")
             try:
                 self.graph = ox.load_graphml(cache_path)
-                # print("OSM graph loaded from cache successfully.")
-                return
+                # Ensure it's projected even if loaded from cache
+                if self.graph is not None:
+                    self.graph = ox.project_graph(self.graph, to_crs=self.source_crs)
+                return self.graph
             except Exception as e:
                 print(f"Error loading cache: {e}. Proceeding to download.")
 
@@ -140,7 +130,10 @@ class PathFinder:
             )
 
             self.graph = ox.graph_from_point(center_point, dist=radius_m, network_type=network_type)
-            print("OSM data downloaded and graph created successfully.")
+            
+            # Project graph to source CRS
+            if self.graph is not None:
+                self.graph = ox.project_graph(self.graph, to_crs=self.source_crs)
             
             # Save to cache if requested
             if cache_path and self.graph is not None:
@@ -149,11 +142,12 @@ class PathFinder:
                     print(f"OSM graph saved to cache: {cache_path}")
                 except Exception as e:
                      print(f"Warning: Could not save OSM cache: {e}")
+                    
+            return self.graph
 
         except Exception as e:
             print(f"An error occurred during OSM data download: {e}")
             self.graph = None
-
 
     def get_graph_geodataframes(self):
         """
@@ -172,7 +166,6 @@ class PathFinder:
             print("No graph data available to convert.")
             return None, None
 
-
     def set_node_elevations(self, nodes_gdf, elevations):
         """
         Updates the graph nodes with elevation data.
@@ -183,12 +176,10 @@ class PathFinder:
                                      to the nodes in nodes_gdf.
         """
         if self.graph and nodes_gdf is not None and len(nodes_gdf) == len(elevations):
-            print("Updating graph with elevation data...")
             # Create a dictionary mapping node ID to its elevation
             elevation_dict = dict(zip(nodes_gdf.index, elevations))
             # Set the 'elevation' attribute for each node in the graph
             nx.set_node_attributes(self.graph, elevation_dict, 'elevation')
-            print("Graph nodes updated with elevation.")
             print('-'*60)
             print()
 
@@ -197,170 +188,6 @@ class PathFinder:
             # print(f"Elevation for node {first_node_id}: {self.graph.nodes[first_node_id].get('elevation')}")
         else:
             print("Could not update elevations. Check graph, nodes GeoDataFrame, or elevations array.")
-
-
-
-    def find_shortest_path_with_elevation_old(self,
-                                              length_weight=0.4,
-                                              elevation_weight=0.4,
-                                              road_weight=0.2,
-                                              max_depth=7.0,
-                                              road_preferences=None):
-        """
-        Encuentra la ruta óptima para alcantarillado por gravedad considerando:
-        - Longitud del trayecto
-        - Profundidad extra de excavación (cuando el terreno sube)
-        - Preferencias de tipo de vía
-        - Penalización por profundidad excesiva
-        
-        Args:
-            length_weight (float): Peso para longitud de arista.
-            elevation_weight (float): Peso para profundidad extra de excavación.
-            road_weight (float): Peso para penalización por tipo de vía.
-            max_depth (float): Profundidad máxima antes de penalización extrema.
-            road_preferences (dict, opcional): Mapeo de tipos de vía a factores de penalización.
-        
-        Returns:
-            list: IDs de nodos de la ruta más corta o None.
-        """
-        if not self.graph:
-            print("Grafo no disponible. No se puede encontrar la ruta.")
-            return None
-    
-        # Validar que los pesos sean válidos y sumen 1
-        total_w = length_weight + elevation_weight + road_weight
-        if any(w < 0 for w in (length_weight, elevation_weight, road_weight)) or not math.isclose(total_w, 1.0):
-            raise ValueError("Todos los pesos deben ser >= 0 y sumar 1.")
-    
-        # Penalizaciones por defecto para tipos de vía (menor = más preferible)
-        if road_preferences is None:
-            road_preferences = {
-                'motorway': 0.5, 'trunk': 0.6, 'primary': 0.7,      # Vías principales - más fácil construir
-                'secondary': 0.8, 'tertiary': 0.9, 'residential': 1.0,  # Vías medias
-                'service': 1.2, 'unclassified': 1.1,                # Vías menores
-                'footway': 3.0, 'path': 3.0, 'steps': 5.0           # Evitar estas
-            }
-        default_penalty = road_preferences.get('default', 1.5)
-    
-        # Obtener nodos de inicio y fin
-        start_node = ox.nearest_nodes(self.graph,
-                                      self.start_point_latlon[1],
-                                      self.start_point_latlon[0])
-        end_node = ox.nearest_nodes(self.graph,
-                                    self.end_point_latlon[1],
-                                    self.end_point_latlon[0])
-        
-        print(f"Nodo inicial: {start_node}, Nodo final: {end_node}")
-    
-        # Calcular valores máximos para normalización
-        max_length = 0
-        max_elevation_penalty = 0
-
-        for u, v, data in self.graph.edges(data=True):
-            length = data.get('length', 0)
-            max_length = max(max_length, length)
-            
-            # Calcular profundidad extra de excavación (solo cuando sube)
-            u_elevation = self.graph.nodes[u].get('elevation', 0)
-            v_elevation = self.graph.nodes[v].get('elevation', 0)
-            elevation_penalty = max(0, v_elevation - u_elevation)  # Solo penalizar subidas
-            
-            # Penalización adicional si excede profundidad máxima
-            if elevation_penalty > max_depth:
-                elevation_penalty = elevation_penalty + (elevation_penalty - max_depth) * 5  # Penalización exponencial
-            
-            max_elevation_penalty = max(max_elevation_penalty, elevation_penalty)
-        
-        # Evitar división por cero
-        max_length = max_length or 1.0
-        max_elevation_penalty = max_elevation_penalty or 1.0
-        
-        # Calcular rangos para penalizaciones de vía
-        penalties = list(road_preferences.values()) + [default_penalty]
-        min_penalty, max_penalty = min(penalties), max(penalties)
-        penalty_range = (max_penalty - min_penalty) or 1.0
-    
-        # print(f"Longitud máxima: {max_length:.2f}m")
-        # print(f"Penalización máxima por elevación: {max_elevation_penalty:.2f}m")
-        
-        # Calcular costo para cada arista
-        for u, v, data in self.graph.edges(data=True):
-            # 1. Componente de longitud (normalizada)
-            length = data.get('length', 0)
-            length_norm = length / max_length
-            
-            # 2. Componente de elevación (profundidad extra de excavación)
-            u_elevation = self.graph.nodes[u].get('elevation', 0)
-            v_elevation = self.graph.nodes[v].get('elevation', 0)
-            elevation_penalty = max(0, v_elevation - u_elevation)  # Solo penalizar subidas
-            
-            # Penalización exponencial si excede profundidad máxima
-            if elevation_penalty > max_depth:
-                elevation_penalty = elevation_penalty + (elevation_penalty - max_depth) * 5
-            
-            elevation_norm = elevation_penalty / max_elevation_penalty
-            
-            # 3. Componente de tipo de vía
-            highway = data.get('highway', 'unclassified')
-            if isinstance(highway, list):
-                highway = highway[0]  # Tomar el primer tipo si hay múltiples
-            
-            road_penalty = road_preferences.get(highway, default_penalty)
-            road_norm = (road_penalty - min_penalty) / penalty_range
-            
-            # Costo total combinado
-            total_cost = (length_weight * length_norm +
-                         elevation_weight * elevation_norm +
-                         road_weight * road_norm)
-            
-            data['cost'] = total_cost
-            
-            # Debug para algunas aristas
-            if elevation_penalty > 0:
-                # print(f"Arista {u}->{v}: longitud={length:.1f}m, subida={v_elevation-u_elevation:.1f}m, "
-                #       f"vía={highway}, costo={total_cost:.3f}")
-                pass
-    
-        print(f"Buscando ruta óptima desde nodo {start_node} hasta {end_node}...")
-        try:
-            self.shortest_path = nx.shortest_path(self.graph,
-                                                  source=start_node,
-                                                  target=end_node,
-                                                  weight='cost')
-            
-            # Calcular estadísticas de la ruta encontrada
-            total_length = 0
-            total_elevation_gain = 0
-            total_elevation_loss = 0
-            
-            for i in range(len(self.shortest_path) - 1):
-                u = self.shortest_path[i]
-                v = self.shortest_path[i + 1]
-                edge_data = self.graph[u][v][0]  # Primer arista si hay múltiples
-                
-                total_length += edge_data.get('length', 0)
-                
-                u_elev = self.graph.nodes[u].get('elevation', 0)
-                v_elev = self.graph.nodes[v].get('elevation', 0)
-                elev_diff = v_elev - u_elev
-                
-                if elev_diff > 0:
-                    total_elevation_gain += elev_diff
-                else:
-                    total_elevation_loss += abs(elev_diff)
-            
-            print(f"Ruta encontrada:")
-            print(f"  - Longitud total: {total_length:.1f}m")
-            print(f"  - Elevación ganada (excavación extra): {total_elevation_gain:.1f}m")
-            print(f"  - Elevación perdida (favorable): {total_elevation_loss:.1f}m")
-            print(f"  - Número de segmentos: {len(self.shortest_path) - 1}")
-            
-            return self.shortest_path
-            
-        except nx.NetworkXNoPath:
-            print("No se pudo encontrar una ruta entre los puntos de inicio y fin.")
-            self.shortest_path = None
-            return None
 
     def find_shortest_path_with_elevation(self,
                                           length_weight=0.4,
@@ -405,14 +232,16 @@ class PathFinder:
         default_penalty = road_preferences.get('default', 1.5)
     
         # Obtener nodos de inicio y fin
+        # Since the graph is now PROJECTED to self.source_crs (meters), 
+        # we pass the projected coordinates directly instead of latlon.
         start_node = ox.nearest_nodes(self.graph,
-                                      self.start_point_latlon[1],
-                                      self.start_point_latlon[0])
+                                      self.start_point[0],
+                                      self.start_point[1])
         end_node = ox.nearest_nodes(self.graph,
-                                    self.end_point_latlon[1],
-                                    self.end_point_latlon[0])
+                                    self.end_point[0],
+                                    self.end_point[1])
     
-        print(f"Nodo inicial: {start_node}, Nodo final: {end_node}")
+        print(f"Nodo inicial: {start_node} (UTM X: {self.start_point[0]:.1f}), Nodo final: {end_node} (UTM X: {self.end_point[0]:.1f})")
     
         # Calcular valores máximos para normalización
         max_length = 0
@@ -554,23 +383,23 @@ class PathFinder:
                 elevaciones_base.append(elev_final_ideal)
                 last_base_elevation = elev_final_ideal  # Actualizar la elevación base para el siguiente segmento
     
-            # Dibujar el perfil de elevación
-            plt.figure(figsize=(12, 6))
-    
-            # Perfil real de elevación
-            plt.plot(path_distances, path_real_elevations, color='green', linewidth=2, label='Perfil Real')
-    
-            # Línea base con pendiente ajustada
-            plt.plot(path_distances, elevaciones_base, color='red', linestyle='--', linewidth=2, label='Línea Base (≥0.4%)')
-    
-            # Marcar los nodos
-            for i, (dist, elev_real, elev_base) in enumerate(zip(path_distances, path_real_elevations, elevaciones_base)):
-                plt.scatter(dist, elev_real, color='blue', s=100, zorder=5)
-                plt.text(dist, elev_real + 1, str(i), fontsize=10, ha='center')  # Etiquetas de nodos
-    
-                # Opcional: dibujar flechas hacia la línea base
-                plt.plot([dist, dist], [elev_real, elev_base], color='gray', linestyle=':', linewidth=1, zorder=0)
-    
+            # # Dibujar el perfil de elevación
+            # plt.figure(figsize=(12, 6))
+            #
+            # # Perfil real de elevación
+            # plt.plot(path_distances, path_real_elevations, color='green', linewidth=2, label='Perfil Real')
+            #
+            # # Línea base con pendiente ajustada
+            # plt.plot(path_distances, elevaciones_base, color='red', linestyle='--', linewidth=2, label='Línea Base (≥0.4%)')
+            #
+            # # Marcar los nodos
+            # for i, (dist, elev_real, elev_base) in enumerate(zip(path_distances, path_real_elevations, elevaciones_base)):
+            #     plt.scatter(dist, elev_real, color='blue', s=100, zorder=5)
+            #     plt.text(dist, elev_real + 1, str(i), fontsize=10, ha='center')  # Etiquetas de nodos
+            #
+            #     # Opcional: dibujar flechas hacia la línea base
+            #     plt.plot([dist, dist], [elev_real, elev_base], color='gray', linestyle=':', linewidth=1, zorder=0)
+            #
             # # Configuración del gráfico
             # plt.title('Perfil de Elevación a lo largo de la Ruta Óptima')
             # plt.xlabel('Distancia Acumulada (m)')
@@ -587,7 +416,6 @@ class PathFinder:
         except nx.NetworkXNoPath:
             print("❌ No existe una ruta factible entre los puntos.")
             return None
-
 
 
     def plot_downloaded_area(self, image_path=None, title=None):
@@ -731,7 +559,12 @@ class PathFinder:
     
             # Merge the individual line segments into a single geometry object (MultiLineString)
             # and then merge that into a single polyline (LineString).
-            merged_line = linemerge(path_segments_gdf.geometry.unary_union)
+            union_geom = path_segments_gdf.geometry.unary_union
+            
+            if union_geom.geom_type == 'LineString':
+                merged_line = union_geom
+            else:
+                merged_line = linemerge(union_geom)
     
             # Create a new GeoDataFrame for the single polyline
             polyline_gdf = gpd.GeoDataFrame(
@@ -758,7 +591,7 @@ class PathFinder:
 
     def get_simplified_path(
         self,
-        tolerance: float = 15,
+        tolerance: float = 20,
         must_keep: list[tuple[float, float]] = None
     ) -> gpd.GeoDataFrame | None:
         """
@@ -829,8 +662,6 @@ class PathFinder:
         # 7) devolvemos GeoDataFrame en source_crs
         return gpd.GeoDataFrame(geometry=[final], crs=self.source_crs)
     
-    
-
 
     def run(self,
             title: str,
@@ -855,7 +686,7 @@ class PathFinder:
 
 
         # Download and prepare graph
-        self.download_osm_data(safety_margin_km=0.2, network_type='all')
+        self.download_osm_data(safety_margin_km=0.5, network_type='all')
         nodes_gdf, edges_gdf = self.get_graph_geodataframes()
         if nodes_gdf is None:
             return

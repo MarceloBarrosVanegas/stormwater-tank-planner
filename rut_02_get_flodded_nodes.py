@@ -1,404 +1,717 @@
 """
-overflow_analyzer_run.py
-Corre un modelo SWMM desde Python, analiza overflow de nodos
-y genera un paquete completo de gráficos estadísticos.
+rut_02a_prioritize_urgency.py
+-----------------------------
+Systematic prioritization of stormwater network interventions.
+Ranks nodes based on Volume, Flow, and Risk.
+Adapts metric calculation based on config.TANK_OPT_OBJECTIVE ('capacity' or 'flooding').
 """
+
 import os
+import sys
 from pathlib import Path
-import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from scipy import stats
-import re
 import geopandas as gpd
-from shapely.geometry import Point
-import warnings, sys
-
+import numpy as np
+import warnings
 from tqdm import tqdm
-import swmmio
 from pyswmm import Output, Simulation
-from swmm.toolkit.shared_enum import NodeAttribute
+from swmm.toolkit.shared_enum import NodeAttribute, LinkAttribute
+from swmm.toolkit.shared_enum import NodeAttribute, LinkAttribute
+from scipy.spatial.distance import cdist
+import rasterio
+from rasterio import features
+from dataclasses import dataclass, field
+from typing import Optional, Any, Dict
+from shapely.geometry import Point, Polygon, LineString
 
 
-plt.rcParams["savefig.dpi"] = 300
-warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+# Project imports
+import config
+from rut_06_pipe_sizing import CapacidadMaximaTuberia
+from rut_25_from_inp_to_vector import NetworkExporter
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
 
 
 
-def _sanitize(name: str) -> str:
+from dataclasses import dataclass
+from typing import Tuple, Optional
+
+
+
+
+@dataclass
+class CandidatePair:
     """
-    Reemplaza caracteres ilegales en nombres de archivo por subrayado.
-    Útil para Windows y multiplataforma.
+    Represents a candidate assignment of a node to a predio.
+    Shared data structure for ranking and dynamic evaluation.
     """
-    return re.sub(r'[\\/*?:"<>|]', "_", name)
+    # --- Identificadores y Metadatos ---
+    node_id: str           # Nombre/ID del nodo (ej. J-123)
+    predio_id: str         # Nombre/ID del predio (ej. P-456)
+    
+    # --- Datos del Nodo de derivacion ---
+    node_volume_flood: float = 0.0    # Volumen de inundación en el nodo (m3)
+    node_max_flow: float = 0.0        # Caudal pico de inundación (m3/s)
+    node_max_depth: float = 0.0       # H_max del nodo original
+    node_z_invert: float = 0.0        # Elevación batea del nodo (m)
+    node_z_surface: float = 0.0     # Elevación superficie del nodo (m)
+    node_x: float = 0.0             # Coordenada X del nodo (m)
+    node_y: float = 0.0             # Coordenada Y del nodo (m)
+    node_probability_failure: float =0.0
+    node_flow_over_capacity: float = 0.0 # Caudal sobre capacidad de tubería (m3/s)
+    node_flooding_flow: float = 0.0       # Caudal de inundación del nodo (m3/s)
+    node_volume_over_capacity: float = 0.0 # Volumen sobre capacidad de tubería (m3)
+    node_volume_flooding: float = 0.0  # Volumen de inundación del nodo (m3)
+    node_geometry: Optional[Point] = None # Point con las coordenadas del nodo
+    node_distance_to_predio: float = 0.0 # Distancia euclidiana al predio (m)
+    node_elevation_gap_to_predio: float = 0.0    # Desnivel entre nodo y predio (m)
+    
+    # --- Tuberia ---
+    derivation_link: str = ""         # ID del tramo que más aporta a la inundación
+    derivation_link_geometry: Optional[LineString] = None
+    derivation_target_node_geometry: Optional[Point] = None
+    
+    # --- Datos del Predio  ---
+    predio_area_m2: float = 0.0
+    predio_geometry: Optional[Polygon] = None
+    predio_x_centroid: float = 0.0
+    predio_y_centroid: float = 0.0
+    predio_ground_z: float = 0.0      # Elevación del terreno
+    
+    # ---  Tanque  ---
+    tank_volume_simulation: float = 0.0 # Volumen capturado en simulación post-ejecución
+    tank_max_depth: float = 0.0       # Profundidad de diseño (por defecto en config)
+    
+    # --- Datos de Tubería (de rut_03 diseño) ---
+    diameter: str = 'N/A'              # Diámetro de tubería diseñada (ej. "1.2" o "1.5x1.2")
+    pipeline_length: float = 0.0       # Longitud total de tubería (m)
+    
+    # --- Costos Estimados (Para rut_17 Dashboard) ---
+    cost_link: float = 0.0
+    cost_tank: float = 0.0
+    cost_land: float = 0.0
+    
+    # --- Contexto del Árbol (Tree Routing) ---
+    is_tank: bool = True              # ¿Se conecta a un tanque o es solo una tubería?
+    target_id: str = ""               # ID del nodo/tanque al que finalmente descarga
+    
+    # --- Propiedades Calculadas ---
+    @property
+    def total_cost(self) -> float:
+        return self.cost_pipeline + self.cost_tank + self.cost_land
 
 
-class SWMMOverflowAnalyzer:
-    # ---------------------- 0.  Carga, simula y configura --------------- #
-    def __init__(
-        self,
-        inp_path: Path,
-        w_vol: float = 0.5,
-        w_peak: float = 0.3,
-        w_hours: float = 0.2,
-        top_timeline: int = 10,
-        source_crs: str ="EPSG:32717",
-    ):
-        self.inp_path = Path(inp_path)
-        if not self.inp_path.is_file():
-            raise FileNotFoundError(self.inp_path)
-
-        self.rpt_path = self.inp_path.with_suffix(".rpt")
-        self.top_timeline = top_timeline
-
-        # pesos
-        self.w_vol, self.w_peak, self.w_hours = w_vol, w_peak, w_hours
-
-        # 0.1  Corre el modelo (si no existe .rpt o prefieres forzar)
-        self._run_swmm()
-
-        # 0.2  Instancia swmmio
-        self.model = swmmio.Model(str(self.inp_path))
-
-        self.df_metrics = self._extract_metrics()
-        self._compute_scores()
 
 
+class FloodingMetrics:
+    """Calculates flooding metrics for nodes in a SWMM model."""
 
-        self.out_path = self.inp_path.with_suffix(".out")
-        self.source_crs = source_crs
+    def __init__(self, inp_file_path, risk_file_path):
+        #swwm file path
+        self.inp_file_path = inp_file_path
+        #risk geopackage file path
+        self.risk_file_path = risk_file_path
 
-    def _run_swmm(self):
-        print(f">> Ejecutando SWMM sobre {self.inp_path.name}")
-        cwd = os.getcwd()  # guarda cwd actual
-        os.chdir(self.inp_path.parent)  # ⇦ cambia a la carpeta del .inp
-        try:
-            with Simulation(str(self.inp_path)) as sim:
-                with tqdm(total=100, desc="SWMM %", unit="%",
-                          bar_format="{l_bar}{bar}| {n_fmt}%") as bar:
-                    for _ in sim:
-                        bar.n = round(sim.percent_complete * 100, 1)  # :contentReference[oaicite:2]{index=2}
-                        bar.refresh()
-        finally:
-            os.chdir(cwd)  # devuelve el cwd
-        print("✓ Simulación terminada")
-        # comprueba que el .out existe
-        self.out_path = self.inp_path.with_suffix(".out").resolve()
-        if not self.out_path.exists():
-            raise FileNotFoundError(f"No se generó {self.out_path}")
+        self.at_capacity_flow = CapacidadMaximaTuberia()
+        self.parse_shape_from_swmm = {'RECT_CLOSED': 'rectangular','RECT_OPEN': 'rectangular' , 'MODBASKETHANDLE': 'rectangular', 'CIRCULAR': 'circular'}
+
+    @staticmethod
+    def parse_seccion_to_pypiper( conduit_row: pd.Series) -> str:
+        """
+        Extrae la sección de una tubería como string para PyPiper.
+
+        Args:
+            conduit_row: Serie de Pandas con datos de la tubería (fila del DataFrame)
+
+        Returns:
+            str: "geom1" si circular, "geom1xgeom2" si rectangular
+        """
+        shape = str(conduit_row['Shape']).strip().upper()
+        geom1 = conduit_row['Geom1']
+
+        # Circular: solo diámetro
+        if shape == 'CIRCULAR':
+            return str(geom1)
+
+        # Rectangular: ancho x alto
+        if shape in ['RECT_CLOSED', 'RECTANGULAR', 'MODBASKETHANDLE', 'RECT_OPEN']:
+            geom2 = conduit_row['Geom2']
+            return f"{geom1}x{geom2}"
+
+        raise ValueError(f"Forma no soportada: {shape}")
+
+    def load_swmm_model(self):
+        in_file_path = str(self.inp_file_path)
+
+        self.exporter = NetworkExporter(str(in_file_path))
+        swmm_gdf = self.exporter.run(None, crs=config.PROJECT_CRS)
+
+        swmm_gdf['Seccion'] = swmm_gdf['Shape'].map(self.parse_shape_from_swmm)
+        swmm_gdf['D_int'] = swmm_gdf.apply(self.parse_seccion_to_pypiper, axis=1)
+
+        q_at_capacity, v_at_capacity, h_at_capacity = self.at_capacity_flow.calcular_capacidad_maxima(
+            D_int=swmm_gdf['D_int'].to_numpy().astype(str),
+            S=np.where(swmm_gdf['Slope'] < 0, 0.01, swmm_gdf['Slope']),
+            Rug=swmm_gdf['Roughness'].to_numpy().astype(float),
+            Seccion=swmm_gdf['Seccion'].to_numpy().astype(str),
+            h_D_objetivo=config.CAPACITY_MAX_HD
+        )
+
+        self.q_at_capacity_series = pd.Series(np.round(q_at_capacity / 1000, 3), index=swmm_gdf.index)
+
+        swmm_gdf['flow_over_pipe_capacity'] = np.where(
+            swmm_gdf['MaxFlow'] - self.q_at_capacity_series < 0,
+            0,
+            swmm_gdf['MaxFlow'] - self.q_at_capacity_series
+        )
+        swmm_gdf['flow_pipe_capacity'] = self.q_at_capacity_series
 
 
-    # ---------------------- 1.  Extrae métricas ------------------------- #
-    def _extract_metrics(self):
-        with Output(str(self.out_path)) as out:  # fichero binario
-            dt = out.report  # Δt en s
-            filas = []
-            for nid in out.nodes:
-                serie = out.node_series(nid, NodeAttribute.FLOODING_LOSSES)
-                vals = pd.Series(serie.values(), dtype=float)
-                filas.append([
-                    nid,
-                    (vals * dt).sum(),  # Volumen m³
-                    vals.max(),  # Pico m³/s
-                    (vals > 0).sum() * dt / 3600  # Horas
-                ])
-        df = (pd.DataFrame(filas, columns=["NodeID", "Total Vol (m3)",
-                                           "Peak Flow (m3/s)", "Hours Flooded"])
-              .set_index("NodeID")
-              .sort_values("Total Vol (m3)", ascending=False))
+        return swmm_gdf
+
+    @staticmethod
+    def _calculate_volume_from_series(series: pd.Series, threshold: float = 0.0) -> float:
+        """
+        Calcula volumen integrando una serie temporal usando método rectangular.
+
+        Args:
+            series: Serie con índice datetime y valores de caudal [m³/s]
+            threshold: Umbral mínimo para considerar el flujo
+
+        Returns:
+            Volumen total [m³]
+        """
+        if len(series) == 0:
+            return 0.0
+
+        max_val = series.max()
+
+        if max_val <= threshold or len(series) <= 1:
+            return 0.0
+
+        # Asegurar índice datetime
+        idx = pd.to_datetime(series.index)
+
+        # dt en segundos entre muestras consecutivas
+        dt_secs = idx.to_series().diff().dt.total_seconds().fillna(0).values
+
+        # Usar tasas de la muestra anterior para integración rectangular
+        prev_rates = series.shift(1, fill_value=0).values
+
+        # Volumen (m³) = sum(rate_prev (m³/s) * dt (s))
+        volume = (prev_rates * dt_secs).sum()
+
+        return float(volume)
+
+    @staticmethod
+    def is_original_node(nid):
+        """Check if node is part of original network (not tank or derivation)"""
+        # Tanks start with TK_
+        if nid.startswith('TK_'):
+            return False
+        # Derivation nodes are format: 0.0, 0.1, 1.0, etc.
+        parts = nid.split('.')
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            return False
+        return True
+
+    def extract_metrics(self):
+        out_file_path = str(self.exporter.out_path_file)
+
+        # Normalizar inlet nodes una sola vez
+        inletnodes_series = self.swmm_gdf['InletNode'].astype(str).str.strip().str.upper()
+        results_list = []
+        with Output(out_file_path) as out:
+            # Precalcular listas de nodos/links para evitar múltiples iteraciones
+            all_nodes = list(out.nodes)
+            original_nodes = [nid for nid in all_nodes if self.is_original_node(nid)]
+
+            # =====================================================================
+            # 3. PROCESAR NODOS ORIGINALES (un solo loop)
+            # =====================================================================
+            for nid in tqdm(original_nodes, desc="Extracting Nodes Flooding Metrics"):
+                nid_str = str(nid).strip().upper()
+
+                incoming_links = inletnodes_series[inletnodes_series == nid_str].index.tolist()
+                
+                # --- Calcular flujo entrante si es necesario ---
+                if config.TANK_OPT_OBJECTIVE == 'capacity':
+                    if len(incoming_links) > 0:
+                        # Encontrar el link con el máximo exceso
+                        excesses = self.swmm_gdf['flow_over_pipe_capacity'].loc[incoming_links]
+                        link_with_max_excess = excesses.idxmax()
+                        flow_over_pipe_capacity_incoming = float(excesses.max())
+
+                        # Oftener la serie de flujo y la capacidad del link con max exceso
+                        flow_incoming_series = pd.Series(out.link_series(link_with_max_excess, LinkAttribute.FLOW_RATE))
+                        capacity_incoming = float(self.q_at_capacity_series.loc[link_with_max_excess])
+
+                    else:
+                        flow_over_pipe_capacity_incoming = 0.0
+                        flow_incoming_series = pd.Series(dtype=float)  # Serie vacía por defecto
+                        capacity_incoming = 0.0
+                else:
+                        flow_over_pipe_capacity_incoming = 0.0
+                        flow_incoming_series = pd.Series(dtype=float)  # Serie vacía por defecto
+                        capacity_incoming = 0.0
+
+                # --- Obtener series de flooding ---
+                flooding_series = pd.Series(out.node_series(nid, NodeAttribute.FLOODING_LOSSES))
+                flooding_peak = float(flooding_series.max()) if len(flooding_series) > 0 else 0.0
+
+                # --- Calcular volumen de flooding del nodo ---
+                vol_node_flooding = self._calculate_volume_from_series(
+                    flooding_series,
+                    threshold=config.MINIMUN_FLOODING_FLOW
+                )
+
+                # --- Calcular volumen sobre capacidad ---
+                vol_over_pipe_capacity = 0.0
+                if flow_over_pipe_capacity_incoming > config.MINIMUN_FLOODING_FLOW and len(flow_incoming_series) > 0:
+                    # Corregido: restar la capacidad real en lugar del exceso
+                    flow_excess_series = flow_incoming_series - capacity_incoming
+                    flow_excess_series = flow_excess_series.clip(lower=0)
+                    vol_over_pipe_capacity = self._calculate_volume_from_series(
+                        flow_excess_series,
+                        threshold=0
+                    )
+
+                # --- Almacenar resultados si hay flooding o exceso ---
+                vol_total = vol_node_flooding + vol_over_pipe_capacity
+
+                if vol_total > 0:
+                    # Obtener profundidad máxima
+                    depth_series = pd.Series(out.node_series(nid, NodeAttribute.INVERT_DEPTH))
+                    node_depth = float(depth_series.max()) if len(depth_series) > 0 else 0.0
+
+                    # Coordinates
+                    x_coord =self.swmm_gdf.loc[incoming_links]['X2'].max()
+                    y_coord = self.swmm_gdf.loc[incoming_links]['Y2'].max()
+                    geom = Point(x_coord, y_coord)
+                    invert_elevation = self.swmm_gdf.loc[incoming_links]['OutletNode_InvertElev'].max()
+                    results_list.append({
+                        'NodeID': nid,
+                        'x': x_coord,
+                        'y': y_coord,
+                        'flow_over_capacity': flow_over_pipe_capacity_incoming,
+                        'flow_node_flooding': flooding_peak,
+                        'total_flow': flow_over_pipe_capacity_incoming + flooding_peak,
+                        'vol_over_capacity': vol_over_pipe_capacity,
+                        'vol_node_flooding': vol_node_flooding,
+                        'total_volume': vol_total,
+                        'NodeDepth': node_depth,
+                        'InvertElevation':invert_elevation,
+                        'geometry': geom,
+                    })
+
+        gdf_results = gpd.GeoDataFrame(results_list, geometry='geometry', crs=config.PROJECT_CRS)
+        return gdf_results
+
+    def get_spatial_risk(self, df):
+        """Maps risk data to nodes using spatial proximity (nearest neighbor)."""
+        if not self.risk_file_path or not Path(self.risk_file_path).exists() or df.empty:
+            df['FailureProbability'] = 0
+            return df
+
+        risk_gdf = gpd.read_file(self.risk_file_path)
+
+        if not risk_gdf.empty and 'failure_prob' in risk_gdf.columns:
+            # Ensure geometries are valid
+            risk_gdf = risk_gdf[risk_gdf.geometry.is_valid & ~risk_gdf.geometry.is_empty]
+
+            # get_coordinates returns a dataframe with columns x, y.
+            # The index of this dataframe corresponds to the index in risk_gdf.
+            coords_risk_df = risk_gdf.geometry.get_coordinates()
+            coords_risk_df_index = coords_risk_df.index.to_numpy()
+
+            # Coordinate arrays
+            risk_coords = coords_risk_df[['x', 'y']].to_numpy()
+            node_coords = df[['x', 'y']].to_numpy()
+
+            if len(risk_coords) > 0 and len(node_coords) > 0:
+                # Calculate distance matrix (RiskFeaturesCoordinates x Nodes)
+                dists = cdist(risk_coords, node_coords, metric='euclidean')
+
+                # Find the index in the flattened 'risk_coords' array that is closest
+                nearest_coord_idx = np.argmin(dists, axis=0)
+                min_dists = np.min(dists, axis=0)
+
+                # Map the flattened vertex index back to the original risk_gdf index label
+                matched_gdf_indices = coords_risk_df_index[nearest_coord_idx]
+
+                # Retrieve probabilities using .loc (label-based lookup)
+                nearest_probs = risk_gdf.loc[matched_gdf_indices, 'failure_prob'].values
+
+                # Assign failure_prob only if distance < 0.1, otherwise 0
+                df['FailureProbability'] = np.where(min_dists < 0.1, nearest_probs, 0.0)
+            else:
+                print("Warning: Coordinate mismatch or empty geometries for risk/nodes.")
+                df['FailureProbability'] = 0.0
+        else:
+            print("Warning: Risk GPKG empty or missing 'failure_prob' column.")
+            df['FailureProbability'] = 0.0
+
+
         return df
 
-    # ---------------------- 2.  Score y ranking ------------------------- #
-    def _compute_scores(self):
-        df = self.df_metrics
-        norm = (df - df.min()) / (df.max() - df.min())
-        df["Score"] = (
-            self.w_vol * norm["Total Vol (m3)"]
-            + self.w_peak * norm["Peak Flow (m3/s)"]
-            + self.w_hours * norm["Hours Flooded"]
-        )
-        q95, q80 = df["Score"].quantile([0.95, 0.80])
-        df["Class"] = np.select(
-            [df["Score"] >= q95, df["Score"] >= q80], ["A", "B"], default="C"
-        )
-        self.df_metrics = df.sort_values("Score", ascending=False)
-
-    # ---------------------- 3.  Utilidades de guardado ------------------ #
-    def _save_fig(self, fig, name):
-        safe_name = _sanitize(name)
-        out_path = self.out_dir / f"{safe_name}.png"
-        fig.savefig(out_path, bbox_inches="tight")
-        plt.close(fig)
-
-    # ---------------------- 4.  Gráficos ------------------------------- #
-    def plot_hist_kde(self):
-        for col in self.df_metrics.columns[:3]:
-            data = self.df_metrics[col]
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.hist(data, bins=30, density=True, alpha=0.4)
-            kde = stats.gaussian_kde(data)
-            xs = np.linspace(data.min(), data.max(), 300)
-            ax.plot(xs, kde(xs))
-            ax.set_title(f"Histograma + KDE · {col}")
-            ax.set_xlabel(col)
-            self._save_fig(fig, f"hist_kde_{col.replace(' ', '_')}")
-
-    def plot_box_violin(self):
-        cols = self.df_metrics.columns[:3]
-        data = [self.df_metrics[c] for c in cols]
-
-        # box
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.boxplot(data, vert=False, labels=cols)
-        ax.set_title("Boxplot métricas overflow")
-        self._save_fig(fig, "boxplot")
-
-        # violin
-        fig, ax = plt.subplots(figsize=(6, 4))
-        parts = ax.violinplot(data, vert=False, showextrema=False)
-        for pc in parts["bodies"]:
-            pc.set_alpha(0.5)
-        ax.set_yticks(range(1, len(cols) + 1))
-        ax.set_yticklabels(cols)
-        ax.set_title("Violin plot métricas overflow")
-        self._save_fig(fig, "violin")
-
-    def plot_pareto(self):
-        df = self.df_metrics.sort_values("Total Vol (m3)", ascending=False)
-        cum = df["Total Vol (m3)"].cumsum() / df["Total Vol (m3)"].sum() * 100
-
-        fig, ax1 = plt.subplots(figsize=(8, 4))
-        ax1.bar(df.index, df["Total Vol (m3)"])
-        ax1.tick_params(axis="x", rotation=90, labelsize=6)
-        ax1.set_ylabel("Volumen (m3)")
-
-        ax2 = ax1.twinx()
-        ax2.plot(df.index, cum, color="red", marker=".")
-        ax2.set_ylim(0, 100)
-        ax2.set_ylabel("% acumulado")
-        ax1.set_title("Pareto Volumen Overflow")
-        self._save_fig(fig, "pareto")
-
-    def plot_scatter_matrix(self):
-        pd.plotting.scatter_matrix(
-            self.df_metrics[self.df_metrics.columns[:3]],
-            figsize=(8, 8),
-            diagonal="kde",
-            alpha=0.5,
-        )
-        plt.suptitle("Scatter matrix métricas overflow")
-        fig = plt.gcf()
-        self._save_fig(fig, "scatter_matrix")
-
-    def plot_ecdf(self):
-        for col in self.df_metrics.columns[:3]:
-            data = np.sort(self.df_metrics[col])
-            y = np.arange(1, len(data) + 1) / len(data)
-            fig, ax = plt.subplots(figsize=(6, 4))
-            ax.step(data, y, where="post")
-            ax.set_xlabel(col)
-            ax.set_ylabel("F(x)")
-            ax.set_title(f"ECDF – {col}")
-            self._save_fig(fig, f"ecdf_{col.replace(' ', '_')}")
-
-    def plot_corr_heatmap(self):
-        corr = self.df_metrics[self.df_metrics.columns[:3]].corr()
-        fig, ax = plt.subplots(figsize=(4, 4))
-        im = ax.imshow(corr, cmap="coolwarm", vmin=-1, vmax=1)
-        ax.set_xticks(range(len(corr)))
-        ax.set_xticklabels(corr.columns, rotation=45, ha="right")
-        ax.set_yticks(range(len(corr)))
-        ax.set_yticklabels(corr.columns)
-        for (i, j), val in np.ndenumerate(corr):
-            ax.text(j, i, f"{val:.2f}", ha="center", va="center")
-        fig.colorbar(im, ax=ax)
-        ax.set_title("Matriz correlación")
-        self._save_fig(fig, "heatmap_corr")
-
-    def plot_qq(self):
-        for col in self.df_metrics.columns[:3]:
-            fig, ax = plt.subplots(figsize=(4, 4))
-            stats.probplot(self.df_metrics[col], dist="norm", plot=ax)
-            ax.set_title(f"QQ‑plot – {col}")
-            self._save_fig(fig, f"qq_{col.replace(' ', '_')}")
-
-    def plot_timeline(self):
-        if not self.out_path.exists():  # self.out_path = inp.with_suffix(".out")
-            print("No .out disponible → se omite timeline.")
+    @staticmethod
+    def save_results(gdf, output_dir):
+        """
+        Saves results to Excel (.xlsx) and GeoPackage (.gpkg) if output_dir is provided.
+        """
+        if output_dir is None or gdf.empty:
             return
 
-        # --- abre el binario --------------------------------------------------
-        with Output(str(self.out_path)) as out:  # ✔ PySWMM Output
-            sim_time = list(out.times)  # lista datetime
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
 
-            top_nodes = self.df_metrics.head(self.top_timeline).index
-            fig, ax = plt.subplots(figsize=(10, 5))
+        base_name = "prioritized_nodes"
 
-            for nd in top_nodes:
-                q = out.node_series(nd, NodeAttribute.FLOODING_LOSSES)
-                ax.plot(sim_time, q.values(), label=nd, alpha=0.7)
+        # 1. Save GeoPackage (preserves geometry)
+        gpkg_file = out_path / f"{base_name}.gpkg"
+        try:
+            gdf.to_file(gpkg_file, driver="GPKG")
+            print(f"[Flooding Metrics] Saved GPKG: {gpkg_file}")
+        except Exception as e:
+            print(f"[Flooding Metrics] Error saving GPKG: {e}")
 
-        ax.set_ylabel("Overflow (m³/s)")
-        ax.set_title(f"Serie temporal – top {self.top_timeline} nodos")
-        ax.legend(ncol=2, fontsize=8)
-        self._save_fig(fig, "timeline")
+        # 2. Save Excel (strips geometry for cleaner table)
+        xlsx_file = out_path / f"{base_name}.xlsx"
+        try:
+            # Convert to standard pandas DataFrame and drop geometry column
+            df_excel = pd.DataFrame(gdf.drop(columns='geometry', errors='ignore'))
+            df_excel.to_excel(xlsx_file, index=False)
+            print(f"[Flooding Metrics] Saved Excel: {xlsx_file}")
+        except Exception as e:
+            print(f"[Flooding Metrics] Error saving Excel: {e}")
 
-    def plot_bubble_map(self):
-        nodes_df = self.model.nodes()
-        nodes_df["geometry"] = [Point(c[0]) for c in nodes_df["coords"]]
-        gdf = gpd.GeoDataFrame(nodes_df, geometry="geometry")
+    def run(self, output_dir=None):
+        print(f"[Flooding Metrics] 1. Parsing SWMM model and calculating pipe capacities from {self.inp_file_path}...")
+        # parse swmm model
+        self.swmm_gdf = self.load_swmm_model()
 
-        merged = gdf.merge(self.df_metrics[["Total Vol (m3)", "Class"]], left_index=True, right_index=True)
+        print("[Flooding Metrics] 2. Extracting flooding metrics (volume, flow, depth) from simulation results...")
+        # extract flooding metrics
+        gdf = self.extract_metrics()
 
-        fig, ax = plt.subplots(figsize=(8, 6))
-        merged.plot(
-            ax=ax,
-            markersize=merged["Total Vol (m3)"] / merged["Total Vol (m3)"].max() * 300,
-            column="Class",
-            cmap="Set1",
-            legend=True,
-            alpha=0.7,
-        )
-        ax.set_axis_off()
-        ax.set_title("Mapa burbuja – tamaño ∝ Volumen, color = clase")
-        self._save_fig(fig, "bubble_map")
+        print(f"[Flooding Metrics] 3. Mapping spatial risk data from {self.risk_file_path}...")
+        # --- Add Risk Data ---
+        gdf = self.get_spatial_risk(gdf)
 
-    # ---------------------- 5.  Ejecuta todo --------------------------- #
-    def run_all_plots(self):
+        # Sort by Volume -> Flow -> Risk
+        # Prioritize where the most water is, then where it's flowing fastest, then risk.
+        if not gdf.empty:
+            gdf = gdf.sort_values(
+                by=['total_volume', 'total_flow', 'FailureProbability'],
+                ascending=[False, False, False]
+            )
 
-        # 0.3  Carpeta de salida
-        self.out_dir = Path('00_figs_flooding')
-        self.out_dir.mkdir(exist_ok=True)
+        print(f"[Flooding Metrics] Analysis complete. Resulting DataFrame shape: {gdf.shape}")
 
-        self.plot_hist_kde()
-        self.plot_box_violin()
-        self.plot_pareto()
-        self.plot_scatter_matrix()
-        self.plot_ecdf()
-        self.plot_corr_heatmap()
-        self.plot_qq()
-        self.plot_timeline()
-        self.plot_bubble_map()
-        print(f"✔ Figuras guardadas en: {self.out_dir.resolve()}")
+        # Save results if path is provided
+        if output_dir:
+            self.save_results(gdf, output_dir)
 
-    def get_all_peak_details(self) -> pd.DataFrame:
-        from swmm.toolkit.shared_enum import LinkAttribute
+        return gdf
 
-        self.out_dir_stats = Path('00_flooding_stats')
-        self.out_dir_stats.mkdir(exist_ok=True)
-
-        # grab node types from swmmio
-        nodes_df = self.model.nodes()
-        links = self.model.links()
-
-        if "OutfallType" not in nodes_df.columns:
-            nodes_df["OutfallType"] = "node"
-        else:
-            nodes_df['OutfallType'] = nodes_df['OutfallType'].fillna('node')
-
-        if "StorageCurve" not in nodes_df.columns:
-            nodes_df["StorageCurve"] = "no_storage"
-        else:
-            nodes_df['StorageCurve'] = nodes_df['StorageCurve'].fillna('no_storage')
-
-
-
-
-        print(f"▶ Procesando Nudos sobre {self.inp_path.name}")
-        records = []
-        with Output(str(self.out_path)) as out:
-            for nid in tqdm(out.nodes, desc="Processing nodes"):
-                # lookup node type
-                node_type = nodes_df.at[nid, "OutfallType"]
-                storage_type = nodes_df.at[nid, "StorageCurve"]
-
-                if node_type not in ["node"] or storage_type not in ["no_storage"]:
-                    continue
-
-                # flooding losses series
-                serie = out.node_series(nid, NodeAttribute.FLOODING_LOSSES)
-                series = pd.Series(serie.values(), index=list(serie.keys()), dtype=float)
-                if series.empty:
-                    continue
-
-                peak_time = series.idxmax()
-                peak_val = series.max()
-
-                time_in_seconds = series.index.to_series().diff().dt.total_seconds()
-                volumen_perdido_total = (time_in_seconds * series).sum()
-
-
-                if peak_val <= 0.1:
-                    continue
-
-                # first incoming and outgoing link IDs
-                in_edges = list(self.model.network.in_edges(nid, keys=True))
-                out_edges = list(self.model.network.out_edges(nid, keys=True))
-                incoming = in_edges[0][2] if in_edges else None
-                outgoing = out_edges[0][2] if out_edges else None
-
-
-                if incoming:
-                    diameter_inflow = links.loc[incoming, ['MaxQ', 'MaxV', 'MaxDPerc', "Shape", 'Geom1', 'Geom2', 'Geom3', 'Geom4']]
-                    diameter_inflow.index = diameter_inflow.index.map(lambda x: f"InFlow_{x}")
-
-                if outgoing:
-                    diameter_outflow = links.loc[outgoing, ['MaxQ', 'MaxV', 'MaxDPerc', "Shape", 'Geom1', 'Geom2', 'Geom3', 'Geom4']]
-                    diameter_outflow.index = diameter_outflow.index.map(lambda x: f"OutFlow_{x}")
-
-
-                dict_out = {
-                    "NodeID": nid,
-                    "NodeCoordsX": nodes_df.at[nid, "coords"][0][0],
-                    "NodeCoordsY": nodes_df.at[nid, "coords"][0][1],
-                    
-                    "InvertElevation": nodes_df.at[nid, "InvertElev"],
-                    "NodeDepth": nodes_df.at[nid, "MaxDepth"],
-                    "PeakTime": peak_time,
-                    "FloodingFlow": peak_val,
-                    "FloodingVolume": volumen_perdido_total,
-
-                }
-
-                dict_out.update(diameter_inflow.to_dict() if diameter_inflow is not None else {})
-                dict_out.update(diameter_outflow.to_dict() if diameter_outflow is not None else {})
-
-                records.append(dict_out)
-
-        df = pd.DataFrame(records)
-        df = df.sort_values("FloodingFlow", ascending=False).reset_index(drop=True)
-
-        df.to_excel(
-            self.out_dir_stats / "00_flooding_nodes.xlsx",
-            index=False,
-            float_format="%.2f",
-        )
-
+class TankValidator:
+    """
+    Centralizes all tank validation logic.
+    Applies volume, area, and configuration constraints.
+    Supports finding alternative predios if the primary one is full.
+    """
+    
+    def __init__(self, predios_gdf, nodes_gdf):
+        self.predios_gdf = predios_gdf
+        self.nodes_gdf = nodes_gdf
         
+        # Load constraints from config
+        self.MIN_VOLUME = config.TANK_MIN_VOLUME_M3
+        self.MAX_VOLUME = config.TANK_MAX_VOLUME_M3
+        self.TANK_DEPTH = config.TANK_DEPTH_M
+        self.OCCUPATION_FACTOR = config.TANK_OCCUPATION_FACTOR
+        
+        # Track used area per predio
+        self._predio_used_area = {} # predio_idx -> used_area_m2
+        self.rejection_log = []
+    
+    def reset(self):
+        """Reset tracking for a new evaluation."""
+        self._predio_used_area = {}
+        self.rejection_log = []
 
-        gdf = gpd.GeoDataFrame(
-        df, geometry=gpd.points_from_xy(df['NodeCoordsX'], df['NodeCoordsY']), crs=self.source_crs
+    def _cabe_en_predio(self, predio_idx: int, volume: float) -> Tuple[bool, str, float]:
+        """Checks if a tank of given volume fits in a predio."""
+        predio = self.predios_gdf.iloc[predio_idx]
+        predio_area = round(predio.geometry.area,2)
+        
+        # Cap volume to MAX
+        adjusted_volume = min(volume, self.MAX_VOLUME)
+        tank_footprint = adjusted_volume / self.TANK_DEPTH
+        required_area = tank_footprint * self.OCCUPATION_FACTOR
+        
+        already_used_area = self._predio_used_area.get(predio_idx, 0.0)
+        available = predio_area - already_used_area
+        
+        if required_area > available:
+            return False, f"Insufficient area: needs {required_area:.1f}m2, avail {available:.1f}m2", 0
+            
+        return True, "OK", adjusted_volume
+
+
+    def validate_and_reserve(self, original_predio_idx: int, volume: float) -> Tuple[bool, str, int, float]:
+        """
+        Validates an assignment and reserves the area if valid.
+        
+        NOTE: Re-assignment logic DISABLED to avoid conflicts with rut_15's
+        predio capacity tracking. If primary predio is full, assignment is rejected.
+        rut_15 handles predio selection and re-pairing.
+        
+        Returns: (success, reason, final_predio_idx, final_volume)
+        """
+        # BASIC VALIDATION
+        if volume < self.MIN_VOLUME:
+            return False, f"Volume {volume:.1f} < MIN {self.MIN_VOLUME}", -1, 0
+            
+        fits, reason, adj_vol = self._cabe_en_predio(original_predio_idx, volume)
+        
+        if fits:
+            self._predio_used_area[original_predio_idx] = self._predio_used_area.get(original_predio_idx, 0.0) + (adj_vol / self.TANK_DEPTH * self.OCCUPATION_FACTOR)
+            return True, "OK", original_predio_idx, adj_vol
+        
+        # REJECT - let rut_15 handle re-pairing
+        return False, reason, -1, 0
+
+class WeightedCandidateSelector:
+    """
+    Selects the best candidate node-predio pairs using a weighted scoring system.
+    Metrics used:
+    1. Total Volume (Higher is better)
+    2. Total Flow (Higher is better)
+    3. Risk Probability (Higher is better)
+    4. Distance (Lower is better)
+    5. Elevation Gap (Higher is better)
+    """
+    def __init__(self, nodes_gdf, predios_gdf):
+        self.weights = config.FLOODING_RANKING_WEIGHTS
+        self.nodes_gdf = nodes_gdf
+        self.predios_gdf = predios_gdf
+
+    def calculate_scores(self, candidates: list) -> pd.DataFrame:
+        """
+        Calculates weighted scores for a list of candidate dictionaries.
+        Normalizes all values provided to 0-1 range before weighting.
+        """
+        
+        df = pd.DataFrame(candidates)
+
+        # --- Normalization (Min-Max) ---
+        def normalize(series):
+            if series.max() == series.min():
+                return np.zeros(len(series))
+            return (series - series.min()) / (series.max() - series.min())
+            
+        df['norm_vol'] = normalize(df['node_volume_flood'])
+        df['norm_flow'] = normalize(df['node_max_flow'])
+        df['norm_risk'] = normalize(df['node_probability_failure'])
+        df['norm_dist'] = normalize(df['node_distance_to_predio'])
+        df['norm_gap'] = normalize(df['node_elevation_gap_to_predio'])
+        
+        score = (
+            self.weights.get('total_volume', 0) * df['norm_vol'] +
+            self.weights.get('total_flow', 0) * df['norm_flow'] +
+            self.weights.get('node_probability_failure', 0) * df['norm_risk'] +
+            self.weights.get('distance', 0) * (1.0 - df['norm_dist']) +
+            self.weights.get('elevation_gap', 0) * df['norm_gap']
         )
-        gdf.to_file(
-            self.out_dir_stats / "00_flooding_nodes.gpkg",
-        )
+        
+        df['score'] = score
+        columns_to_drop = ['norm_vol', 'norm_flow', 'norm_risk', 'norm_dist', 'norm_gap']
+        df.drop(columns=[c for c in columns_to_drop if c in df.columns], inplace=True)
 
-        return df, gdf
+        return df.sort_values(by=['score'], ascending=[False])
 
 
+    def resolve_assignments(self, assignments: list) -> list:
+        """
+        Converts raw optimization assignments into valid CandidatePairs.
+        Validates volume and area constraints using TankValidator.
+        
+        NOTE: Re-assignment is DISABLED. If predio is full, the assignment
+        is rejected. rut_15's iterative loop handles predio selection.
+        """
+        validator = TankValidator(self.predios_gdf, self.nodes_gdf)
+        active_pairs = []
+        
+        for node_idx, (predio_idx, volume) in enumerate(assignments):
+            if volume <= 0:
+                continue
+                
+            
+            success, reason, final_p_idx, final_vol = validator.validate_and_reserve(predio_idx, volume)
+            
+            if success:
+                node = self.nodes_gdf.iloc[node_idx]
+                predio = self.predios_gdf.iloc[final_p_idx]
+                
+                active_pairs.append(CandidatePair(
+                # --- Identificadores y Metadatos ---
+                node_id = node.NodeID,           # Nombre/ID del nodo (ej. J-123)
+                predio_id = predio_idx,         # Nombre/ID del predio (ej. P-456)
+                
+                # --- Datos del Nodo de derivacion ---
+                node_volume_flood = node.total_volume,    # Volumen de inundación en el nodo (m3)
+                node_max_flow = node.total_flow,        # Caudal pico de inundación (m3/s)
+                node_max_depth = node.NodeDepth,       # H_max del nodo original
+                node_z_invert = node.InvertElevation,        # Elevación batea del nodo (m)
+                node_geometry = node.geometry, # Point con las coordenadas del nodo
+                node_probability_failure = node.FailureProbability,
+                node_flow_over_capacity = node.flow_over_capacity,  # Caudal sobre capacidad de tubería (m3/s)
+                node_flooding_flow = node.flow_node_flooding,       # Caudal de inundación del nodo (m3/s)
+                node_volume_over_capacity = node.vol_over_capacity,  # Volumen sobre capacidad de tubería (m3)
+                node_volume_flooding= node.vol_node_flooding,  # Volumen de inundación del nodo (m3)
+                
+                # --- Tuberia ---
+                derivation_link= "",         # ID del tramo que más aporta a la inundación
+                derivation_link_geometry = None,
+                derivation_target_node_geometry = None,
+
+                
+                # --- Datos del Predio  ---
+                predio_area_m2= round(predio.geometry.area, 0),
+                predio_geometry = predio.geometry,
+                predio_x_centroid= predio.geometry.centroid.x,
+                predio_y_centroid= predio.geometry.centroid.y,
+                predio_ground_z = predio.z,      # Elevación del terreno
+                
+                # ---  Tanque  ---
+                tank_volume_simulation = 0.0, # Volumen capturado en simulación post-ejecución
+                tank_max_depth = 0.0,       # Profundidad de diseño (por defecto en config)
+                
+                # --- Costos Estimados (Para rut_17 Dashboard) ---
+                cost_link = 0.0,
+                cost_tank = 0.0,
+                cost_land = 0.0,
+                
+                # --- Contexto del Árbol (Tree Routing) ---
+                is_tank = True,              # ¿Se conecta a un tanque o es solo una tubería?
+                target_id = "",               # ID del nodo/tanque al que finalmente descarga
+      
+                ))
+            
+        return active_pairs
 
 
-if __name__ == "__main__":
+class PredioSlopeCalculator:
+    """
+    Calculates the average slope for each predio using a vectorized approach.
+    """
 
-    inp_file = Path(r"C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\COLEGIO_TR25_v6.inp").resolve()
+    def __init__(self, elev_raster_path):
+        self.elev_raster_path = elev_raster_path
 
-    swmm_solver = SWMMOverflowAnalyzer(
-        inp_file,
-        w_vol=0.5,
-        w_peak=0.3,
-        w_hours=0.2,
-        top_timeline=10,
-    )
-    df = swmm_solver.get_all_peak_details()
+    def calculate_slopes(self, predios_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """
+        Calculates the mean slope (%) for each predio polygon.
 
-    swmm_solver.run_all_plots()
+        Args:
+            predios_gdf: GeoDataFrame containing predio polygons.
+
+        Returns:
+            GeoDataFrame with a new 'mean_slope_pct' column.
+        """
+        if predios_gdf.empty:
+            predios_gdf['mean_slope_pct'] = 0.0
+            return predios_gdf
+
+        try:
+            with rasterio.open(self.elev_raster_path) as src:
+                # 1. Read DEM data
+                # We read the first band
+                Z = src.read(1)
+                transform = src.transform
+                cell_size_x = transform[0]
+                cell_size_y = -transform[4]  # Usually negative in standard geo-tiffs
+
+                # 2. Compute Slope (Vectorized gradient)
+                # np.gradient returns [gradient_y, gradient_x]
+                grad_y, grad_x = np.gradient(Z, cell_size_y, cell_size_x)
+
+                # Slope in %: sqrt(dx^2 + dy^2) * 100
+                slope_pct = np.sqrt(grad_x ** 2 + grad_y ** 2) * 100
+
+                # Handling NoData (if any exist in Z, they might affect slope)
+                if src.nodata is not None:
+                    mask_nodata = (Z == src.nodata)
+                    slope_pct[mask_nodata] = 0
+
+                # 3. Rasterize Predios (Vectorized Mask)
+                # Create an ID grid effectively mapping pixels to predio indices
+                # We use index + 1 because 0 is usually background
+                shapes = ((geom, idx + 1) for idx, geom in enumerate(predios_gdf.geometry))
+
+                # Ensure we match the raster shape and transform
+                id_grid = features.rasterize(
+                    shapes=shapes,
+                    out_shape=Z.shape,
+                    transform=transform,
+                    fill=0,
+                    dtype=np.int32
+                )
+
+                # 4. Aggregate using bincount (Super fast)
+                # Flatten arrays
+                ids_flat = id_grid.ravel()
+                slopes_flat = slope_pct.ravel()
+
+                # Determine max ID to set bin count size
+                max_id = ids_flat.max()
+
+                # Sum of slopes per ID
+                slope_sums = np.bincount(ids_flat, weights=slopes_flat, minlength=max_id + 1)
+
+                # Count of pixels per ID
+                pixel_counts = np.bincount(ids_flat, minlength=max_id + 1)
+
+                # 5. Calculate means
+                # Avoid division by zero
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    slope_means = slope_sums / pixel_counts
+
+                # slope_means[0] is background, we ignore it.
+                # Predio i corresponds to slope_means[i+1]
+
+                # Map back to GDF
+                # We initialized indices 0 to len-1.
+                # Result array indices 1 to len.
+
+                # Create a Series for mapping, fill missing with 0
+                # We only care about indices 1 to max_id present in the grid
+                # Note: Some predios might not overlap raster or be too small for a pixel
+                # They will have pixel_count 0.
+
+                # Safe access
+                n_predios = len(predios_gdf)
+                results = np.zeros(n_predios)
+
+                for idx in range(n_predios):
+                    bin_idx = idx + 1
+                    if bin_idx <= max_id and pixel_counts[bin_idx] > 0:
+                        results[idx] = slope_means[bin_idx]
+                    else:
+                        results[idx] = 0.0  # Or NaN if preferred
+
+                predios_gdf['mean_slope_pct'] = results
+
+                print(f"[PredioSlope] Calculated slopes for {len(predios_gdf)} predios .")
+
+        except Exception as e:
+            print(f"[PredioSlope] Error calculating slopes: {e}")
+            import traceback
+            traceback.print_exc()
+            predios_gdf['mean_slope_pct'] = 0.0
+
+        return predios_gdf
+

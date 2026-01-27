@@ -11,8 +11,7 @@ import os
 from scipy.spatial import distance
 from shapely.geometry import LineString
 from operator import itemgetter
-import sys
-
+from pathlib import Path
 import warnings
 
 # Suppress all warnings
@@ -503,8 +502,8 @@ class CantidadesZanjaAbierta:
         
         self.m_ramales_df = self.m_ramales_df.reset_index(drop=True)
 
-        if self.m_ramales_df.empty:
-            sys.exit(f"ADVERTENCIA: el filtro resulto en un dataframe vacio, por favor revisa que existan tramos nuevos y al menos una seccion sea circular.")
+        # if self.m_ramales_df.empty:
+        #     sys.exit(f"ADVERTENCIA: el filtro resulto en un dataframe vacio, por favor revisa que existan tramos nuevos y al menos una seccion sea circular.")
     
     def extract_range_depth_old(self, text):
         """Extract depth range from column name."""
@@ -3727,7 +3726,7 @@ class SewerConstructionCost:
         total = calc.run()
     """
     
-    def __init__(self, vector_path: str, tipo: str, fase: str = 'GENERAL', 
+    def __init__(self, vector_path: Path, tipo: str, fase: str = 'GENERAL',
                  domiciliarias_vector_path: str = None, base_precios: str = None,  **kwargs):
         self.vector_path = vector_path
         self.tipo = tipo
@@ -4249,44 +4248,58 @@ class SewerConstructionCost:
             # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
             c_cr = CantidadesZanjaAbierta(self.parameters_dict)
 
-            # cantidades de excavacion
-            df_cut_vol = c_cr.get_class_soil_vol_quantities(force_general_percentages=False)
+            if not  c_cr.m_ramales_df.empty:
+                # cantidades de excavacion
+                df_cut_vol = c_cr.get_class_soil_vol_quantities(force_general_percentages=False)
 
-            # cantidades de entibado
-            df_shoring = c_cr.get_shoring()
+                # cantidades de entibado
+                df_shoring = c_cr.get_shoring()
 
-            # cantidades de relleno
-            df_fill, df_rotura = c_cr.get_fill_vol()
+                # cantidades de relleno
+                df_fill, df_rotura = c_cr.get_fill_vol()
 
-            # cantidades de mejoramiento de fondo de zanja
-            df_soil_replacement = c_cr.get_soil_improvement()
+                # cantidades de mejoramiento de fondo de zanja
+                df_soil_replacement = c_cr.get_soil_improvement()
 
-            # cantidades acarreo y desalojo
-            df_vol = pd.concat([df_cut_vol, df_soil_replacement])
-            df_material_removal = c_cr.get_material_removal(df_vol)
+                # cantidades acarreo y desalojo
+                df_vol = pd.concat([df_cut_vol, df_soil_replacement])
+                df_material_removal = c_cr.get_material_removal(df_vol)
 
-            # abatimiento, desbroce
-            df_other_quantities = c_cr.get_other_quantities()
+                # abatimiento, desbroce
+                df_other_quantities = c_cr.get_other_quantities()
 
-            area_trench_properties = c_cr.area_properties
+                area_trench_properties = c_cr.area_properties
 
-            # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-            tp = CantidadesTuberiasPozos(c_cr.m_ramales_df, area_trench_properties, self.parameters_dict)
+                # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                tp = CantidadesTuberiasPozos(c_cr.m_ramales_df, area_trench_properties, self.parameters_dict)
 
-            resumen = tp.get_length_metodo_constructivo()
+                resumen = tp.get_length_metodo_constructivo()
 
-            # cantidades tuberia
-            df_pipes = tp.get_pipe_length_circular()
+                # cantidades tuberia
+                df_pipes = tp.get_pipe_length_circular()
 
-            # cantidades canales y colectores
-            df_canales_colectores = tp.get_pipe_length_rectangular()
+                # cantidades canales y colectores
+                df_canales_colectores = tp.get_pipe_length_rectangular()
 
-            # cantidades pozos
-            df_pz = tp.get_pz_class()
-            cantidad_pozos = df_pz['CANTIDAD'].sum()
+                # cantidades pozos
+                df_pz = tp.get_pz_class()
+                cantidad_pozos = df_pz['CANTIDAD'].sum()
 
-            # cantidades pozos especiales y salto
-            df_pz_especial = tp.get_pozo_especial(c_cr.depth_ranges)
+                # cantidades pozos especiales y salto
+                df_pz_especial = tp.get_pozo_especial(c_cr.depth_ranges)
+            else:
+                cantidad_pozos = 1
+                df_cut_vol = pd.DataFrame()
+                df_shoring = pd.DataFrame()
+                df_fill = pd.DataFrame()
+                df_rotura = pd.DataFrame()
+                df_soil_replacement = pd.DataFrame()
+                df_material_removal = pd.DataFrame()
+                df_other_quantities = pd.DataFrame()
+                df_pipes = pd.DataFrame()
+                df_canales_colectores = pd.DataFrame()
+                df_pz = pd.DataFrame()
+                df_pz_especial = pd.DataFrame()
 
             # ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
             ct = CantidadesTunel(self.parameters_dict)
@@ -4350,7 +4363,7 @@ class SewerConstructionCost:
             }
             total_all += formatter.total_budget
             
-            print(current_fase, '----', formatter.total_budget)
+
         
         # Si solo una fase, guardar referencia directa
         if len(fases) == 1:
@@ -4396,7 +4409,7 @@ class SewerConstructionCost:
 
 if __name__ == '__main__':
     # Ejemplo de uso de la clase SewerConstructionCost
-    vector_path = r'C:\Users\Alienware\OneDrive\SANTA_ISABEL\PROYECTO_SAN_SEBASTIAN\00_GIS\02_OUT\01_RAMALES\SAN_SEBASTIAN.gpkg'
+    vector_path = r'C:\Users\Alienware\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Seq_Iter_01\Seq_Iter_01.gpkg'
     # vector_path = r'Casima.gpkg'
     domiciliarias_vector_path = None  # Opcional
     tipo = 'PLUVIAL'

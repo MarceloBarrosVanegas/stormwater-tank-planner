@@ -1102,7 +1102,7 @@ def get_geometry_pypiper_GIS(vector_name, dmax, m_ramales=None, ramal=None, appe
         "Estado": "U256",
         "Material": "U256",
         "metodo_constructivo": "U256",
-        "Obs": "U256",
+        "Obs": "U1000",
         "Pozo": "U256",
         "Ramal": "U256",
         "Rugosidad": "U256",
@@ -23601,11 +23601,10 @@ class SewerPipeline:
     • El método `.run()` ejecuta TODO el flujo original.
     """
 
-    def __init__(self, elev_file_path:str, vector_file_path:str, project_name: str, pozo_hmin_dict: dict, flows_dict: dict, proj_to: str, path_out: str = None):
+    def __init__(self, elev_file_path:str, vector_file_path:str, project_name: str, flows_dict: dict, proj_to: str, path_out: str = None):
         self.elev_file_path = elev_file_path
         self.vector_file_path = vector_file_path
         self.project_name = project_name
-        self.pozo_hmin_dict = pozo_hmin_dict
         self.flows_dict = flows_dict
         self.proj_to = proj_to
         self.path_out = path_out
@@ -23621,19 +23620,14 @@ class SewerPipeline:
         elev_file_path = self.elev_file_path
         vector_file_path = self.vector_file_path
         project_name = self.project_name
-        pozo_hmin_dict = self.pozo_hmin_dict
         proj_to = self.proj_to
         flows_dict = self.flows_dict
         
         scale_viewport = 1.0
 
         t0 = time.time()
-        
         path_proy = "PROYECTO_" + str(project_name) + os.path.sep
-        
-        # Street Surface File
         elev_file = [elev_file_path]
-    
         dmax = 0.5
 
 
@@ -23658,8 +23652,7 @@ class SewerPipeline:
             shape_file = vector_file_path
             skip_ramal = []
             elev_source.m_ramales = m_ramales
-            # (Step opt_vertical_profile skipped as in original code)
-            
+
             # 4. Simplificar Geometria
             m_ramales, ramal, xy_inter = simple_geometryV3(m_ramales, ramal, dmax=dmax)
             pbar.set_description("Simplifying Geometry...")
@@ -23670,7 +23663,6 @@ class SewerPipeline:
             pbar.set_description("Assigning Elevations...")
             pbar.update(1)
 
-            # (Asignar Comentarios skipped as in original)
         
             # 6. Longitudes
             m_ramales, ramal = get_len(m_ramales, ramal)
