@@ -21,6 +21,7 @@ import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import shutil
 import geopandas as gpd
 from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -162,47 +163,84 @@ class GreedyTankOptimizer:
                 solution_inp=str(self.current_inp_file)
             )
 
-    def resize_tanks_based_on_exceedance(self, current_inp_file: str):
+    def resize_tanks_based_on_exceedance(self, current_inp_file: str, active_pairs: list = None) -> dict:
         """
         Resizes tanks based on exceedance volume, updates the SWMM file, and re-extracts metrics.
+        Iterates until no tank has flooding (exceedance_volume = 0).
+        
+        Returns:
+            dict or None: If capacity exceeded, returns {'node_id': X, 'predio_id': Y, 'target_id': Z}
+                          Otherwise returns None.
         """
-        run = False
-
-        tanks = self.current_metrics.tank_data
-        for tk_id, tk_data in tanks.items():
-            exceedance_volume = tk_data['exceedance_volume']
-            if exceedance_volume > 0:
-                new_vol = tk_data['max_stored_volume'] + exceedance_volume
-                new_area = (new_vol / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR
-                modifier = SWMMModifier(current_inp_file)
-                modifier.modify_storage_area(tk_id, new_area)
-                modifier.save(current_inp_file)
-                print(f"  [Resize] {tk_id}: Increased volume by {exceedance_volume:.1f} m³ to {new_vol:.1f} m³")
-                run = True
+        MAX_RESIZE_ITERATIONS = 10  # Safety limit to prevent infinite loops
+        iteration = 0
+        
+        while iteration < MAX_RESIZE_ITERATIONS:
+            iteration += 1
+            run = False
+            
+            tanks = self.current_metrics.tank_data
+            for tk_id, tk_data in tanks.items():
+                exceedance_volume = tk_data['exceedance_volume']
+                if exceedance_volume > 0:
+                    new_vol = tk_data['max_stored_volume'] + exceedance_volume
+                    new_area = (new_vol / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR
+                    
+                    # Validate predio capacity before resize
+                    predio_id = int(tk_id.replace("tank_", ""))  # Extract predio_id from tank_X
+                    if predio_id in self.evaluator.predio_tracking:
+                        tracking = self.evaluator.predio_tracking[predio_id]
+                        if new_area > tracking['area_total']:
+                            # Capacity exceeded - find the node_id for this predio
+                            node_id = None
+                            target_id = predio_id
+                            if active_pairs:
+                                for pair in active_pairs:
+                                    if pair.get('predio_id') == predio_id:
+                                        node_id = pair.get('node_id')
+                                        # Check if connected to node instead of direct predio
+                                        if pair.get('target_type') == 'node':
+                                            target_id = pair.get('predio_id')  # The node it connected to
+                                        break
+                            
+                            print(f"  [Overflow] {tk_id} needs {new_area:.0f} m², "
+                                  f"predio {predio_id} only has {tracking['area_total']:.0f} m²")
+                            
+                            return {
+                                'node_id': node_id,
+                                'predio_id': predio_id,
+                                'target_id': target_id,
+                                'tank_id': tk_id
+                            }
+                        # Update tracked volume
+                        self.evaluator.predio_tracking[predio_id]['volumen_acumulado'] = new_vol
+                    
+                    modifier = SWMMModifier(current_inp_file)
+                    modifier.modify_storage_area(tk_id, new_area)
+                    modifier.save(current_inp_file)
+                    print(f"  [Resize Iter {iteration}] {tk_id}: Increased volume by {exceedance_volume:.1f} m³ to {new_vol:.1f} m³")
+                    run = True
                 
+                depth_target = config.TANK_DEPTH_M - (config.TANK_VOLUME_SAFETY_FACTOR - 1) * config.TANK_DEPTH_M
+                variacion_permitida = depth_target * 0.05
+                max_depth = tk_data['max_depth']
                 
-            
-            depth_target = config.TANK_DEPTH_M - config.TANK_DEPTH_M  * (config.TANK_VOLUME_SAFETY_FACTOR - 1)
-            variacion_permitida = depth_target * 0.05
-            max_depth = tk_data['max_depth']
-            
-            if max_depth < depth_target - variacion_permitida:
-                #reduce tank size
-                new_area = (tk_data['max_stored_volume'] / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR
-                modifier = SWMMModifier(current_inp_file)
-                modifier.modify_storage_area(tk_id, new_area)
-                modifier.save(current_inp_file)
-                print(f"  [Resize] {tk_id}: Reduced tank size to control max depth {max_depth:.2f} m")
-                run = True
-            
-            
-            
-        
-        
-        
+                if max_depth < depth_target - variacion_permitida:
+                    # Reduce tank size
+                    new_area = (tk_data['max_stored_volume'] / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR
+                    modifier = SWMMModifier(current_inp_file)
+                    modifier.modify_storage_area(tk_id, new_area)
+                    modifier.save(current_inp_file)
+                    print(f"  [Resize Iter {iteration}] {tk_id}: Reduced tank size to control max depth {max_depth:.2f} m")
+                    run = True
 
-        if run:
-            # Clean all previous .out files in the directory
+            # If no changes were made, exit loop
+            if not run:
+                if iteration > 1:
+                    print(f"  [Resize] Converged after {iteration - 1} iteration(s) - no more exceedance")
+                break
+            
+            # Re-run SWMM simulation with updated tank sizes
             inp_dir = Path(current_inp_file).parent
             for out_file in inp_dir.glob('*.out'):
                 try:
@@ -212,7 +250,28 @@ class GreedyTankOptimizer:
 
             self.metrics_extractor.run(current_inp_file)
             self.current_metrics = self.metrics_extractor.metrics
+            
+            # Check if all exceedance volumes are now zero
+            total_exceedance = sum(tk['exceedance_volume'] for tk in self.current_metrics.tank_data.values())
+            if total_exceedance <= 0:
+                print(f"  [Resize] All tanks converged after {iteration} iteration(s) - no flooding")
+                break
+        
+        if iteration >= MAX_RESIZE_ITERATIONS:
+            print(f"  [Warning] Max resize iterations ({MAX_RESIZE_ITERATIONS}) reached - some tanks may still have exceedance")
+        
+        return None
 
+
+
+
+    def _remove_case_directory(self):
+        """Remove a case directory if it exists."""
+        case_dir = self.evaluator.current_case_dir
+        
+        if case_dir and Path(case_dir).exists():
+            shutil.rmtree(case_dir)
+            print(f"  [Cleanup] Removed directory: {case_dir}")
 
     def run_sequential(self) -> pd.DataFrame:
         """
@@ -236,7 +295,6 @@ class GreedyTankOptimizer:
         self.baseline_metrics = self.metrics_extractor.metrics
         self.predios_gdf = self.metrics_extractor.predios_gdf
         self.nodes_gdf = self.metrics_extractor.nodes_gdf
-        # Refresh candidates (likely updated after previous iteration's simulation)
         candidates = self.metrics_extractor.ranked_candidates.copy()
 
         economic_history = []  # [(iteration, cost, savings, n_tanks)]
@@ -295,14 +353,6 @@ class GreedyTankOptimizer:
                 if too_close:
                     continue
 
-            # # Area check: Verify predio has enough space for this tank
-            # cap = self.predio_capacity[cand['predio_id']]
-            # available_area = cap['total_area'] - cap['used_area']
-            # required_area = (cand['total_volume'] / config.TANK_DEPTH_M) * config.TANK_OCCUPATION_FACTOR
-            #
-            # if required_area * 0.9 >= available_area:
-            #     # print(f"  [Skip] Node {cand['node_id']} lacks space in Predio {cand['predio_id']}")
-            #     continue
             
             iteration += 1
             # --- 2c. TANK INSTALLATION & REGISTRATION ---
@@ -344,7 +394,41 @@ class GreedyTankOptimizer:
             self.current_metrics = self.metrics_extractor.metrics
 
             #resize tanks based on exceedance
-            self.resize_tanks_based_on_exceedance(current_inp_file)
+            overflow = self.resize_tanks_based_on_exceedance(current_inp_file, active_candidates)
+            
+            if overflow:
+                # Capacity exceeded - tank cannot fit in the assigned predio
+                # Extract IDs for tracking and removal
+                node_id = overflow['node_id']
+                target_id = overflow['target_id']
+                
+                # Add to forbidden pairs to prevent reassignment in future iterations
+                if not hasattr(self.evaluator, 'forbidden_pairs'):
+                    self.evaluator.forbidden_pairs = set()
+                self.evaluator.forbidden_pairs.add((str(node_id), str(target_id)))
+                
+                # Remove the failed path from cumulative tracking
+                del self.evaluator.cumulative_paths[node_id]
+                
+                # Remove the node from active candidates to avoid reprocessing
+                active_candidates = [
+                    p for p in active_candidates
+                    if str(p.get('node_id')) != str(node_id)
+                ]
+                
+                print(f"  [Forbidden] Added ({node_id}, {target_id}) to forbidden pairs. Will retry.")
+                
+                # Clean up the failed case directory
+                self._remove_case_directory()
+                
+                # Decrement iteration counter to retry with remaining candidates
+                iteration = iteration - 1
+                candidates = self.metrics_extractor.ranked_candidates.copy()
+                
+                # Skip graph generation and restart with next candidate
+                continue
+
+
 
 
             n_tanks = 0
@@ -358,8 +442,8 @@ class GreedyTankOptimizer:
                     tank_depth = self.current_metrics.tank_data[tank_id]['max_depth']
                     pair['tank_volume_simulation'] = tank_volume
                     pair['tank_max_depth'] = tank_depth
-                    pair['cost_tank'] = CostCalculator.calculate_tank_cost(tank_volume * config.TANK_VOLUME_SAFETY_FACTOR)
-                    pair['cost_land'] = (tank_volume / config.TANK_DEPTH_M * config.TANK_OCCUPATION_FACTOR) * config.LAND_COST_PER_M2
+                    pair['cost_tank'] = CostCalculator.calculate_tank_cost(tank_volume)
+                    pair['cost_land'] = (tank_volume / config.TANK_DEPTH_M ) * config.LAND_COST_PER_M2
                 
             cost_tank_land = 0.0
             for pair in active_candidates:

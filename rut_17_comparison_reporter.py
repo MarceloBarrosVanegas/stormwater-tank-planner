@@ -120,7 +120,7 @@ class ScenarioComparator:
 
         # Build table data - compact format
         # L in km, Vol = actual volume rounded, Util% with warning color if low
-        table_headers = ['#', 'Predio', 'Q\n[m³/s]', 'L\n[km]', 'D\n[m]', 'Volume\n[m³]', '%Predio\n[ha]']
+        table_headers = ['#', 'Predio', 'Q\n[m³/s]', 'L\n[km]', 'D\n[m]', 'Volume\n[m³]', 'Área\n[m²]', '%Uso\nPredio']
         table_data = []
         tank_positions = {}  # To store positions for map labels
         low_util_rows = []  # Track rows with low utilization
@@ -137,35 +137,40 @@ class ScenarioComparator:
                     return default
                 
                 node_id = get_val(tank, 'node_id', '?')
-                q_derivacion = get_val(tank, 'total_flow', 0)
-                longitud_km = get_val(tank, 'pipeline_length', 0) / 1000  # From designed_gdf if available
-                diametro = get_val(tank, 'diameter', 'N/A')  # From designed_gdf if available
-                vol_used = get_val(tank, 'tank_volume_simulation', 0)
-                vol_design = get_val(tank, 'total_volume', 0)
-                util_pct = vol_used / vol_design if vol_design > 0 else 0.0
                 predio_id = get_val(tank, 'predio_id', '')
-                # Calculate used_area from volume and config
-                used_area = (vol_design / config.TANK_DEPTH_M) * config.TANK_OCCUPATION_FACTOR
-                percentage_used_area =  used_area / tank['predio_area'] if tank['predio_area'] > 0 else 0.0
+                longitud_km = get_val(tank, 'pipeline_length', 0) / 1000
+                diametro = get_val(tank, 'diameter', 'N/A')
+                predio_area = get_val(tank, 'predio_area', 0)
+                
+                # Get Q and Volume from solution.tank_data (simulation results)
+                tank_id = f"tank_{predio_id}"
+                if tank_id in solution.tank_data:
+                    q_derivacion = solution.tank_data[tank_id]['max_flow']
+                    vol_stored = solution.tank_data[tank_id]['max_stored_volume']
+                else:
+                    q_derivacion = get_val(tank, 'total_flow', 0)
+                    vol_stored = get_val(tank, 'tank_volume_simulation', 0)
+                
+                # Calculate tank area from stored volume (same formula as rut_15_optimizer)
+                tank_area = (vol_stored / config.TANK_DEPTH_M) + config.TANK_OCCUPATION_FACTOR
+                percentage_used_area = (tank_area / predio_area * 100) if predio_area > 0 else 0.0
 
-                # Round volume to configured increment
-                vol_rounded = round(vol_used / config.TANK_VOLUME_ROUND_M3) * config.TANK_VOLUME_ROUND_M3
-
-                # Track low utilization
-                if util_pct < config.TANK_MIN_UTILIZATION_PCT:
+                # Track low utilization (if tank uses > 80% of predio)
+                if percentage_used_area > 80:
                     low_util_rows.append(i)
 
                 table_data.append([
                     str(i),
                     predio_id,
-                    f"{q_derivacion:.1f}",
+                    f"{q_derivacion:.2f}",
                     f"{longitud_km:.2f}",
                     f"{float(diametro):.2f}" if str(diametro).replace('.', '', 1).isdigit() else (
                         f"{float(str(diametro).split('x')[0]):.2f}x{float(str(diametro).split('x')[1]):.2f}"
                         if 'x' in str(diametro).lower() else str(diametro)[:9]
                     ),
-                    f"{vol_rounded:,.0f}",
-                    f"{percentage_used_area:,.2f}",
+                    f"{vol_stored:,.0f}",
+                    f"{tank_area:,.0f}",
+                    f"{percentage_used_area:.1f}%",
                 ])
                 tank_positions[node_id] = i  # Map node to number
 
@@ -174,7 +179,7 @@ class ScenarioComparator:
                                    colLabels=table_headers,
                                    loc='center',
                                    cellLoc='center',
-                                   colWidths=[0.15, 0.20, 0.15, 0.15, 0.25, 0.20, 0.2])
+                                   colWidths=[0.15, 0.20, 0.20, 0.20, 0.25, 0.20, 0.20, 0.20])
 
             table.auto_set_font_size(False)
             table.set_fontsize(8)
@@ -208,11 +213,9 @@ class ScenarioComparator:
         ax_flood = fig.add_subplot(gs[1, 2])
         self._plot_system_flood_hydrograph(ax_flood, self.baseline, solution)
 
-        # Row 1, Col 3: Flood Volume Histogram
-        ax_hist_vol = fig.add_subplot(gs[1, 3])
-        base_vols = list(self.baseline.system_flood_hydrograph['total_rate'])
-        sol_vols = list(solution.system_flood_hydrograph['total_rate'])
-        self._plot_hist(ax_hist_vol, base_vols, sol_vols, "Flood Vol (m³)")
+        # Row 1, Col 3: Outfall Flow Hydrograph
+        ax_outfall = fig.add_subplot(gs[1, 3])
+        self._plot_outfall_hydrograph(ax_outfall, self.baseline, solution)
 
         plt.tight_layout()
         plt.savefig(save_dir / "00_dashboard_map.png", dpi=100)
@@ -467,6 +470,64 @@ class ScenarioComparator:
         ax.set_xlabel(xlabel)
         ax.legend()
         ax.set_title(f"Distribution: {xlabel}")
+
+    def _plot_outfall_hydrograph(self, ax, baseline, solution):
+        """Plots outfall flow comparison showing lamination effect of tanks."""
+        
+        def plot_series(metrics_obj, color, label, linestyle):
+            data = getattr(metrics_obj, "system_outfall_flow_hydrograph", None)
+            if not data or "total_rate" not in data or "times" not in data:
+                return None, None
+            
+            rates = np.asarray(data["total_rate"], dtype=float)
+            times = np.asarray(data["times"])
+            
+            if len(times) < 2 or len(rates) < 2:
+                return None, None
+            
+            t0 = times[0]
+            if isinstance(t0, pd.Timestamp):
+                t_idx = pd.to_datetime(times)
+                hrs = ((t_idx - t_idx[0]).total_seconds().to_numpy()) / 3600.0
+            else:
+                t64 = times.astype("datetime64[ns]")
+                diffs_sec = (t64 - t64[0]).astype("timedelta64[s]").astype(float)
+                hrs = diffs_sec / 3600.0
+            
+            ax.plot(hrs, rates, linestyle=linestyle, color=color, alpha=0.8, linewidth=2, label=label)
+            
+            # Peak annotation
+            if len(rates) > 0:
+                peak_val = np.max(rates)
+                if peak_val > 0:
+                    peak_idx = np.argmax(rates)
+                    ax.annotate(f'{peak_val:.2f}', xy=(hrs[peak_idx], peak_val), 
+                               xytext=(0, 5), textcoords="offset points",
+                               color=color, fontsize=9, fontweight='bold')
+            
+            return hrs, rates
+        
+        hrs_b, rates_b = plot_series(baseline, 'red', 'Baseline Outfall', '--')
+        hrs_s, rates_s = plot_series(solution, 'blue', 'Solution Outfall', '-')
+        
+        ax.set_title("Outfall Flow ")
+        ax.set_ylabel("Flow Rate (m³/s)")
+        ax.set_xlabel("Time (hours)")
+        ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        
+        # Show peak reduction
+        if rates_b is not None and rates_s is not None:
+            peak_b = np.max(rates_b)
+            peak_s = np.max(rates_s)
+            reduction = peak_b - peak_s
+            pct = (reduction / peak_b) * 100 if peak_b > 0 else 0
+            
+            ax.text(0.98, 0.05, f"Peak Reduction: {reduction:.2f} m³/s ({pct:.1f}%)",
+                   transform=ax.transAxes, fontsize=9,
+                   verticalalignment='bottom', horizontalalignment='right',
+                   bbox=dict(boxstyle="round,pad=0.3", fc="white", ec='black', alpha=0.9))
 
     @staticmethod
     def _plot_derivations_and_labels(ax, derivations, tank_details=None):

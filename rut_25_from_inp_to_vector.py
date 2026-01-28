@@ -276,9 +276,11 @@ class NetworkExporter:
         """
         try:
             # 1. Clean File
-            cleaner = CleanINP(self.inp_file)
-            model = swmmio.Model(cleaner.cleaned_path)
-            self.out_path_file = Path(cleaner.cleaned_path).with_suffix('.out')
+            # cleaner = CleanINP(self.inp_file)
+            # model = swmmio.Model(cleaner.cleaned_path)
+            
+            model = swmmio.Model(self.inp_file)
+            self.out_path_file = Path(self.inp_file).with_suffix('.out')
             
             # 2. Build Physical
             physical = PhysicalNetwork(model)
@@ -335,3 +337,4 @@ if __name__ == "__main__":
     
     exporter = NetworkExporter(inp_file)
     exporter.run(output_file, crs=config.PROJECT_CRS)
+

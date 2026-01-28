@@ -63,16 +63,14 @@ class StormwaterOptimizationRunner:
 
 
     def run_sequential_analysis(self, max_tanks: int = 10, max_iterations: int = 50,
-                                         min_tank_vol: float = 1000.0, max_tank_vol: float = 10000.0, 
-                                         tank_depth: float = 5.0,
+                                         min_tank_vol: float = 1000.0, max_tank_vol: float = 10000.0,
                                          stop_at_breakeven: bool = False, 
                                          breakeven_multiplier: float = 1.0,
                                          optimizer_mode: str = 'greedy',  # 'greedy' or 'nsga'
+                                         elev_file: Path = None,
                                          optimization_tr_list: list = None,  # For NSGA: [25] or [1,2,5,10,25]
                                          validation_tr_list: list = None,    # For NSGA final validation
-                                         n_generations: int = 50,            # NSGA generations
-                                         pop_size: int = 30,                 # NSGA population
-                                         swmm_file: Path = None, elev_file: Path = None):
+                                         ):
         """
         Step 3: Sequential Tank Analysis
         ---------------------------------
@@ -308,17 +306,14 @@ if __name__ == "__main__":
         max_iterations=100,        # Max iterations (stopping condition 2)
         min_tank_vol=config.TANK_MIN_VOLUME_M3,       # Minimum tank size (m³)
         max_tank_vol=config.TANK_MAX_VOLUME_M3,    # Very high - predio area will limit actual size
-        tank_depth=config.TANK_DEPTH_M,            # Tank depth (m)
         stop_at_breakeven=True,    # Stop when cost >= threshold (condition 3)
         breakeven_multiplier=50,  # Allow investment up to 1.5x avoided damage
-        swmm_file=swmm_file,
         elev_file=elev_file,
 
         optimizer_mode = 'greedy',  # 'greedy' or 'nsga'
         optimization_tr_list = config.TR_LIST,  # For NSGA: [25] or [1,2,5,10,25]
         validation_tr_list= config.VALIDATION_TR_LIST,  # For NSGA final validation
-        n_generations = config.N_GENERATIONS,  # NSGA generations
-        pop_size = config.POP_SIZE,  # NSGA population
+
     )
 
 

@@ -828,12 +828,12 @@ class SWMMModifier:
                     if target_type == 'tank':
                         # Create tank with target_id
                         tank_name = f"tank_{target_id}"
-                        tank_volume = node_metadata['target_total_volume'] * config.TANK_OCCUPATION_FACTOR
+                        tank_volume = node_metadata['target_total_volume']
                         
                         if tank_name not in added_nodes:
                             self.add_storage_unit(
                                 name=tank_name,
-                                area=(tank_volume / config.TANK_DEPTH_M),
+                                area=(tank_volume / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR,
                                 max_depth=config.TANK_DEPTH_M,
                                 invert_elev=node_end_elev - config.TANK_DEPTH_M
                             )

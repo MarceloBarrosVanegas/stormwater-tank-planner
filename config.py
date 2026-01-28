@@ -81,6 +81,7 @@ GIS_DIR = PROJECT_ROOT / "gis"
 RASTER_DIR = GIS_DIR / "01_raster"
 VECTOR_DIR = GIS_DIR / "00_vector"
 FLOODING_STATS_DIR = CODIGOS_DIR / "00_flooding_stats"
+FAILIURE_RISK_FILE = CODIGOS_DIR / "probabilistic_results/risk_estimation/04_spatial_analysis/pipe_failure_probability.gpkg"
 
 # =============================================================================
 # MAIN PROJECT FILES
@@ -97,6 +98,7 @@ VALIDATION_TR_LIST = [1,2,5,10,25,50,100]  # For NSGA final validation
 N_GENERATIONS = 300  # NSGA generations
 POP_SIZE = 100  # NSGA population
 MIN_TANKS = 3   # Minimum number of active tanks (constraint for NSGA)
+
 
 # Rasters
 ELEV_FILE_ORIGINAL = RASTER_DIR / "elev_10_dmq_reprojected_clipped.tif"
@@ -142,7 +144,13 @@ MANNING_RASTER_FILE = RASTER_DIR / "manning_raster.tif"
 # =============================================================================
 ITZI_SIMULATION_DURATION_HOURS = 3.5  # Duration for Itzi/SWMM simulation (Hours)
 REPORT_STEP_MINUTES = 5               # Report step for SWMM and Itzi
-PLOT_TIME_LIMIT_HOURS = 3.5           # Limit X-axis on time plots
+
+# Reporting Parameters
+SHOW_PREDIOS_IN_REPORTS = False  # Enable/Disable predios background in comparison maps (slow)
+
+# GREEN (NATURAL) SCENARIO PARAMETERS
+GREEN_SCENARIO_CN = 76.0              # Default Curve Number for natural state (Forest/Pasture)
+GREEN_SCENARIO_IMPERV = 15.0           # 3% residual imperviousness (rocks, clay, etc.)
 
 # =============================================================================
 # COST PARAMETERS
@@ -159,19 +167,46 @@ COST_COMPONENTS = {
 # =============================================================================
 # TANK DESIGN PARAMETERS
 # =============================================================================
-TANK_DEPTH_M = 5.0              # Default tank depth in meters
-TANK_MIN_VOLUME_M3 = 5000.0     # Minimum tank volume in cubic meters
+CAPACITY_MAX_HD = 0.5 # Maximum h/D ratio in conduits
+CAPACITY_MAX_FOR_AVOIDED_COST = 0.75
+
+# 'flooding' for just avoid flooding nodes   or  'capacity' for avoiding h/D > DERIVATION_MAX_HD in all conduits
+TANK_OPT_OBJECTIVE = 'flooding'
+# TANK_OPT_OBJECTIVE = 'capacity'
+MINIMUN_FLOODING_FLOW = 0.1  # Minimum flooding flow to consider a node flooded (m3/s)
+MAX_ITERATIONS = 100  # Max iterations for tank sizing convergence
+
+TANK_DEPTH_M = 10.0              # Default tank depth in meters
+TANK_MIN_VOLUME_M3 = 1000.0     # Minimum tank volume in cubic meters
 TANK_MAX_VOLUME_M3 = 100000.0    # Maximum tank volume in cubic meters
-TANK_OCCUPATION_FACTOR = 1.2    # Extra space factor for access, pumps, maneuvering
-TANK_MIN_UTILIZATION_PCT = 40.0 # Minimum tank utilization % (warn if below this)
+
+TANK_MIN_UTILIZATION_PCT = 20.0 # Minimum tank utilization % (warn if below this)
 TANK_VOLUME_ROUND_M3 = 100      # Round volumes to this increment for display
-MAX_TANKS = 15
+MAX_TANKS = 20
+MAX_PRUNE_RETRIES =  2  # Max retries for pruning tanks
+MAX_PREDIO_SLOPE = 30.0 # Maximum allowed predio slope in %. Predios steeper than this are discarded.
+PREDIO_MAX_OCCUPANCY_RATIO = 0.85  # Exclude predios with >85% area occupied from path search
 
 # Tank Volume Sizing
-TANK_VOLUME_SAFETY_FACTOR = 2.0 # Safety factor applied to flooding volume
+TANK_VOLUME_SAFETY_FACTOR = 1.1 # Safety factor applied to flooding volume
+TANK_OCCUPATION_FACTOR = 150    # Extra space factor for access, pumps, maneuvering in tank area calculation
+
+
 WEIR_CREST_MIN_M = 0.1         # Minimum weir crest height above tank bottom (m)
 WEIR_DISCHARGE_COEFF = 1.84   # Weir discharge coefficient (Cd) for rectangular sharp-crested weir
-DERIVATION_MIN_DISTANCE_M = 1000.0  # Minimum distance (m) between derivation points on same pipe line
+DERIVATION_MIN_DISTANCE_M = 50  # Minimum distance (m) between derivation points on same pipe line
+MIN_DETPH_FOR_DERIVATION_M = 6.0  # Minimum pipe depth tunnel
+
+# Pipeline Design Defaults (used in rut_16)
+MIN_PIPE_SLOPE = 0.004           # Minimum pipe slope (0.4%) for gravity flow
+DEFAULT_PIPE_MATERIAL = 'HA'     # Default pipe material (Hormigón Armado)
+DEFAULT_PIPE_SECTION = 'rectangular'  # Default pipe cross-section type
+DEFAULT_PIPE_RUGOSITY = 'liso'   # Default pipe roughness category
+DEFAULT_POZO_DEPTH = 6.0         # Default manhole/pozo depth (m)
+MIN_PIPE_DIAMETER = 1.8          # Minimum pipe diameter (m)
+
+TOLERANCE = 20  # min distance to simplify paths
+
 # =============================================================================
 
 # LAND COST PARAMETERS
@@ -191,16 +226,24 @@ EXCEL_METADATA = {
 
 # Default if not provided
 DEFAULT_PATH_WEIGHTS = {
-    'length_weight': 0.4,
-    'elevation_weight': 0.3,
-    'road_weight': 0.3
+    'length_weight': 1.0,     # 80% distancia - PRIORIDAD ALTA para rutas más cortas
+    'elevation_weight': 0.0,  # 10% elevación - evitar subidas
+    'road_weight': 0.0        # 10% tipo de calle - menor importancia
 }
+
 DEFAULT_ROAD_PREFERENCES = {
-    'motorway': 5.0, 'trunk': 5.0, 'primary': 1.0,
-    'secondary': 2.5, 'tertiary': 2.5, 'residential': 0.5,
-    'service': 1.0, 'unclassified': 1.0,
-    'footway': 10.0, 'path': 10.0, 'steps': 20.0,
+    'motorway': 5.0, 'trunk': 1.0, 'primary': 1.0,
+    'secondary': 1.2, 'tertiary': 1.3, 'residential': 1.5,
+    'service': 1.5, 'unclassified': 1.5,
+    'footway': 5.0, 'path': 5.0, 'steps': 10.0,
     'default': 1.5
+}
+
+
+FLOODING_RANKING_WEIGHTS = {
+    'total_volume': 0.5,
+    'total_flow': 0.5,
+    'failure_probability': 0.,
 }
 
 # =============================================================================

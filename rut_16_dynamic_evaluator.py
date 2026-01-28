@@ -132,12 +132,18 @@ class DynamicSolutionEvaluator:
         # Track designed pipelines across iterations for tree-based routing
         self.last_designed_gdf = None  # Will store design_gdf from previous iteration
         
+        # Predio capacity tracking for cumulative volume validation
+        self.predio_tracking = {}  # {predio_id: {'area_total', 'volumen_acumulado', 'ramales'}}
+        self.ramal_to_predio = {}  # {ramal_id: predio_id} - maps pipeline branches to their final predio
+        self.forbidden_pairs = set()  # {(node_id, target_id)} - combinations that exceeded capacity
+        
         # INCREMENTAL PATH GENERATION: Cache paths from previous iterations
         self.cached_path_gdfs = []  # List of path GeoDataFrames from all previous iterations
         self.processed_node_ids = set()  # Node IDs that already have paths generated
 
         # 3. Initialize Sub-Systems
         self._init_baseline()
+        self._init_predio_tracking()  # Initialize predio capacity tracking
         self._init_path_finder()
 
 
@@ -226,6 +232,21 @@ class DynamicSolutionEvaluator:
                 self.shared_path_finder.set_node_elevations(nodes_osm, elevations)
         else:
             sys.exit("  Warning: Failed to initialize shared OSM map.")
+
+    def _init_predio_tracking(self):
+        """Initialize predio capacity tracking from predios GeoDataFrame."""
+        self.predio_tracking = {}
+        predios_gdf = self.metrics_extractor.predios_gdf
+        for idx, row in predios_gdf.iterrows():
+            self.predio_tracking[idx] = {
+                'area_total': row.geometry.area,
+                'volumen_acumulado': 0.0,
+                'ramales': []
+            }
+        self.ramal_to_predio = {}
+        print(f"  [Tracking] Initialized capacity tracking for {len(self.predio_tracking)} predios")
+
+
 
     def _build_topology_from_conduits(self, clear_existing: bool = False):
         """
@@ -321,244 +342,60 @@ class DynamicSolutionEvaluator:
         }
 
 
+    def _get_predio_occupancy_ratio(self, predio_id) -> float:
+        """Calculate current occupancy ratio for a predio (0.0 to 1.0+)."""
+        if predio_id not in self.predio_tracking:
+            return 0.0
+        tracking = self.predio_tracking[predio_id]
+        if tracking['area_total'] <= 0:
+            return 1.0  # Treat zero-area as fully occupied
+        # Calculate max volume that fits in area
+        max_volume = (tracking['area_total'] * config.TANK_DEPTH_M)
+        if max_volume <= 0:
+            return 1.0
+        return tracking['volumen_acumulado'] / max_volume
 
-    def _find_best_target_by_path_length(self,
-                                          source_point: tuple,
-                                          source_elevation: float,) -> tuple:
+    def _check_predio_has_capacity(self, predio_id, additional_volume: float) -> tuple:
         """
+        Check if a predio has capacity for additional volume.
         
         Args:
-            source_point: (x, y) of the source node (flooded node)
-            source_elevation: Elevation of the source node
+            predio_id: ID of the predio to check
+            additional_volume: Volume to add (m³)
+            
         Returns:
-            Tuple of (target_x, target_y, is_intermediate, metadata)
+            (bool, str): (has_capacity, message)
         """
-        print(f"  [Target] Source point: ({source_point[0]:.1f}, {source_point[1]:.1f})")
-    
-        # Initialize node_df as empty DataFrame with correct columns
-        node_df = pd.DataFrame(columns=['id', 'type', 'invert_elevation', 'x', 'y'])
+        if predio_id not in self.predio_tracking:
+            return False, f"Predio {predio_id} not found in tracking"
         
-        # Extract coordinates from last designed pipeline only if it exists
-        if self.last_designed_gdf is not None:
-            coords_df = self.last_designed_gdf.geometry.get_coordinates()
-            node_df = coords_df.iloc[1::2]  # Select every other row starting from index 1
-            node_df.columns = ['x', 'y']
-            node_df['type'] = 'node'
-            node_df['invert_elevation'] = self.last_designed_gdf['ZFF']  # Invert elevation from pipeline end
-            node_df['id'] = self.last_designed_gdf['Pozo']  # Node ID from Pozo column
-            node_df = node_df[['id', 'type', 'invert_elevation', 'x', 'y']]  # Reorder columns
+        tracking = self.predio_tracking[predio_id]
+        volumen_total = tracking['volumen_acumulado'] + additional_volume
         
-        # Extract centroid coordinates from predios GeoDataFrame
-        predios_df = self.predios_gdf.geometry.centroid.get_coordinates()
-        predios_df.columns = ['x', 'y']
-        predios_df['type'] = 'tank'
-        predios_df['invert_elevation'] = self.predios_gdf['z'] - config.TANK_DEPTH_M  # Tank invert elevation
-        predios_df['id'] = self.predios_gdf.index.to_list()  # Use index as ID
-        predios_df = predios_df[['id', 'type', 'invert_elevation', 'x', 'y']]  # Reorder columns
+        # Calculate required area for total volume
+        area_requerida = (volumen_total / config.TANK_DEPTH_M) + config.TANK_OCCUPATION_FACTOR
         
-        # Combine node and predio dataframes into possible targets
-        posible_targets_df = pd.concat([node_df, predios_df], ignore_index=True)
+        if area_requerida > tracking['area_total']:
+            return False, (f"Insufficient area: needs {area_requerida:.0f} m², "
+                          f"available {tracking['area_total']:.0f} m²")
         
-        # Filter candidates where source elevation is sufficient for gravity flow
-        elev_filter = source_elevation >= posible_targets_df['invert_elevation']
-        candidates_df = posible_targets_df[elev_filter]
-        candidates_df.reset_index(drop=True, inplace=True)
-        
-        #filter for available area in predios
-        cap = self.predio_capacity.get(cand['predio_id'], 0)
-        # available_area = cap['total_area'] - cap['used_area']
-        # required_area = (cand['total_volume'] / config.TANK_DEPTH_M) * config.TANK_OCCUPATION_FACTOR
-        #
-        # if required_area * 0.9 >= available_area:
-        #     # print(f"  [Skip] Node {cand['node_id']} lacks space in Predio {cand['predio_id']}")
-        #     continue
-        
-        
-        
-        
-        
-        # Convert filtered dataframe to list of dictionaries
-        candidates = candidates_df.to_dict('records')
-    
-        
-        
-        # Use 50% of available cores (minimum 2)
-        num_cores = max(2, os.cpu_count() // 2)
-        print(f"  [Parallel] Using {num_cores} threads for path calculation (ThreadPoolExecutor)")
-        
-        # Get graph reference once
-        graph = self.shared_path_finder.graph
-        
-        if len(candidates) == 0:
-            print("  [Target] No candidates available after elevation filtering.")
-            return None
-        
-        # Vectorized nearest node search (outside the parallel loop)
-        print(f"  [Parallel] Nearest node search for {len(candidates)} candidates...")
-        source_node = ox.nearest_nodes(graph, source_point[0], source_point[1])
-        candidate_xs = [c['x'] for c in candidates]
-        candidate_ys = [c['y'] for c in candidates]
-        # osmnx can handle lists of coordinates for vectorized search
-        target_nodes = ox.nearest_nodes(graph, candidate_xs, candidate_ys)
-    
-        results = []
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            # Create list of tasks with pre-computed source and target nodes
-            tasks = [
-                (c, graph, source_node, target_nodes[i], self.path_weights, self.road_preferences)
-                for i, c in enumerate(candidates)
-            ]
+        return True, "OK"
+
+    def _register_volume_to_predio(self, predio_id, volume: float, ramal_id: str = None):
+        """Register volume assigned to a predio and update ramal mapping."""
+        if predio_id in self.predio_tracking:
+            self.predio_tracking[predio_id]['volumen_acumulado'] += volume
+            if ramal_id and ramal_id not in self.predio_tracking[predio_id]['ramales']:
+                self.predio_tracking[predio_id]['ramales'].append(ramal_id)
             
-            # Submit all tasks
-            futures = [executor.submit(calculate_path_for_candidate, *task) for task in tasks]
-            
-            # Collect results as they complete
-            for future in as_completed(futures):
-                candidate, path_length, linestring, error = future.result()
-                results.append((candidate, path_length, linestring, error))
-    
-    
-        valid_results = []
-        filtered_gravity = 0
-        for candidate, path_length, linestring, error in results:
-            if path_length is not None:
-                # Target elevation is already stored in 'invert_elevation' in the candidates DataFrame
-                target_elev = candidate['invert_elevation']
-                
-                # Calculate required slope drop (0.4% min)
-                slope_drop = path_length * config.MIN_PIPE_SLOPE
-                min_source_required = target_elev + slope_drop
-                
-                if source_elevation >= min_source_required:
-                    valid_results.append((candidate, path_length, error))
-                else:
-                    filtered_gravity += 1
-            else:
-                # No path found - include for logging
-                valid_results.append((candidate, path_length, error))
+            occupancy = self._get_predio_occupancy_ratio(predio_id)
+            print(f"  [Tracking] Predio {predio_id}: +{volume:.0f} m³ → "
+                  f"Total: {self.predio_tracking[predio_id]['volumen_acumulado']:.0f} m³ "
+                  f"({occupancy*100:.1f}% occupancy)")
         
-        if filtered_gravity > 0:
-            print(f"  [Target] Filtered {filtered_gravity} candidates by gravity (0.4% slope rule)")
-        
-        # Find best result (shortest path) from valid candidates
-        best_path_length = float('inf')
-        best_target = None
-    
-        for candidate, path_length, error in valid_results:
-            if path_length is not None:
-                is_better = path_length < best_path_length
-                prefix = "  -> BEST!" if is_better else ""
-                # print(f"    [OSM] {candidate['id']}: {path_length:.1f}m{prefix}")
-                
-                if is_better:
-                    best_path_length = path_length
-                    best_target = (
-                        candidate['x'],
-                        candidate['y'],
-                        candidate['type'],
-                        candidate # The candidate dictionary itself as metadata
-                    )
-            else:
-                print(f"    [OSM] {candidate['id']}: {error or 'No path found'}")
-        
-        if best_target:
-            if best_target[2] == 'node':
-                print(f"  [Target] *** SELECTED: pipeline node '{best_target[3]['id']}' (OSM: {best_path_length:.1f}m) ***")
-            else:
-                print(f"  [Target] *** SELECTED: predio (OSM: {best_path_length:.1f}m) ***")
-        
-        return best_target
-    
-    def _generate_paths(self,
-                       active_pairs: List[CandidatePair],
-                       ) -> List[gpd.GeoDataFrame]:
-        """
-        Generate PathFinder paths for each active pair REUSING the shared graph.
-        
-        NEW: Creates TREE STRUCTURE by allowing paths to connect to existing 
-        pipeline nodes instead of going directly to predio, avoiding parallel lines.
-        """
-        path_gdfs = []
-
-        for i, pair in enumerate(active_pairs):
-            source_node_x, source_node_y, source_z = pair['node_x'], pair['node_y'], pair['invert_elevation']
-
-            res = self._find_best_target_by_path_length(
-                source_point=(source_node_x, source_node_y),
-                source_elevation=source_z,
-            )
-            
-            if res:
-                target_x, target_y, target_type, target_node_metadata = res
-                if target_type == 'node':
-                    print(f"  [Tree] Path {i+1}: Connecting to existing pipeline node instead of predio")
-                else:
-                    print(f"  [Direct] Path {i+1}: Connecting directly to predio")
-
-            target_node_metadata['total_volume'] = pair['total_volume']
-            target_node_metadata['ramal'] = self._solution_counter - 1
-            pair['predio_id'] = target_node_metadata['id']
-            pair['predio_x_centroid'] = target_node_metadata['x']
-            pair['predio_y_centroid'] = target_node_metadata['y']
-            pair['predio_ground_z'] = target_node_metadata['invert_elevation']
-            
-            if target_type == 'tank':
-                pair['predio_area'] = round(self.predios_gdf.loc[target_node_metadata['id']].geometry.area, 1)
-            else:
-                pair['predio_area'] = 0
-                
-            # Set endpoints
-            self.shared_path_finder.set_start_end_points(
-                (source_node_x, source_node_y),
-                (target_x, target_y)
-            )
-
-            # Find path on existing graph
-            best_path = self.shared_path_finder.find_shortest_path_with_elevation(
-                **self.path_weights,
-                road_preferences=self.road_preferences
-            )
-
-            if best_path:
-                path_gdf = self.shared_path_finder.get_simplified_path(tolerance=config.TOLERANCE)
-
-                if path_gdf is not None:
-                    # Ensure we operate on the geometry column safely
-                    if not path_gdf.empty:
-                        geom = path_gdf.geometry.iloc[0]
-
-                        # Handle MultiLineString - merge into single LineString
-                        if geom.geom_type == 'MultiLineString':
-
-                            geom = linemerge(geom)
-                            # If still multi after merge, take longest
-                            if geom.geom_type == 'MultiLineString':
-                                geom = max(geom.geoms, key=lambda g: g.length)
-                            path_gdf.geometry.iloc[0] = geom
-
-                        if geom.geom_type == 'LineString':
-                            coords = list(geom.coords)
-                            # Force first point to match exact derivation node
-                            coords[0] = (source_node_x, source_node_y)
-                            # # Force last point to match exact target coordinates
-                            coords[-1] = (target_x, target_y)
-                            path_gdf.geometry.iloc[0] = LineString(coords)
-
-                    path_gdf['total_flow'] = pair['total_flow']
-                    path_gdf['node_id'] = pair['node_id']
-                    path_gdf['node_invert_elevation'] = pair['invert_elevation']
-                    path_gdf['node_max_depth'] = pair['node_depth']
-                    path_gdf['node_ramal'] = self._solution_counter - 1
-                    
-                    for key in target_node_metadata.keys():
-                        path_gdf[f'target_{key}'] = target_node_metadata[key]
-                    
-                    path_gdfs.append(path_gdf)
-
-            else:
-                return [], None, pair  # Failed to find path
-
-        return path_gdfs, target_node_metadata, pair
+        # Update ramal → predio mapping
+        if ramal_id:
+            self.ramal_to_predio[ramal_id] = predio_id
 
     def _create_case_directory(self, solution_name: str) -> Path:
         """Create a simple directory for the specific case."""
@@ -635,6 +472,429 @@ class DynamicSolutionEvaluator:
                 f.write(f"    Coords (Derivación): ({pair['node_x']:.2f}, {pair['node_y']:.2f})\n")
                 f.write(f"    Coords (Terreno): ({pair['predio_x_centroid']:.2f}, {pair['predio_y_centroid']:.2f})\n")
             f.write("-" * 40 + "\n")
+
+
+
+
+
+
+
+
+    def is_predio_available(self, predio_id):
+        """Check if predio has less than MAX_OCCUPANCY_RATIO occupied."""
+        occupancy = self._get_predio_occupancy_ratio(predio_id)
+        return occupancy < config.PREDIO_MAX_OCCUPANCY_RATIO
+    
+    
+    
+    def _get_ramal_from_node(self, node_id: str) -> str:
+        """
+        Finds the Ramal ID that a specific pipeline node belongs to.
+        Looks up the node in last_designed_gdf.
+        """
+        if self.last_designed_gdf is None or self.last_designed_gdf.empty:
+            return None
+            
+        # Assuming 'Pozo' column contains the Node IDs
+        match = self.last_designed_gdf[self.last_designed_gdf['Pozo'].astype(str) == str(node_id)]
+        if match.empty:
+            return None
+            
+        return str(match.iloc[0]['Ramal'])
+
+    def _get_target_info_from_ramal(self, ramal_id: str) -> dict:
+        """
+        Retrieves the target (destination) for a given Ramal ID.
+        Searches in the cumulative_paths to find the defining path for this ramal.
+        """
+        if not hasattr(self, 'cumulative_paths'):
+            return None
+
+        # Iterate defined paths to find which one created this ramal
+        # path_gdf['node_ramal'] stores the ramal ID assigned to that path
+        for source_node, path_gdf in self.cumulative_paths.items():
+            if not path_gdf.empty and str(path_gdf['node_ramal'].iloc[0]) == str(ramal_id):
+                # Columns 'target_id' and 'target_type' are created in _generate_paths
+                return {
+                    'target_id': path_gdf['target_id'].iloc[0],
+                    'target_type': path_gdf['target_type'].iloc[0]
+                }
+        return None
+
+    def _trace_downstream_tank(self, start_node_id: str, visited=None) -> str:
+        """
+        Recursively traces a node downstream through Ramals until a Tank (Predio) is found.
+        
+        Returns:
+            predio_id (str): If a tank is reached.
+            None: If the chain is broken, undefined, or forms a cycle.
+        """
+        if visited is None:
+            visited = set()
+            
+        # Cycle detection
+        if start_node_id in visited:
+            print(f"  [Cycle] Recursive trace detected loop at node {start_node_id}")
+            return None
+        visited.add(start_node_id)
+        
+        # 1. Identify which Ramal this node is on
+        ramal_id = self._get_ramal_from_node(start_node_id)
+        if ramal_id is None:
+            return None
+            
+        # 2. Find where this Ramal goes (Target)
+        target_info = self._get_target_info_from_ramal(ramal_id)
+        if not target_info:
+            return None
+            
+        target_type = target_info['target_type']
+        target_id = target_info['target_id']
+        
+        # 3. Base Case: Found a Tank/Predio
+        if target_type == 'tank':
+            return target_id
+            
+        # 4. Recursive Case: Found another Node -> Continue tracing
+        elif target_type == 'node':
+            return self._trace_downstream_tank(target_id, visited)
+            
+        return None
+    
+    def is_node_ramal_available(self, node_id):
+        """
+        Check if the downstream tank available for this node has capacity.
+        Uses recursive tracing to find the ultimate tank.
+        """
+        # Trace downstream to find the real predio/tank
+        predio_final = self._trace_downstream_tank(node_id)
+        
+        if predio_final is None:
+            # If we can't trace it to a tank (e.g., broken link), assume available
+            # to avoid blocking potentially valid connections (or return False to be strict)
+            return True
+            
+        return self.is_predio_available(predio_final)
+
+
+    def _find_best_target_by_path_length(self,
+                                          source_point: tuple,
+                                          source_elevation: float,
+                                          source_volume: float = 0.0,
+                                          source_node_id: str = None) -> tuple:
+        """
+        Find the best target (predio or pipeline node) for a flooded node.
+        
+        Args:
+            source_point: (x, y) of the source node (flooded node)
+            source_elevation: Elevation of the source node
+            source_volume: Volume to drain from this node (m³) - used for capacity validation
+        Returns:
+            Tuple of (target_x, target_y, target_type, metadata) or None if no valid target
+        """
+        print(f"  [Target] Source point: ({source_point[0]:.1f}, {source_point[1]:.1f})")
+    
+        # Initialize node_df as empty DataFrame with correct columns
+        node_df = pd.DataFrame(columns=['id', 'type', 'invert_elevation', 'x', 'y'])
+        
+        # Extract coordinates from last designed pipeline only if it exists
+        if self.last_designed_gdf is not None:
+            coords_df = self.last_designed_gdf.geometry.get_coordinates()
+            node_df = coords_df.iloc[1::2]  # Select every other row starting from index 1
+            node_df.columns = ['x', 'y']
+            node_df['type'] = 'node'
+            node_df['invert_elevation'] = self.last_designed_gdf['ZFF']  # Invert elevation from pipeline end
+            node_df['id'] = self.last_designed_gdf['Pozo']  # Node ID from Pozo column
+            node_df = node_df[['id', 'type', 'invert_elevation', 'x', 'y']]  # Reorder columns
+        
+        # Extract centroid coordinates from predios GeoDataFrame
+        predios_gdf = self.metrics_extractor.predios_gdf
+        predios_df = predios_gdf.geometry.centroid.get_coordinates()
+        predios_df.columns = ['x', 'y']
+        predios_df['type'] = 'tank'
+        predios_df['invert_elevation'] = predios_gdf['z'] - config.TANK_DEPTH_M  # Tank invert elevation
+        predios_df['id'] = predios_gdf.index.to_list()  # Use index as ID
+        predios_df = predios_df[['id', 'type', 'invert_elevation', 'x', 'y']]  # Reorder columns
+        
+        # Combine node and predio dataframes into possible targets
+        posible_targets_df = pd.concat([node_df, predios_df], ignore_index=True)
+        
+        # Filter candidates where source elevation is sufficient for gravity flow
+        elev_filter = source_elevation >= posible_targets_df['invert_elevation']
+        candidates_df = posible_targets_df[elev_filter].copy()
+        candidates_df.reset_index(drop=True, inplace=True)
+        
+        # =====================================================================
+        # EARLY OCCUPANCY FILTER: Exclude predios/nodes with >80% occupancy
+        # =====================================================================
+        
+        # Apply occupancy filter
+        initial_count = len(candidates_df)
+        
+        # Filter predios (type == 'tank')
+        predio_mask = candidates_df['type'] == 'tank'
+        predio_available = candidates_df.loc[predio_mask, 'id'].apply(self.is_predio_available)
+        
+        # Filter nodes (type == 'node')
+        node_mask = candidates_df['type'] == 'node'
+        node_available = candidates_df.loc[node_mask, 'id'].apply(self.is_node_ramal_available)
+        
+        # Combine masks
+        available_mask = pd.Series(True, index=candidates_df.index)
+        available_mask.loc[predio_mask] = predio_available.values
+        available_mask.loc[node_mask] = node_available.values
+        
+        candidates_df = candidates_df[available_mask]
+        candidates_df.reset_index(drop=True, inplace=True)
+        
+        filtered_count = initial_count - len(candidates_df)
+        if filtered_count > 0:
+            print(f"  [Occupancy] Filtered {filtered_count} targets with >{config.PREDIO_MAX_OCCUPANCY_RATIO*100:.0f}% occupancy")
+        
+        # Convert filtered dataframe to list of dictionaries
+        candidates = candidates_df.to_dict('records')
+    
+        
+        
+        # Use 50% of available cores (minimum 2)
+        num_cores = max(2, os.cpu_count() // 2)
+        print(f"  [Parallel] Using {num_cores} threads for path calculation (ThreadPoolExecutor)")
+        
+        # Get graph reference once
+        graph = self.shared_path_finder.graph
+        
+        if len(candidates) == 0:
+            print("  [Target] No candidates available after elevation filtering.")
+            return None
+        
+        # Vectorized nearest node search (outside the parallel loop)
+        print(f"  [Parallel] Nearest node search for {len(candidates)} candidates...")
+        source_node = ox.nearest_nodes(graph, source_point[0], source_point[1])
+        candidate_xs = [c['x'] for c in candidates]
+        candidate_ys = [c['y'] for c in candidates]
+        # osmnx can handle lists of coordinates for vectorized search
+        target_nodes = ox.nearest_nodes(graph, candidate_xs, candidate_ys)
+    
+        results = []
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
+            # Create list of tasks with pre-computed source and target nodes
+            tasks = [
+                (c, graph, source_node, target_nodes[i], self.path_weights, self.road_preferences)
+                for i, c in enumerate(candidates)
+            ]
+            
+            # Submit all tasks
+            futures = [executor.submit(calculate_path_for_candidate, *task) for task in tasks]
+            
+            # Collect results as they complete
+            for future in as_completed(futures):
+                candidate, path_length, linestring, error = future.result()
+                results.append((candidate, path_length, linestring, error))
+    
+    
+        valid_results = []
+        filtered_gravity = 0
+        for candidate, path_length, linestring, error in results:
+            if path_length is not None:
+                # Target elevation is already stored in 'invert_elevation' in the candidates DataFrame
+                target_elev = candidate['invert_elevation']
+                
+                # Calculate required slope drop (0.4% min)
+                slope_drop = path_length * config.MIN_PIPE_SLOPE
+                min_source_required = target_elev + slope_drop
+                
+                if source_elevation >= min_source_required:
+                    valid_results.append((candidate, path_length, error))
+                else:
+                    filtered_gravity += 1
+            else:
+                # No path found - include for logging
+                valid_results.append((candidate, path_length, error))
+        
+        if filtered_gravity > 0:
+            print(f"  [Target] Filtered {filtered_gravity} candidates by gravity (0.4% slope rule)")
+        
+        # =====================================================================
+        # EXACT CAPACITY VALIDATION: Sort by path_length, check capacity
+        # =====================================================================
+        # Sort valid results by path_length (shortest first)
+        sorted_results = sorted(
+            [(c, pl, e) for c, pl, e in valid_results if pl is not None],
+            key=lambda x: x[1]
+        )
+        
+        if len(sorted_results) == 0:
+            raise ValueError(
+                f"No valid path found for source point {source_point}. "
+                f"All candidates filtered by elevation or gravity constraints."
+            )
+        
+        # Iterate through candidates by path_length, select first with capacity
+        for candidate, path_length, error in sorted_results:
+            target_type = candidate['type']
+            
+            # Check if this pair is forbidden (previous overflow)
+            if source_node_id:
+                target_check_id = str(candidate['id'])
+                if (str(source_node_id), target_check_id) in self.forbidden_pairs:
+                    print(f"  [Forbidden] Skipping target {target_check_id} for node {source_node_id} (previously failed capacity)")
+                    continue
+
+                # If target is a node, check if the ramal's final predio is forbidden
+                if target_type == 'node':
+                    ramal_id = self._get_ramal_from_node(candidate['id'])
+                    # We can't easily check the predio here without looking it up,
+                    # but the Forbidden logic stores (node_id, predio_id) or (node_id, node_id).
+                    # If we blocked (node_source, predio_final), we should check that too.
+                    # For now, relying on direct target checks.
+            
+            if target_type == 'tank':
+                predio_id = candidate['id']
+                has_capacity, msg = self._check_predio_has_capacity(predio_id, source_volume)
+                
+                if has_capacity:
+                    print(f"  [Target] *** SELECTED: predio {predio_id} (OSM: {path_length:.1f}m) ***")
+                    return (candidate['x'], candidate['y'], target_type, candidate)
+                else:
+                    print(f"  [Capacity] Predio {predio_id} skipped: {msg}")
+                    
+            elif target_type == 'node':
+                ramal_id = self._get_ramal_from_node(candidate['id'])
+                predio_final = self.ramal_to_predio[ramal_id]  # Always exists for nodes in last_designed_gdf
+                
+                has_capacity, msg = self._check_predio_has_capacity(predio_final, source_volume)
+                
+                if has_capacity:
+                    print(f"  [Target] *** SELECTED: pipeline node '{candidate['id']}' → Predio {predio_final} (OSM: {path_length:.1f}m) ***")
+                    return (candidate['x'], candidate['y'], target_type, candidate)
+                else:
+                    print(f"  [Capacity] Node {candidate['id']} → Predio {predio_final} skipped: {msg}")
+        
+        # If we get here, NO candidate had sufficient capacity - this IS a real error
+        raise ValueError(
+            f"NO PREDIO WITH SUFFICIENT CAPACITY: Checked {len(sorted_results)} candidates "
+            f"for source volume {source_volume:.0f} m³, none had enough space. "
+            f"Consider adding more predios or reducing tank volumes."
+        )
+    
+    def _generate_paths(self,
+                       active_pairs: List[CandidatePair],
+                       ) -> List[gpd.GeoDataFrame]:
+        """
+        Generate PathFinder paths for each active pair REUSING the shared graph.
+        
+        NEW: Creates TREE STRUCTURE by allowing paths to connect to existing
+        pipeline nodes instead of going directly to predio, avoiding parallel lines.
+        """
+        path_gdfs = []
+
+        for i, pair in enumerate(active_pairs):
+            source_node_x, source_node_y, source_z = pair['node_x'], pair['node_y'], pair['invert_elevation']
+            source_volume = pair.get('total_volume', 0.0)
+
+            res = self._find_best_target_by_path_length(
+                source_point=(source_node_x, source_node_y),
+                source_elevation=source_z,
+                source_volume=source_volume,
+                source_node_id=str(pair.get('node_id', '')),
+            )
+            
+            # _find_best_target_by_path_length now raises ValueError on failure
+            # This should never return None, but defensive check per strict rules
+            if res is None:
+                raise RuntimeError(
+                    f"Unexpected None from _find_best_target_by_path_length for pair {i+1}. "
+                    f"This indicates a bug - function should raise, not return None."
+                )
+                
+            target_x, target_y, target_type, target_node_metadata = res
+            if target_type == 'node':
+                print(f"  [Tree] Path {i+1}: Connecting to existing pipeline node instead of predio")
+            else:
+                print(f"  [Direct] Path {i+1}: Connecting directly to predio")
+
+            target_node_metadata['total_volume'] = pair['total_volume']
+            target_node_metadata['ramal'] = str(self._solution_counter - 1)
+            target_node_metadata['target_type'] = target_type  # Store for downstream use
+            pair['predio_id'] = target_node_metadata['id']
+            pair['predio_x_centroid'] = target_node_metadata['x']
+            pair['predio_y_centroid'] = target_node_metadata['y']
+            pair['predio_ground_z'] = target_node_metadata['invert_elevation']
+            pair['is_tank'] = target_node_metadata['type'] == 'tank'
+            pair['ramal'] = target_node_metadata['ramal']
+            
+
+            
+            
+            # Register volume to the predio (directly or via ramal)
+            ramal_id =pair['ramal']
+            if target_type == 'tank':
+                pair['predio_area'] = round(self.metrics_extractor.predios_gdf.loc[target_node_metadata['id']].geometry.area, 1)
+                # Register volume directly to this predio
+                self._register_volume_to_predio(target_node_metadata['id'], source_volume, ramal_id)
+            else:
+                pair['predio_area'] = 0
+                # Node connections always go to existing ramales that have predio mapped
+                node_ramal_id = self._get_ramal_from_node(target_node_metadata['id'])
+                predio_final = self.ramal_to_predio[node_ramal_id]
+                self._register_volume_to_predio(predio_final, source_volume, ramal_id)
+                
+
+
+            # Set endpoints
+            self.shared_path_finder.set_start_end_points(
+                (source_node_x, source_node_y),
+                (target_x, target_y)
+            )
+
+            # Find path on existing graph
+            best_path = self.shared_path_finder.find_shortest_path_with_elevation(
+                **self.path_weights,
+                road_preferences=self.road_preferences
+            )
+
+            if best_path:
+                path_gdf = self.shared_path_finder.get_simplified_path(tolerance=config.TOLERANCE)
+
+                if path_gdf is not None:
+                    # Ensure we operate on the geometry column safely
+                    if not path_gdf.empty:
+                        geom = path_gdf.geometry.iloc[0]
+
+                        # Handle MultiLineString - merge into single LineString
+                        if geom.geom_type == 'MultiLineString':
+
+                            geom = linemerge(geom)
+                            # If still multi after merge, take longest
+                            if geom.geom_type == 'MultiLineString':
+                                geom = max(geom.geoms, key=lambda g: g.length)
+                            path_gdf.geometry.iloc[0] = geom
+
+                        if geom.geom_type == 'LineString':
+                            coords = list(geom.coords)
+                            # Force first point to match exact derivation node
+                            coords[0] = (source_node_x, source_node_y)
+                            # # Force last point to match exact target coordinates
+                            coords[-1] = (target_x, target_y)
+                            path_gdf.geometry.iloc[0] = LineString(coords)
+
+                    path_gdf['total_flow'] = pair['total_flow']
+                    path_gdf['node_id'] = pair['node_id']
+                    path_gdf['node_invert_elevation'] = pair['invert_elevation']
+                    path_gdf['node_max_depth'] = pair['node_depth']
+                    path_gdf['node_ramal'] = self._solution_counter - 1
+                    
+                    for key in target_node_metadata.keys():
+                        path_gdf[f'target_{key}'] = target_node_metadata[key]
+                    
+                    path_gdfs.append(path_gdf)
+
+            else:
+                return [], None, pair  # Failed to find path
+
+        return path_gdfs, target_node_metadata, pair
+
+
 
     def evaluate_solution(self,
                           active_pairs: List[CandidatePair],
@@ -714,18 +974,8 @@ class DynamicSolutionEvaluator:
                 self.cumulative_paths[gdf['node_id'].iloc[0]] = gdf
 
         active_pairs[-1] = pair  # Update last pair with target metadata
-        
-        # cap = self.predio_capacity.get(cand['predio_id'], 0)
-        # available_area = cap['total_area'] - cap['used_area']
-        # required_area = (cand['total_volume'] / config.TANK_DEPTH_M) * config.TANK_OCCUPATION_FACTOR
-        #
-        # if required_area * 0.9 >= available_area:
-        #     # print(f"  [Skip] Node {cand['node_id']} lacks space in Predio {cand['predio_id']}")
-        #     continue
-        #
-        
-        
-        # Save summary immediately 
+
+        # Save summary immediately
         self._save_case_summary(case_dir, active_pairs, solution_name)
 
         # 6. Save Input GPKG for rut_03 (Sewer Design)
@@ -789,7 +1039,7 @@ class DynamicSolutionEvaluator:
         
         # === UPDATE active_pairs with pipeline design data ===
         for i, pair in enumerate(active_pairs):
-            ramal_str = str(i)
+            ramal_str = pair['ramal']
             ramal_data = self.last_designed_gdf[self.last_designed_gdf['Ramal'] == ramal_str]
             if not ramal_data.empty:
                 # Get diameter (D_ext column, first value - they should be consistent per ramal)
@@ -799,11 +1049,7 @@ class DynamicSolutionEvaluator:
                 if 'L' in ramal_data.columns:
                     pair['pipeline_length'] = float(ramal_data['L'].sum())
                 
-                if i == target_node_metadata['ramal']:
-                    pair['predio_id'] = target_node_metadata['id']
-                    pair['predio_x_centroid'] = target_node_metadata['x']
-                    pair['predio_y_centroid'] = target_node_metadata['y']
-                    pair['is_tank'] = target_node_metadata['type'] == 'tank'
+
                     
 
         # 7. Update SWMM Model & Simulate (rut_14)
