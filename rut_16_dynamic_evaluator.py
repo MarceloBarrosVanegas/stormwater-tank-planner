@@ -64,6 +64,7 @@ def combined_weight(graph, path_weights, road_preferences, u, v, d):
     road_cost = road_preferences.get(road_type, road_preferences['default']) * path_weights['road_weight']
     return length_cost + elevation_cost + road_cost
 
+
 def calculate_path_for_candidate(candidate, graph, source_node, target_node, path_weights, road_preferences):
     """Calculate path length for a candidate - runs in parallel threads."""
     weight_func = functools.partial(combined_weight, graph, path_weights, road_preferences)
@@ -85,8 +86,6 @@ def calculate_path_for_candidate(candidate, graph, source_node, target_node, pat
             return candidate, None, None, "Path too short"
     except Exception as e:
         return candidate, None, None, str(e)
-
-
 
 
 class DynamicSolutionEvaluator:
@@ -149,6 +148,8 @@ class DynamicSolutionEvaluator:
 
         self._base_precios_path = str(config.BASE_PRECIOS)
         self._build_topology_from_conduits(clear_existing=True)
+
+        self.last_designed_gdf = None
 
 
 
@@ -484,9 +485,7 @@ class DynamicSolutionEvaluator:
         """Check if predio has less than MAX_OCCUPANCY_RATIO occupied."""
         occupancy = self._get_predio_occupancy_ratio(predio_id)
         return occupancy < config.PREDIO_MAX_OCCUPANCY_RATIO
-    
-    
-    
+
     def _get_ramal_from_node(self, node_id: str) -> str:
         """
         Finds the Ramal ID that a specific pipeline node belongs to.
@@ -776,7 +775,159 @@ class DynamicSolutionEvaluator:
             f"for source volume {source_volume:.0f} m³, none had enough space. "
             f"Consider adding more predios or reducing tank volumes."
         )
+
+
+
+    def resize_tanks_based_on_exceedance(self,
+                                         current_inp_file: str,
+                                         active_pairs: list = None,
+                                         ) -> dict:
+        """
+        Resizes tanks based on exceedance volume, updates the SWMM file, and re-extracts metrics.
+        Iterates until no tank has flooding (exceedance_volume = 0).
+
+        Returns:
+            dict or None: If capacity exceeded, returns {'node_id': X, 'predio_id': Y, 'target_id': Z}
+                          Otherwise returns None.
+        """
+        slll = SeccionLlena()
+        modifier = SWMMModifier(current_inp_file)
+
+        #correr modelo modificado por primrea vez
+        self.metrics_extractor.run(current_inp_file)
+        self.current_metrics = self.metrics_extractor.metrics
+   
+
+
+        iteration = 0
+        while iteration < config.MAX_RESIZE_ITERATIONS:
+            iteration += 1
+            run = False
+            
+            # actualziar caudales para cada tramos segun el modelo de swmm simulado.
+            old_flow = {}
+            for node_id, gdf_path  in self.cumulative_paths.items():
+                ramal = gdf_path['node_ramal'].item()
+                target_link = f'{node_id}-{ramal}.1'
+                new_flow = float(self.current_metrics.link_data[target_link]['max_flow'])
+                old_flow[ramal] = float(gdf_path['total_flow'])
+                gdf_path['total_flow'] = new_flow
+                
+            # 1. con el caudal tomado del modelo, crear otra vez las lineas para diseño de tuberias
+            new_path_gdfs = list(self.cumulative_paths.values())
+            input_gpkg = self._save_input_gpkg_for_rut03(new_path_gdfs, self.case_dir)
     
+            # 9. Run sewer pipeline design
+            out_gpkg = self._run_sewer_pipeline(
+                input_gpkg=input_gpkg,
+                new_path_gdfs=new_path_gdfs,
+                solution_name=self.solution_name,
+                case_dir=self.case_dir,
+            )
+            
+            # 10. Load designed pipeline for tree-based routing in next iteration
+            self.last_designed_gdf = gpd.read_file(out_gpkg).copy()
+            
+            # 2. revisar si hay cambios significativos en los caudales maximos de los tramos
+            for node_id, gdf_path  in self.cumulative_paths.items():
+                ramal = gdf_path['node_ramal'].item()
+                target_link = f'{node_id}-{ramal}.1'
+                
+                new_flow = float(self.current_metrics.link_data[target_link]['max_flow'])
+                if abs(new_flow - old_flow[ramal]) / old_flow[ramal] > 0.05:
+                    print(f"  [Resize Iter {iteration}] Significant flow change detected on link {target_link}: "
+                          f"old {old_flow[ramal]:.2f} m³/s -> new {new_flow:.2f} m³/s")
+
+                    links = self.last_designed_gdf['Tramo'].to_list()
+                    links[0] = target_link  # First link corresponds to the source node's link
+                    shapes = self.last_designed_gdf['Seccion'].map(modifier.seccion_type_map).to_list()
+                    geoms = slll.section_str2float(self.last_designed_gdf['D_ext'], return_all=True)
+                    geoms[np.isnan(geoms)] = 0.0
+                    modifier.modify_xsections(links, shapes, geoms)
+                    run = True
+            
+
+            tanks = self.current_metrics.tank_data
+            for tk_id, tk_data in tanks.items():
+                # determinar el volumen excedente por flooding
+                exceedance_volume = tk_data['exceedance_volume']
+
+                if exceedance_volume > 0:
+                    new_vol = tk_data['max_stored_volume'] + exceedance_volume
+                    new_area = (new_vol / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR
+
+                    # Validate predio capacity before resize
+                    predio_id = int(tk_id.replace("tank_", ""))  # Extract predio_id from tank_X
+                    if predio_id in self.predio_tracking:
+                        tracking = self.predio_tracking[predio_id]
+                        if new_area > tracking['area_total']:
+                            # Capacity exceeded - find the node_id for this predio
+                            node_id = None
+                            target_id = predio_id
+                            if active_pairs:
+                                for pair in active_pairs:
+                                    if pair.get('predio_id') == predio_id:
+                                        node_id = pair.get('node_id')
+                                        # Check if connected to node instead of direct predio
+                                        if pair.get('target_type') == 'node':
+                                            target_id = pair.get('predio_id')  # The node it connected to
+                                        break
+
+                            print(f"  [Overflow] {tk_id} needs {new_area:.0f} m², "
+                                  f"predio {predio_id} only has {tracking['area_total']:.0f} m²")
+
+                            return {
+                                'node_id': node_id,
+                                'predio_id': predio_id,
+                                'target_id': target_id,
+                                'tank_id': tk_id
+                            }
+                        # Update tracked volume
+                        self.predio_tracking[predio_id]['volumen_acumulado'] = new_vol
+                    
+                    modifier.modify_storage_area(tk_id, new_area)
+                    modifier.save(current_inp_file)
+                    print(f"  [Resize Iter {iteration}] {tk_id}: Increased volume by {exceedance_volume:.1f} m³ to {new_vol:.1f} m³")
+                    run = True
+
+                depth_target = config.TANK_DEPTH_M - (config.TANK_VOLUME_SAFETY_FACTOR - 1) * config.TANK_DEPTH_M
+                variacion_permitida = depth_target * 0.05
+                max_depth = tk_data['max_depth']
+
+                if max_depth < depth_target - variacion_permitida:
+                    # Reduce tank size
+                    new_area = (tk_data['max_stored_volume'] / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR
+                    modifier = SWMMModifier(current_inp_file)
+                    modifier.modify_storage_area(tk_id, new_area)
+                    modifier.save(current_inp_file)
+                    print(f"  [Resize Iter {iteration}] {tk_id}: Reduced tank size to control max depth {max_depth:.2f} m")
+                    run = True
+
+            if not run:
+                return None  # No changes made, exit loop
+
+            # Re-run SWMM simulation with updated tank sizes
+            inp_dir = Path(current_inp_file).parent
+            for out_file in inp_dir.glob('*.out'):
+                try:
+                    os.remove(out_file)
+                except OSError:
+                    pass
+
+            self.metrics_extractor.run(current_inp_file)
+            self.current_metrics = self.metrics_extractor.metrics
+
+            # Check if all exceedance volumes are now zero
+            total_exceedance = sum(tk['exceedance_volume'] for tk in self.current_metrics.tank_data.values())
+            if total_exceedance <= 0:
+                print(f"  [Resize] All tanks converged after {iteration} iteration(s) - no flooding")
+                break
+
+        if iteration >= config.MAX_RESIZE_ITERATIONS:
+            print(f"  [Warning] Max resize iterations ({config.MAX_RESIZE_ITERATIONS}) reached - some tanks may still have exceedance")
+
+        return None
+
     def _generate_paths(self,
                        active_pairs: List[CandidatePair],
                        ) -> List[gpd.GeoDataFrame]:
@@ -894,118 +1045,53 @@ class DynamicSolutionEvaluator:
 
         return path_gdfs, target_node_metadata, pair
 
-
-
-    def evaluate_solution(self,
-                          active_pairs: List[CandidatePair],
-                          solution_name: str = None,
-                          current_metrics: SystemMetrics = None,
-                          ) -> Tuple[float, float]:
-
+    def _run_sewer_pipeline(
+            self,
+            input_gpkg: str,
+            new_path_gdfs: list,
+            solution_name: str,
+            case_dir: Path,
+    ) -> Path:
         """
-        Evaluate a complete solution using SewerPipeline + SWMM.
+        Execute SewerPipeline design and locate the output GPKG file.
+
+        Args:
+            input_gpkg: Path to input GPKG with routes
+            new_path_gdfs: List of GeoDataFrames with path data
+            solution_name: Name of the solution/project
+            case_dir: Directory for case outputs
+
+        Returns:
+            Path: Path to the output GPKG file
+
+        Raises:
+            FileNotFoundError: If input GPKG doesn't exist
+            RuntimeError: If pipeline fails or output not found
         """
-        # 1. Store current metrics
-        self.current_metrics = current_metrics
-        self.nodes_gdf = current_metrics.nodes_gdf
-        self.predios_gdf = current_metrics.predios_gdf
-        
+        print("  Running pipeline design...")
 
-        # 2. Setup Case Directory
-        case_dir = self.current_case_dir = self._create_case_directory(solution_name)
-
-        # Initialize cached_active_pairs if not exists
-        if not hasattr(self, 'cached_active_pairs'):
-            self.cached_active_pairs = {}  # NodeID -> CandidatePair
-
-        # # If this is NOT the first iteration, re-calculate flooding metrics
-        # # using the INP from the previous iteration to get updated priorities.
-        # if self._solution_counter > 0:
-        #     print(f"  [Re-Rank] Iteration {self._solution_counter + 1}: Recalculating flooding with {Path(self.last_solution_inp_path).name}...")
-        #     metrics_runner = FloodingMetrics(
-        #         inp_file_path=str(self.last_solution_inp_path),
-        #         risk_file_path=config.FAILIURE_RISK_FILE
-        #     )
-        #     # CRITICAL FIX: Do NOT replace self.nodes_gdf entirely, as its indices
-        #     # must remain stable for the optimizer's 'assignments' mapping.
-        #     updated_metrics_gdf = metrics_runner.run()
-        #
-        #     # Reset current metrics but PRESERVE order/length
-        #     self.nodes_gdf['total_volume'] = 0.0
-        #     self.nodes_gdf['total_flow'] = 0.0
-        #     if 'NodeDepth' in self.nodes_gdf.columns: self.nodes_gdf['NodeDepth'] = 0.0
-        #
-        #     # Map updated metrics back to baseline nodes
-        #     if not updated_metrics_gdf.empty:
-        #         new_map = updated_metrics_gdf.set_index('NodeID')
-        #         for node_id in new_map.index:
-        #             if node_id in self.nodes_gdf['NodeID'].values:
-        #                 stable_idx = self.nodes_gdf.index[self.nodes_gdf['NodeID'] == node_id][0]
-        #                 self.nodes_gdf.at[stable_idx, 'total_volume'] = new_map.at[node_id, 'total_volume']
-        #                 self.nodes_gdf.at[stable_idx, 'total_flow'] = new_map.at[node_id, 'total_flow']
-        #                 if 'NodeDepth' in new_map.columns:
-        #                     self.nodes_gdf.at[stable_idx, 'NodeDepth'] = new_map.at[node_id, 'NodeDepth']
-        #
-        #     # Re-initialize the selector with updated flooding data (for pruning/ranking)
-        #     self.candidate_selector = WeightedCandidateSelector(self.nodes_gdf, self.predios_gdf)
-        #     print(f"  [Re-Rank] Candidate selector updated with stable indices.")
-        
-        # 2. Increment counter and setup persistence
-        self._solution_counter += 1
-        if not hasattr(self, 'cumulative_paths'):
-            self.cumulative_paths = {}  # NodeID -> path_gdf
-
-        # 3. Sticky Paths: Only generate NEW paths, reuse existing ones
-        new_active_pairs = []
-        for pair in active_pairs:
-            if pair['node_id'] not in self.cumulative_paths:
-                new_active_pairs.append(pair)
-        
-        print(f"  [Sticky] Reusing {len(active_pairs) - len(new_active_pairs)} paths, generating {len(new_active_pairs)} new.")
-
-        # 4. Generate Paths for NEW pairs only
-        # They will try to connect to self.last_designed_gdf (previous iterations)
-        new_path_gdfs, target_node_metadata, pair = self._generate_paths(new_active_pairs)
-        if not target_node_metadata:
-            return None, None
-        
-        for gdf in new_path_gdfs:
-            if not gdf.empty:
-                self.cumulative_paths[gdf['node_id'].iloc[0]] = gdf
-
-        active_pairs[-1] = pair  # Update last pair with target metadata
-
-        # Save summary immediately
-        self._save_case_summary(case_dir, active_pairs, solution_name)
-
-        # 6. Save Input GPKG for rut_03 (Sewer Design)
-        new_path_gdfs = list(self.cumulative_paths.values())
-        input_gpkg = self._save_input_gpkg_for_rut03(new_path_gdfs, case_dir)
-
-        # 5. Run SewerPipeline (rut_03)
-        print(f"  Running pipeline design...")
         try:
-            # Explicitly verify input exists
+            # Verify input exists
             if not Path(input_gpkg).exists():
-                 raise FileNotFoundError(f"Input GPKG not found: {input_gpkg}")
+                raise FileNotFoundError(f"Input GPKG not found: {input_gpkg}")
 
-
-            # Build flows_dict from path_gdfs (which reflects only valid paths)
+            # Build flows dictionary
             flows_dict = {}
             for i, gdf in enumerate(new_path_gdfs):
                 ramal_name = str(i)
-                flows_dict[ramal_name + '.0'] = gdf['total_flow'].iloc[0]
+                flows_dict[ramal_name + ".0"] = gdf["total_flow"].iloc[0]
 
-
+            # Initialize pipeline
             pipeline = SewerPipeline(
                 elev_file_path=self.elev_files_list[0],
                 vector_file_path=str(input_gpkg),
                 project_name=solution_name,
                 flows_dict=flows_dict,
                 proj_to=str(self.proj_to),
-                path_out=str(case_dir)
+                path_out=str(case_dir),
             )
 
+            # Execute pipeline
             try:
                 pipeline.run()
             except SystemExit:
@@ -1020,39 +1106,105 @@ class DynamicSolutionEvaluator:
             traceback.print_exc()
             raise RuntimeError(f"Failed to initialize SewerPipeline: {e}") from e
 
-        # 6. Read Designed Output
-       
+        # Locate output GPKG
         out_gpkg = case_dir / f"{solution_name}.gpkg"
 
         if not out_gpkg.exists():
-            # Try finding ANY gpkg that isn't the input or 'input_routes'
-            possible = [f for f in case_dir.glob("*.gpkg") if "input" not in f.name.lower()]
+            # Search for alternative GPKG files
+            possible = [
+                f for f in case_dir.glob("*.gpkg")
+                if "input" not in f.name.lower()
+            ]
             if possible:
                 out_gpkg = possible[0]
                 print(f"  [Info] Found output GPKG with different name: {out_gpkg.name}")
             else:
-                raise RuntimeError(f"No output GPKG found in {case_dir}. SewerPipeline failed silently.")
+                raise RuntimeError(
+                    f"No output GPKG found in {case_dir}. "
+                    f"SewerPipeline failed silently."
+                )
+
+        return out_gpkg
 
 
-        # Store for next iteration's tree-based path generation
+    def evaluate_solution(
+            self,
+            active_pairs: List[CandidatePair],
+            solution_name: str = None,
+            current_metrics: SystemMetrics = None,
+            iteration: int = 0,
+    ) -> Tuple[float, float]:
+        """
+        Evaluate a complete solution using SewerPipeline + SWMM.
+        """
+        # 1. Store current metrics
+        self.current_metrics = current_metrics
+        self.nodes_gdf = current_metrics.nodes_gdf
+        self.predios_gdf = current_metrics.predios_gdf
+        self._solution_counter  = iteration
+        self.solution_name =  solution_name
+
+        # 2. Setup case directory
+        case_dir = self.case_dir = self._create_case_directory(solution_name)
+
+        # 3. Initialize tracking structures
+        if not hasattr(self, 'cached_active_pairs'):
+            self.cached_active_pairs = {}  # NodeID -> CandidatePair
+
+
+
+        if not hasattr(self, 'cumulative_paths'):
+            self.cumulative_paths = {}  # NodeID -> path_gdf
+
+        # 4. Identify new paths to generate (sticky paths: reuse existing ones)
+        new_active_pairs = []
+        for pair in active_pairs:
+            if pair['node_id'] not in self.cumulative_paths:
+                new_active_pairs.append(pair)
+
+        print(f"  [Sticky] Reusing {len(active_pairs) - len(new_active_pairs)} paths, generating {len(new_active_pairs)} new.")
+
+        # 5. Generate paths for new pairs only
+        new_path_gdfs, target_node_metadata, pair = self._generate_paths(new_active_pairs)
+        if not target_node_metadata:
+            return None, None
+
+        # 6. Store new paths in cumulative collection
+        for gdf in new_path_gdfs:
+            if not gdf.empty:
+                self.cumulative_paths[gdf['node_id'].iloc[0]] = gdf
+
+        active_pairs[-1] = pair  # Update last pair with target metadata
+
+        # 7. Save case summary
+        self._save_case_summary(case_dir, active_pairs, solution_name)
+
+        # 8. Prepare input GPKG for sewer design (rut_03)
+        new_path_gdfs = list(self.cumulative_paths.values())
+        input_gpkg = self._save_input_gpkg_for_rut03(new_path_gdfs, case_dir)
+
+        # 9. Run sewer pipeline design
+        out_gpkg = self._run_sewer_pipeline(
+            input_gpkg=input_gpkg,
+            new_path_gdfs=new_path_gdfs,
+            solution_name=solution_name,
+            case_dir=case_dir,
+        )
+
+        # 10. Load designed pipeline for tree-based routing in next iteration
         self.last_designed_gdf = gpd.read_file(out_gpkg).copy()
-        
-        # === UPDATE active_pairs with pipeline design data ===
+
+        # 11. Update active_pairs with pipeline design data
         for i, pair in enumerate(active_pairs):
             ramal_str = pair['ramal']
             ramal_data = self.last_designed_gdf[self.last_designed_gdf['Ramal'] == ramal_str]
             if not ramal_data.empty:
-                # Get diameter (D_ext column, first value - they should be consistent per ramal)
                 if 'D_ext' in ramal_data.columns:
                     pair['diameter'] = str(ramal_data['D_ext'].iloc[0])
-                # Get total pipeline length (sum of L column)
                 if 'L' in ramal_data.columns:
                     pair['pipeline_length'] = float(ramal_data['L'].sum())
-                
 
-                    
-
-        # 7. Update SWMM Model & Simulate (rut_14)
+        # 12. Run SWMM simulation
         print("  Running SWMM simulation...")
         cost, current_inp_file = self._run_swmm_simulation(
             vector_path=Path(out_gpkg),
@@ -1060,7 +1212,10 @@ class DynamicSolutionEvaluator:
             case_dir=case_dir
         )
 
-        return cost, current_inp_file
+        # 13. Resize tanks based on exceedance volume
+        overflow = self.resize_tanks_based_on_exceedance(current_inp_file, active_pairs)
+
+        return cost, current_inp_file, overflow
 
     def _run_swmm_simulation(self,
                             vector_path: Path,
@@ -1086,6 +1241,9 @@ class DynamicSolutionEvaluator:
         # --- INTEGRATE SOLUTION INTO SWMM MODEL ---
         swmm_modifier = SWMMModifier(inp_file=self.inp_file, crs=config.PROJECT_CRS)
         current_inp_file = swmm_modifier.add_derivation_to_model(self.last_designed_gdf, case_dir, solution_name)
+
+
+
 
         
 

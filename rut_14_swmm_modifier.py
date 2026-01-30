@@ -85,7 +85,7 @@ class SWMMModifier:
         """Creates a new section if it doesn't exist."""
         # Try to find a good place to insert (Default: Before [CONDUITS] or at end)
         insert_idx = -1
-        target_successor = "[CONDUITS]" 
+        target_successor = "[CONDUITS]"
         
         for i, line in enumerate(self.lines):
             if line.strip().upper() == target_successor:
@@ -93,7 +93,7 @@ class SWMMModifier:
                 break
         
         if insert_idx == -1:
-            insert_idx = len(self.lines) 
+            insert_idx = len(self.lines)
             
         # Prepare header text
         header_block = [
@@ -347,7 +347,7 @@ class SWMMModifier:
             The invert elevation of the connecting node. Used if `terrain_elev`
             is not provided. Invert Elevation = node_invert - max_depth.
         invert_elev : float, optional
-            Directly sets the Invert Elevation (Bottom) of the tank. 
+            Directly sets the Invert Elevation (Bottom) of the tank.
             Overrides other elevation parameters if provided.
 
         Returns
@@ -393,12 +393,116 @@ class SWMMModifier:
             
         self.lines.insert(idx, new_line)
 
+
+    def modify_xsections(self, links, shapes, geoms):
+        """
+        Batch modifies cross-sections for multiple links using parallel lists.
+        Ideal for working with GeoDataFrames columns.
+        
+        Parameters
+        ----------
+        links : list of str
+            List of Link IDs.
+        shapes : list of str
+            List of SWMM shape types (e.g., 'CIRCULAR', 'RECT_CLOSED').
+        geoms : list of list of float or list of numpy arrays
+            List of geometry parameter lists.
+            Each element is a list or array [Geom1, Geom2, Geom3, Geom4].
+            
+        Returns
+        -------
+        int
+            Number of cross-sections modified.
+            
+        Examples
+        --------
+        >>> links = ['T-01', 'T-02']
+        >>> shapes = ['CIRCULAR', 'RECT_CLOSED']
+        >>> geoms = [[1.2, 0, 0, 0], [1.5, 2.0, 0, 0]]
+        >>> modifier.modify_xsections(links, shapes, geoms)
+        """
+        # Create a lookup dictionary: link_id -> (shape, geom_list)
+        # Zip to ensure we handle them in sync
+        updates = {}
+        if len(links) != len(shapes) or len(links) != len(geoms):
+            raise ValueError("Input lists (links, shapes, geoms) must have the same length.")
+    
+        for lk, sh, gm in zip(links, shapes, geoms):
+            updates[lk] = {'shape': sh, 'geoms': gm}
+    
+        modified_count = 0
+        
+        section = "XSECTIONS"
+        header = f"[{section}]"
+        
+        # 1. Find section start
+        header_idx = -1
+        for i, line in enumerate(self.lines):
+            if line.strip().upper() == header:
+                header_idx = i
+                break
+                
+        if header_idx == -1:
+            print(f"Warning: [{section}] section not found.")
+            return 0
+            
+        # 2. Iterate through the section
+        current_idx = header_idx + 1
+        while current_idx < len(self.lines):
+            line = self.lines[current_idx]
+            stripped = line.strip()
+            
+            # Stop if next section starts
+            if stripped.startswith("["):
+                break
+                
+            # Skip comments/empty
+            if not stripped or stripped.startswith(";"):
+                current_idx += 1
+                continue
+                
+            parts = stripped.split()
+            if len(parts) > 0:
+                link_id = parts[0]
+                
+                if link_id in updates:
+                    # Retrieve new data
+                    new_data = updates[link_id]
+                    shape = new_data['shape']
+                    geoms = new_data['geoms']
+                    
+                    # Convert to list if it's a numpy array
+                    if hasattr(geoms, 'tolist'):
+                        geoms = geoms.tolist()
+                    else:
+                        geoms = list(geoms)
+                    
+                    # Format geometry string (Geom1 Geom2 Geom3 Geom4)
+                    # SWMM expects 4 geoms usually, fill with 0 if fewer are provided
+                    g = geoms + [0.0] * (4 - len(geoms))
+                    geom_str = f"{g[0]:<10.2f} {g[1]:<10.2f} {g[2]:<10.2f} {g[3]:<10.2f}"
+                    
+                    # Preserving Barrels (usually parts[6] if existing)
+                    # Standard (parts): Link Shape Geom1 Geom2 Geom3 Geom4 Barrels Culvert
+                    barrels = "1"
+                    if len(parts) >= 7:
+                        barrels = parts[6]
+                    
+                    new_line = f"{link_id:<16} {shape:<12} {geom_str} {barrels:<10} 0\n"
+                    
+                    self.lines[current_idx] = new_line
+                    modified_count += 1
+            
+            current_idx += 1
+            
+        return modified_count
+    
     def modify_storage_area(self, storage_id, new_area):
         """
         Modifies the area of an existing storage unit.
         
         This method iterates through the file line-by-line (consistent with the class design)
-        to find the [STORAGE] section and the specific storage unit, then updates its 
+        to find the [STORAGE] section and the specific storage unit, then updates its
         area parameter while preserving other properties if possible.
         
         Parameters
@@ -499,7 +603,7 @@ class SWMMModifier:
             print(f"Warning: Storage unit {storage_id} not found.")
             return False
 
-    def add_weir(self, name, from_node, to_node, weir_type="SIDEFLOW", crest_height=0.5, 
+    def add_weir(self, name, from_node, to_node, weir_type="SIDEFLOW", crest_height=0.5,
                  discharge_coeff=1.84, width=2.0, end_contractions=0, flap_gate=False):
         """
         Adds a weir to the model for flow diversion.
@@ -510,7 +614,7 @@ class SWMMModifier:
             The ID of the weir.
         from_node : str
             The ID of the inlet node (where water comes from).
-        to_node : str  
+        to_node : str
             The ID of the outlet node (where water goes to, e.g., a tank or derivation).
         weir_type : str, optional
             Type of weir: 'TRANSVERSE', 'SIDEFLOW', 'V-NOTCH', 'TRAPEZOIDAL' (default 'SIDEFLOW').

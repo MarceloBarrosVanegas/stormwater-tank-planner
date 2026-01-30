@@ -20,9 +20,9 @@ import os
 import sys
 import numpy as np
 import pandas as pd
-from pathlib import Path
 import shutil
 import geopandas as gpd
+from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from shapely.geometry import Point
@@ -163,29 +163,37 @@ class GreedyTankOptimizer:
                 solution_inp=str(self.current_inp_file)
             )
 
+    def _remove_case_directory(self):
+        """Remove a case directory if it exists."""
+        case_dir = self.evaluator.case_dir
+        
+        if case_dir and Path(case_dir).exists():
+            shutil.rmtree(case_dir)
+            print(f"  [Cleanup] Removed directory: {case_dir}")
+
     def resize_tanks_based_on_exceedance(self, current_inp_file: str, active_pairs: list = None) -> dict:
         """
         Resizes tanks based on exceedance volume, updates the SWMM file, and re-extracts metrics.
         Iterates until no tank has flooding (exceedance_volume = 0).
-        
+
         Returns:
             dict or None: If capacity exceeded, returns {'node_id': X, 'predio_id': Y, 'target_id': Z}
                           Otherwise returns None.
         """
         MAX_RESIZE_ITERATIONS = 10  # Safety limit to prevent infinite loops
         iteration = 0
-        
+
         while iteration < MAX_RESIZE_ITERATIONS:
             iteration += 1
             run = False
-            
+
             tanks = self.current_metrics.tank_data
             for tk_id, tk_data in tanks.items():
                 exceedance_volume = tk_data['exceedance_volume']
                 if exceedance_volume > 0:
                     new_vol = tk_data['max_stored_volume'] + exceedance_volume
                     new_area = (new_vol / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR
-                    
+
                     # Validate predio capacity before resize
                     predio_id = int(tk_id.replace("tank_", ""))  # Extract predio_id from tank_X
                     if predio_id in self.evaluator.predio_tracking:
@@ -202,10 +210,10 @@ class GreedyTankOptimizer:
                                         if pair.get('target_type') == 'node':
                                             target_id = pair.get('predio_id')  # The node it connected to
                                         break
-                            
+
                             print(f"  [Overflow] {tk_id} needs {new_area:.0f} m², "
                                   f"predio {predio_id} only has {tracking['area_total']:.0f} m²")
-                            
+
                             return {
                                 'node_id': node_id,
                                 'predio_id': predio_id,
@@ -214,17 +222,17 @@ class GreedyTankOptimizer:
                             }
                         # Update tracked volume
                         self.evaluator.predio_tracking[predio_id]['volumen_acumulado'] = new_vol
-                    
+
                     modifier = SWMMModifier(current_inp_file)
                     modifier.modify_storage_area(tk_id, new_area)
                     modifier.save(current_inp_file)
                     print(f"  [Resize Iter {iteration}] {tk_id}: Increased volume by {exceedance_volume:.1f} m³ to {new_vol:.1f} m³")
                     run = True
-                
+
                 depth_target = config.TANK_DEPTH_M - (config.TANK_VOLUME_SAFETY_FACTOR - 1) * config.TANK_DEPTH_M
                 variacion_permitida = depth_target * 0.05
                 max_depth = tk_data['max_depth']
-                
+
                 if max_depth < depth_target - variacion_permitida:
                     # Reduce tank size
                     new_area = (tk_data['max_stored_volume'] / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR
@@ -239,7 +247,7 @@ class GreedyTankOptimizer:
                 if iteration > 1:
                     print(f"  [Resize] Converged after {iteration - 1} iteration(s) - no more exceedance")
                 break
-            
+
             # Re-run SWMM simulation with updated tank sizes
             inp_dir = Path(current_inp_file).parent
             for out_file in inp_dir.glob('*.out'):
@@ -250,28 +258,17 @@ class GreedyTankOptimizer:
 
             self.metrics_extractor.run(current_inp_file)
             self.current_metrics = self.metrics_extractor.metrics
-            
+
             # Check if all exceedance volumes are now zero
             total_exceedance = sum(tk['exceedance_volume'] for tk in self.current_metrics.tank_data.values())
             if total_exceedance <= 0:
                 print(f"  [Resize] All tanks converged after {iteration} iteration(s) - no flooding")
                 break
-        
+
         if iteration >= MAX_RESIZE_ITERATIONS:
             print(f"  [Warning] Max resize iterations ({MAX_RESIZE_ITERATIONS}) reached - some tanks may still have exceedance")
-        
+
         return None
-
-
-
-
-    def _remove_case_directory(self):
-        """Remove a case directory if it exists."""
-        case_dir = self.evaluator.current_case_dir
-        
-        if case_dir and Path(case_dir).exists():
-            shutil.rmtree(case_dir)
-            print(f"  [Cleanup] Removed directory: {case_dir}")
 
     def run_sequential(self) -> pd.DataFrame:
         """
@@ -317,9 +314,6 @@ class GreedyTankOptimizer:
                 
             cand = candidates.pop(0)  # Take the current best
 
-            
-            # --- 2a. TECHNICAL CONSTRAINTS & PRUNING ---
-            
             # Skip if flooding volume is below threshold
             if cand['total_volume'] < config.TANK_MIN_VOLUME_M3:
                 continue
@@ -333,7 +327,7 @@ class GreedyTankOptimizer:
                 continue
             
             # Skip if node belongs to a newly designed pipeline (not original node)
-            if hasattr(self.evaluator, 'last_designed_gdf') and self.evaluator.last_designed_gdf is not None:
+            if self.evaluator.last_designed_gdf is not None:
                 if cand['node_id'] in self.evaluator.last_designed_gdf['Pozo'].to_list():
                     continue
                     
@@ -351,16 +345,13 @@ class GreedyTankOptimizer:
                         too_close = True
                         break
                 if too_close:
+                    print('Aviso Casey: Candidate too close to existing tank, skipping.')
                     continue
 
             
             iteration += 1
             # --- 2c. TANK INSTALLATION & REGISTRATION ---
             used_nodes.add(cand['node_id'])
-            # predio_idx = cand['predio_id']
-            # predio_capacity[predio_idx]['used_area'] += required_area
-            # predio_capacity[predio_idx]['n_tanks'] += 1
-            # n_tanks_in_predio = predio_capacity[predio_idx]['n_tanks']
             active_candidates.append(cand)
             
             # Step logging
@@ -374,10 +365,11 @@ class GreedyTankOptimizer:
             print(f"  Running SWMM simulation for {len(active_candidates)} tanks...")
             self.solution_name = f"Seq_Iter_{iteration:02d}"
             
-            cost_link, current_inp_file = self.evaluator.evaluate_solution(
+            cost_link,  current_inp_file, overflow = self.evaluator.evaluate_solution(
                 active_candidates,
                 solution_name=self.solution_name,
                 current_metrics=self.metrics_extractor,
+                iteration = iteration
             )
             
             if current_inp_file is None:
@@ -386,18 +378,11 @@ class GreedyTankOptimizer:
             
             # Update current state references
             self.current_inp_file = current_inp_file
-            self.case_dir = self.evaluator.current_case_dir
-            
-            # --- 2e. POST-SIMULATION REPORTING & METRICS ---
-            # Extraction and Comparison
-            self.metrics_extractor.run(current_inp_file)
-            self.current_metrics = self.metrics_extractor.metrics
-
-            #resize tanks based on exceedance
-            overflow = self.resize_tanks_based_on_exceedance(current_inp_file, active_candidates)
+            self.case_dir = self.evaluator.case_dir
+            self.current_metrics = self.evaluator.current_metrics
+       
             
             if overflow:
-                # Capacity exceeded - tank cannot fit in the assigned predio
                 # Extract IDs for tracking and removal
                 node_id = overflow['node_id']
                 target_id = overflow['target_id']
@@ -428,9 +413,6 @@ class GreedyTankOptimizer:
                 # Skip graph generation and restart with next candidate
                 continue
 
-
-
-
             n_tanks = 0
             for pair in active_candidates:
                 if pair['is_tank']:
@@ -454,8 +436,7 @@ class GreedyTankOptimizer:
             
             # Detailed visual and tabular comparison
             self.compare_solutions(active_candidates)
-            
-            
+
             candidates = self.metrics_extractor.ranked_candidates.copy()
 
             results.append({  'cost': self.current_metrics.cost,
@@ -616,9 +597,12 @@ class GreedyTankOptimizer:
             predio_capacity[str(predio_idx)] = {'total_area': area_m2, 'used_area': 0.0, 'n_tanks': 0}
         
         return predio_capacity
-        
-        
-    
+
+
+
+
+
+
     def _plot_economic_curve(self, economic_history: list, current_iteration: int = None):
         """Generate and save the Cost vs Savings economic curve."""
         import matplotlib.pyplot as plt
@@ -740,7 +724,6 @@ class GreedyTankOptimizer:
         print(f"  [Graph] Saved: {save_path}")
         plt.close(fig)
 
-
     def plot_sequence_curve(self, df_results, save_path=None):
         import matplotlib.pyplot as plt
         if df_results.empty: return
@@ -766,7 +749,6 @@ class GreedyTankOptimizer:
         if save_path:
             plt.savefig(save_path)
             print(f"Curve saved to {save_path}")
-
 
     def _generate_summary_report(self, active_candidates: list, economic_history: list, predio_capacity: dict):
         """Generate a text file with optimization summary results."""
@@ -860,8 +842,8 @@ class GreedyTankOptimizer:
     
     def _export_selected_predios_gpkg(self, active_candidates: list, predio_capacity: dict):
         """Export selected predios with tank data as GeoPackage."""
-        from pathlib import Path
-        import geopandas as gpd
+
+
         
         save_dir = Path("optimization_results")
         save_dir.mkdir(exist_ok=True)
@@ -1074,7 +1056,7 @@ class GreedyTankOptimizer:
         # === BOX 7: KEY METRICS ===
         ax7 = fig.add_subplot(gs[2, 1:])
         ax7.axis('off')
-        ax7.set_title('🎯 MÉTRICAS CLAVE', fontsize=14, fontweight='bold', pad=10)
+        ax7.set_title('MÉTRICAS CLAVE', fontsize=14, fontweight='bold', pad=10)
         
         # Big number displays
         metrics = [

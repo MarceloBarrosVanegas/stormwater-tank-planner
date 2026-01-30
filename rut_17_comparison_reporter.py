@@ -20,7 +20,6 @@ from rut_27_model_metrics import SystemMetrics
 plt.style.use('ggplot')
 
 
-
 class ScenarioComparator:
     """
     Compares two SystemMetrics (Baseline vs Solution) and generates reports/plots.
@@ -2162,6 +2161,7 @@ class ScenarioComparator:
             fig.savefig(save_dir / f"04_{solution_name}_tank_hydrographs_page_{batch_idx+1}.png", dpi=100)
             plt.close(fig)
             print(f"  [Tanks] Saved page {batch_idx+1}")
+
 
 if __name__ == "__main__":
     # Test logic
