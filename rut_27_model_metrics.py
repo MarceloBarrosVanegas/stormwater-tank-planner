@@ -175,6 +175,11 @@ class SystemMetrics:
 
     flooded_nodes_count: int = 0
     cost: float = 0.0
+
+    # NETWORK HEALTH
+    surcharged_links_count: int = 0
+    overloaded_links_length: float = 0.0
+    system_mean_utilization: float = 0.0
     
 
 @dataclass
@@ -474,7 +479,38 @@ class MetricExtractor:
             swmm_gdf['Capacity'] = swmm_gdf.index.map(max_capacity_dict).fillna(0.0)
             swmm_gdf['flow_over_pipe_capacity'] = np.maximum(swmm_gdf['MaxFlow'] - q_at_capacity_series, 0)
             swmm_gdf['flow_pipe_capacity'] = q_at_capacity_series
+            swmm_gdf['flow_pipe_capacity'] = q_at_capacity_series
             metrics.swmm_gdf = swmm_gdf
+
+            # =====================================================================
+            # 4.1 NETWORK HEALTH METRICS
+            # =====================================================================
+            # Filter valid pipes (capacity > 0) to avoid division by zero
+            valid_pipes = swmm_gdf[swmm_gdf['Capacity'] > 0].copy()
+            if not valid_pipes.empty:
+                # Calculate utilization
+                valid_pipes['utilization'] = valid_pipes['MaxFlow'] / valid_pipes['Capacity']
+                
+                # Surcharged status
+                valid_pipes['Surcharged'] = valid_pipes['utilization'] >= 1.0
+                
+                # Update the main GDF with these new columns
+                swmm_gdf = swmm_gdf.join(valid_pipes[['utilization', 'Surcharged']], rsuffix='_calc')
+                # Fill NaNs for non-valid pipes (e.g. dummy links)
+                swmm_gdf['utilization'] = swmm_gdf['utilization'].fillna(0.0)
+                swmm_gdf['Surcharged'] = swmm_gdf['Surcharged'].fillna(False)
+
+                # Surcharged links (over 100% capacity)
+                surcharged_links = swmm_gdf[swmm_gdf['Surcharged'] == True]
+                metrics.surcharged_links_count = len(surcharged_links)
+                metrics.overloaded_links_length = surcharged_links['Length'].sum()
+                
+                # System mean utilization (using mean of ratios)
+                metrics.system_mean_utilization = swmm_gdf[swmm_gdf['Capacity'] > 0]['utilization'].mean() * 100 # In percentage
+            else:
+                 metrics.surcharged_links_count = 0
+                 metrics.overloaded_links_length = 0.0
+                 metrics.system_mean_utilization = 0.0
 
             inletnodes_series = swmm_gdf['InletNode'].astype(str).str.strip().str.upper()
 

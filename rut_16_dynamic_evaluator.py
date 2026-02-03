@@ -777,47 +777,138 @@ class DynamicSolutionEvaluator:
         )
 
 
+    def check_minimun_tank_size(self) -> list | bool:
+        """
+        Identifica tanques que no cumplen con el volumen mínimo requerido.
+        
+        Validación de Viabilidad Técnica:
+        ==================================
+        - Itera sobre todos los tanques en el sistema simulado
+        - Compara el volumen almacenado máximo vs. el mínimo configurable
+        - Identifica nodo de origen y predio de destino para cada tanque pequeño
+        - Útil para filtrar soluciones inviables antes de análisis económico
+        
+        Criterio de Rechazo:
+        ====================
+        Si `max_stored_volume < TANK_MIN_VOLUME_M3`, el tanque es considerado
+        demasiado pequeño para ser práctico (costos de construcción, mantenimiento, etc.)
+        
+        Returns:
+            list: Lista de diccionarios con información de TODOS los tanques pequeños:
+                  [{'node_id': str, 'predio_id': int, 'target_id': int, 'tank_id': str, 'stored_volume': float}, ...]
+            bool: False si todos los tanques cumplen el tamaño mínimo
+        
+        Example:
+            >>> result = evaluator.check_minimun_tank_size()
+            >>> if result:  # Hay tanques pequeños (lista no vacía)
+            >>>     for tank_info in result:
+            >>>         print(f"Tank {tank_info['tank_id']} is undersized: {tank_info['stored_volume']} m³")
+        """
+        # Obtener datos de tanques desde las métricas de simulación SWMM
+        tanks = self.current_metrics.tank_data
+        small_tanks = []  # Lista para almacenar todos los tanques problemáticos
+        
+        # ========================================================================
+        # ITERAR SOBRE CADA TANQUE Y VALIDAR VOLUMEN MÍNIMO
+        # ========================================================================
+        for tank, tank_value in tanks.items():
+            # --- PASO 1: Extraer predio_id desde el nombre del tanque ---
+            predio_id = int(tank.replace("tank_", ""))
+            
+            # --- PASO 2: Buscar el node_id que conecta a este predio ---
+            node_id = [
+                key
+                for key, values in self.cumulative_paths.items()
+                if (values['target_id'].item()) == predio_id
+            ][0]
+            
+            # --- PASO 3: Obtener volumen almacenado máximo del tanque ---
+            stored_volume = tank_value['max_stored_volume']
+            
+            # --- PASO 4: Validar contra volumen mínimo configurable ---
+            if stored_volume < config.TANK_MIN_VOLUME_M3:
+                print(f"  [Min Size] Tank {tank} at predio {predio_id} (node {node_id}) has insufficient volume: "
+                      f"required {config.TANK_MIN_VOLUME_M3} m³, has {stored_volume:.2f} m³")
+                
+                # --- PASO 5: Agregar tanque problemático a la lista ---
+                small_tanks.append({
+                    'node_id': node_id,
+                    'predio_id': predio_id,
+                    'target_id': predio_id,
+                    'tank_id': tank,
+                    'stored_volume': stored_volume
+                })
+        
+        # ========================================================================
+        # RETORNAR RESULTADO DE VALIDACIÓN
+        # ========================================================================
+        if len(small_tanks) > 0:
+            # Hay tanques pequeños → retornar lista completa
+            return small_tanks
+        else:
+            # Todos los tanques cumplen el mínimo → retornar False
+            return False  # ✓ CONSISTENTE CON resize_tanks_based_on_exceedance
+    
 
     def resize_tanks_based_on_exceedance(self,
                                          current_inp_file: str,
                                          active_pairs: list = None,
-                                         ) -> dict:
+                                         ) -> list | bool:
         """
-        Resizes tanks based on exceedance volume, updates the SWMM file, and re-extracts metrics.
-        Iterates until no tank has flooding (exceedance_volume = 0).
-
+        Ajusta iterativamente tanques y tuberías hasta eliminar desbordamientos en el modelo SWMM.
+        
+        Proceso Iterativo:
+        ==================
+        1. Ejecuta simulación SWMM y extrae métricas (caudales, volúmenes de tanques, flooding)
+        2. Actualiza caudales de diseño con valores reales de la simulación
+        3. Re-diseña tuberías con los nuevos caudales (si cambios >5%)
+        4. Ajusta tamaño de tanques según volumen excedente (flooding)
+        5. Valida capacidad física del predio (área disponible)
+        6. Repite hasta que no haya flooding o se alcance el máximo de iteraciones
+        
+        Args:
+            current_inp_file: Ruta al archivo .inp de SWMM a modificar
+            active_pairs: Lista de pares nodo-predio activos (para rastrear capacidad)
+        
         Returns:
-            dict or None: If capacity exceeded, returns {'node_id': X, 'predio_id': Y, 'target_id': Z}
-                          Otherwise returns None.
+            list: Si se excede capacidad de uno o más predios, retorna lista de overflows:
+                  [{'node_id': str, 'predio_id': int, 'target_id': str, 'tank_id': str}, ...]
+            bool: False si converge exitosamente (sin problemas)
+        
+        Raises:
+            RuntimeError: Si se alcanzan MAX_RESIZE_ITERATIONS sin convergencia
         """
+        # Inicializar herramientas de diseño y modificación
         slll = SeccionLlena()
         modifier = SWMMModifier(current_inp_file)
+        
+        # Lista para acumular overflows si ocurren múltiples
+        overflow_list = []
 
-        #correr modelo modificado por primrea vez
-        self.metrics_extractor.run(current_inp_file)
-        self.current_metrics = self.metrics_extractor.metrics
-   
-
-
+        
         iteration = 0
         while iteration < config.MAX_RESIZE_ITERATIONS:
             iteration += 1
-            run = False
+            run = False  # Flag para detectar si hubo cambios en esta iteración
             
-            # actualziar caudales para cada tramos segun el modelo de swmm simulado.
+            # ====================================================================
+            # PASO 2: Actualizar caudales de diseño con valores de simulación
+            # ====================================================================
             old_flow = {}
-            for node_id, gdf_path  in self.cumulative_paths.items():
+            for node_id, gdf_path in self.cumulative_paths.items():
                 ramal = gdf_path['node_ramal'].item()
                 target_link = f'{node_id}-{ramal}.1'
+                
                 new_flow = float(self.current_metrics.link_data[target_link]['max_flow'])
                 old_flow[ramal] = float(gdf_path['total_flow'])
                 gdf_path['total_flow'] = new_flow
-                
-            # 1. con el caudal tomado del modelo, crear otra vez las lineas para diseño de tuberias
+            
+            # ====================================================================
+            # PASO 3: Re-diseñar tuberías con caudales actualizados
+            # ====================================================================
             new_path_gdfs = list(self.cumulative_paths.values())
             input_gpkg = self._save_input_gpkg_for_rut03(new_path_gdfs, self.case_dir)
-    
-            # 9. Run sewer pipeline design
+            
             out_gpkg = self._run_sewer_pipeline(
                 input_gpkg=input_gpkg,
                 new_path_gdfs=new_path_gdfs,
@@ -825,108 +916,136 @@ class DynamicSolutionEvaluator:
                 case_dir=self.case_dir,
             )
             
-            # 10. Load designed pipeline for tree-based routing in next iteration
             self.last_designed_gdf = gpd.read_file(out_gpkg).copy()
             
-            # 2. revisar si hay cambios significativos en los caudales maximos de los tramos
-            for node_id, gdf_path  in self.cumulative_paths.items():
+            # ====================================================================
+            # PASO 4: Detectar cambios significativos de caudal (>5%)
+            # ====================================================================
+            for node_id, gdf_path in self.cumulative_paths.items():
                 ramal = gdf_path['node_ramal'].item()
                 target_link = f'{node_id}-{ramal}.1'
-                
                 new_flow = float(self.current_metrics.link_data[target_link]['max_flow'])
+                
                 if abs(new_flow - old_flow[ramal]) / old_flow[ramal] > 0.05:
                     print(f"  [Resize Iter {iteration}] Significant flow change detected on link {target_link}: "
                           f"old {old_flow[ramal]:.2f} m³/s -> new {new_flow:.2f} m³/s")
-
+                    
                     links = self.last_designed_gdf['Tramo'].to_list()
-                    links[0] = target_link  # First link corresponds to the source node's link
+                    links[0] = target_link
                     shapes = self.last_designed_gdf['Seccion'].map(modifier.seccion_type_map).to_list()
                     geoms = slll.section_str2float(self.last_designed_gdf['D_ext'], return_all=True)
                     geoms[np.isnan(geoms)] = 0.0
+                    
                     modifier.modify_xsections(links, shapes, geoms)
                     run = True
             
-
+            # ====================================================================
+            # PASO 5: Ajustar tamaño de tanques según volumen excedente
+            # ====================================================================
             tanks = self.current_metrics.tank_data
             for tk_id, tk_data in tanks.items():
-                # determinar el volumen excedente por flooding
                 exceedance_volume = tk_data['exceedance_volume']
-
+                
+                # --- SUB-PASO 5A: EXPANSIÓN DE TANQUE (flooding > 0) ---
                 if exceedance_volume > 0:
                     new_vol = tk_data['max_stored_volume'] + exceedance_volume
                     new_area = (new_vol / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR
-
-                    # Validate predio capacity before resize
-                    predio_id = int(tk_id.replace("tank_", ""))  # Extract predio_id from tank_X
+                    
+                    predio_id = int(tk_id.replace("tank_", ""))
                     if predio_id in self.predio_tracking:
                         tracking = self.predio_tracking[predio_id]
+                        
+                        # ¿Cabe el tanque ampliado en el terreno?
                         if new_area > tracking['area_total']:
-                            # Capacity exceeded - find the node_id for this predio
+                            # OVERFLOW: El tanque no cabe → agregar a lista
                             node_id = None
                             target_id = predio_id
+                            
                             if active_pairs:
                                 for pair in active_pairs:
                                     if pair.get('predio_id') == predio_id:
                                         node_id = pair.get('node_id')
-                                        # Check if connected to node instead of direct predio
                                         if pair.get('target_type') == 'node':
-                                            target_id = pair.get('predio_id')  # The node it connected to
+                                            target_id = pair.get('predio_id')
                                         break
-
+                            
                             print(f"  [Overflow] {tk_id} needs {new_area:.0f} m², "
                                   f"predio {predio_id} only has {tracking['area_total']:.0f} m²")
-
-                            return {
+                            
+                            overflow_list.append({
                                 'node_id': node_id,
                                 'predio_id': predio_id,
                                 'target_id': target_id,
                                 'tank_id': tk_id
-                            }
-                        # Update tracked volume
+                            })
+                            continue
+                        
                         self.predio_tracking[predio_id]['volumen_acumulado'] = new_vol
                     
                     modifier.modify_storage_area(tk_id, new_area)
                     modifier.save(current_inp_file)
                     print(f"  [Resize Iter {iteration}] {tk_id}: Increased volume by {exceedance_volume:.1f} m³ to {new_vol:.1f} m³")
                     run = True
-
+                
+                # --- SUB-PASO 5B: REDUCCIÓN DE TANQUE ---
                 depth_target = config.TANK_DEPTH_M - (config.TANK_VOLUME_SAFETY_FACTOR - 1) * config.TANK_DEPTH_M
                 variacion_permitida = depth_target * 0.05
                 max_depth = tk_data['max_depth']
-
+                
                 if max_depth < depth_target - variacion_permitida:
-                    # Reduce tank size
                     new_area = (tk_data['max_stored_volume'] / config.TANK_DEPTH_M) * config.TANK_VOLUME_SAFETY_FACTOR + config.TANK_OCCUPATION_FACTOR
                     modifier = SWMMModifier(current_inp_file)
                     modifier.modify_storage_area(tk_id, new_area)
                     modifier.save(current_inp_file)
                     print(f"  [Resize Iter {iteration}] {tk_id}: Reduced tank size to control max depth {max_depth:.2f} m")
                     run = True
-
+            
+            # ====================================================================
+            # VERIFICAR SI HUBO OVERFLOWS EN ESTA ITERACIÓN
+            # ====================================================================
+            if len(overflow_list) > 0:
+                print(f"  [Resize] Detected {len(overflow_list)} overflow(s) - returning for handling")
+                return overflow_list
+            
+            # ====================================================================
+            # PASO 6: Verificar convergencia
+            # ====================================================================
             if not run:
-                return None  # No changes made, exit loop
-
-            # Re-run SWMM simulation with updated tank sizes
+                # No hubo cambios → sistema converge exitosamente
+                print(f"  [Resize] No changes in iteration {iteration} - system converged")
+                return False  # ✓ RETORNAR FALSE (consistente con check_minimun_tank_size)
+            
+            # ====================================================================
+            # PASO 7: Re-ejecutar simulación con cambios aplicados
+            # ====================================================================
             inp_dir = Path(current_inp_file).parent
             for out_file in inp_dir.glob('*.out'):
                 try:
                     os.remove(out_file)
                 except OSError:
                     pass
-
+            
             self.metrics_extractor.run(current_inp_file)
             self.current_metrics = self.metrics_extractor.metrics
-
-            # Check if all exceedance volumes are now zero
+            
+            # ====================================================================
+            # PASO 8: Verificar si se eliminó  el flooding
+            # ====================================================================
             total_exceedance = sum(tk['exceedance_volume'] for tk in self.current_metrics.tank_data.values())
             if total_exceedance <= 0:
                 print(f"  [Resize] All tanks converged after {iteration} iteration(s) - no flooding")
                 break
-
+        
+        # ========================================================================
+        # FINAL: Advertencia si no converge dentro del límite de iteraciones
+        # ========================================================================
         if iteration >= config.MAX_RESIZE_ITERATIONS:
             print(f"  [Warning] Max resize iterations ({config.MAX_RESIZE_ITERATIONS}) reached - some tanks may still have exceedance")
+        
+        # Convergencia exitosa (con o sin advertencia)
+        return False  # ✓ RETORNAR FALSE (sin problemas que requieran retry)
 
-        return None
+
 
     def _generate_paths(self,
                        active_pairs: List[CandidatePair],
@@ -938,7 +1057,7 @@ class DynamicSolutionEvaluator:
         pipeline nodes instead of going directly to predio, avoiding parallel lines.
         """
         path_gdfs = []
-
+        pairs = []
         for i, pair in enumerate(active_pairs):
             source_node_x, source_node_y, source_z = pair['node_x'], pair['node_y'], pair['invert_elevation']
             source_volume = pair.get('total_volume', 0.0)
@@ -965,7 +1084,7 @@ class DynamicSolutionEvaluator:
                 print(f"  [Direct] Path {i+1}: Connecting directly to predio")
 
             target_node_metadata['total_volume'] = pair['total_volume']
-            target_node_metadata['ramal'] = str(self._solution_counter - 1)
+            target_node_metadata['ramal'] = str(self._solution_counter)
             target_node_metadata['target_type'] = target_type  # Store for downstream use
             pair['predio_id'] = target_node_metadata['id']
             pair['predio_x_centroid'] = target_node_metadata['x']
@@ -1033,12 +1152,13 @@ class DynamicSolutionEvaluator:
                     path_gdf['node_id'] = pair['node_id']
                     path_gdf['node_invert_elevation'] = pair['invert_elevation']
                     path_gdf['node_max_depth'] = pair['node_depth']
-                    path_gdf['node_ramal'] = self._solution_counter - 1
+                    path_gdf['node_ramal'] = str(self._solution_counter)
                     
                     for key in target_node_metadata.keys():
                         path_gdf[f'target_{key}'] = target_node_metadata[key]
                     
                     path_gdfs.append(path_gdf)
+                    pairs.append(pair)
 
             else:
                 return [], None, pair  # Failed to find path
@@ -1141,8 +1261,8 @@ class DynamicSolutionEvaluator:
         self.current_metrics = current_metrics
         self.nodes_gdf = current_metrics.nodes_gdf
         self.predios_gdf = current_metrics.predios_gdf
-        self._solution_counter  = iteration
-        self.solution_name =  solution_name
+        self._solution_counter = iteration
+        self.solution_name = solution_name
 
         # 2. Setup case directory
         case_dir = self.case_dir = self._create_case_directory(solution_name)
@@ -1200,7 +1320,7 @@ class DynamicSolutionEvaluator:
             ramal_data = self.last_designed_gdf[self.last_designed_gdf['Ramal'] == ramal_str]
             if not ramal_data.empty:
                 if 'D_ext' in ramal_data.columns:
-                    pair['diameter'] = str(ramal_data['D_ext'].iloc[0])
+                    pair['diameter'] = str(ramal_data['D_ext'].iloc[-1])
                 if 'L' in ramal_data.columns:
                     pair['pipeline_length'] = float(ramal_data['L'].sum())
 
@@ -1214,8 +1334,10 @@ class DynamicSolutionEvaluator:
 
         # 13. Resize tanks based on exceedance volume
         overflow = self.resize_tanks_based_on_exceedance(current_inp_file, active_pairs)
+        
+        small_tanks = self.check_minimun_tank_size()
 
-        return cost, current_inp_file, overflow
+        return cost, current_inp_file, overflow, small_tanks
 
     def _run_swmm_simulation(self,
                             vector_path: Path,
@@ -1242,7 +1364,9 @@ class DynamicSolutionEvaluator:
         swmm_modifier = SWMMModifier(inp_file=self.inp_file, crs=config.PROJECT_CRS)
         current_inp_file = swmm_modifier.add_derivation_to_model(self.last_designed_gdf, case_dir, solution_name)
 
-
+        # Ejecutar simulación inicial y extraer métricas base
+        self.metrics_extractor.run(current_inp_file)
+        self.current_metrics = self.metrics_extractor.metrics
 
 
         

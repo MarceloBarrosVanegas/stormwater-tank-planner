@@ -350,8 +350,8 @@ class ScenarioComparator:
     def _plot_cumulative_volume(self, ax, baseline, solution):
         """Plots cumulative flooding volume over time (integral of rate)."""
 
-        hrs_b, cum_b = self.get_cumulative(ax, baseline, "red", "Baseline Cumulative")
-        hrs_s, cum_s = self.get_cumulative(ax, solution, "blue", "Solution Cumulative")
+        hrs_b, cum_b = self.get_cumulative(ax, baseline, "red", "Baseline")
+        hrs_s, cum_s = self.get_cumulative(ax, solution, "blue", "Solution")
 
         ax.set_title("Cumulative Flooding Volume Over Time")
         ax.set_ylabel("Cumulative Volume (m³)")
@@ -365,7 +365,7 @@ class ScenarioComparator:
             pct = (reduction / cum_b[-1]) * 100.0
             ax.text(
                 0.98,
-                0.05,
+                0.35,
                 f"Reduction: {reduction:,.0f} m³ ({pct:.1f}%)",
                 transform=ax.transAxes,
                 fontsize=9,
@@ -412,8 +412,8 @@ class ScenarioComparator:
 
 
         # Plot
-        t_b, y_b = self.plot_series(ax, baseline, 'red', 'Baseline Total Flood Rate')
-        t_s, y_s = self.plot_series(ax, solution, 'blue', 'Solution Total Flood Rate')
+        t_b, y_b = self.plot_series(ax, baseline, 'red', 'Baseline')
+        t_s, y_s = self.plot_series(ax, solution, 'blue', 'Solution')
 
         ax.set_title("Total System Flooding Rate (All Nodes)")
         ax.set_ylabel("Flooding Rate (cms)")
@@ -443,18 +443,12 @@ class ScenarioComparator:
                  vol_b_integ = 0
                  vol_s_integ = 0
              
-             vol_diff = vol_b_reported - vol_s_reported # Reduction
+             flow_diff = round(baseline.total_max_flooding_flow - solution.total_max_flooding_flow, 2)
              
              # Print STATS on the plot (Showing match/mismatch)
-             stats_text = (f"SWMM Vol Base: {vol_b_reported:,.0f} m3\n"
-                           f"Plot Vol Base: {vol_b_integ:,.0f} m3\n"
-                           f"----------------\n"
-                           f"SWMM Vol Sol:  {vol_s_reported:,.0f} m3\n"
-                           f"Plot Vol Sol:  {vol_s_integ:,.0f} m3\n"
-                           f"----------------\n"
-                           f"Reduc (SWMM): {vol_diff:,.0f} m3")
+             stats_text = (f"Reduction: {flow_diff:,.2f} m3/s ({(1 - solution.total_max_flooding_flow / baseline.total_max_flooding_flow) * 100:,.2f}%)")
              
-             ax.text(0.98, 0.95, stats_text, transform=ax.transAxes,
+             ax.text(0.98, 0.35, stats_text, transform=ax.transAxes,
                      fontsize=9, verticalalignment='top', horizontalalignment='right',
                      bbox=dict(boxstyle="round,pad=0.3", fc="white", ec='black', alpha=0.9))
 
@@ -506,8 +500,8 @@ class ScenarioComparator:
             
             return hrs, rates
         
-        hrs_b, rates_b = plot_series(baseline, 'red', 'Baseline Outfall', '--')
-        hrs_s, rates_s = plot_series(solution, 'blue', 'Solution Outfall', '-')
+        hrs_b, rates_b = plot_series(baseline, 'red', 'Baseline', '--')
+        hrs_s, rates_s = plot_series(solution, 'blue', 'Solution', '-')
         
         ax.set_title("Outfall Flow ")
         ax.set_ylabel("Flow Rate (m³/s)")
@@ -523,7 +517,7 @@ class ScenarioComparator:
             reduction = peak_b - peak_s
             pct = (reduction / peak_b) * 100 if peak_b > 0 else 0
             
-            ax.text(0.98, 0.05, f"Peak Reduction: {reduction:.2f} m³/s ({pct:.1f}%)",
+            ax.text(0.98, 0.35, f"Reduction: {reduction:.2f} m³/s ({pct:.1f}%)",
                    transform=ax.transAxes, fontsize=9,
                    verticalalignment='bottom', horizontalalignment='right',
                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec='black', alpha=0.9))
@@ -941,6 +935,11 @@ class ScenarioComparator:
         links_sol_gdf = solution.swmm_gdf
         links_base_gdf = self.baseline.swmm_gdf
         
+        links_sol_gdf['Tramo'] = links_sol_gdf['InletNode'] + '-' + links_sol_gdf['OutletNode']
+        links_sol_gdf =  links_sol_gdf[~links_sol_gdf['Tramo'].isin(derivations['Tramo'])].copy()
+
+        
+        
         # Load predios using lazy cache
         predios_gdf = self._get_predios_gdf() if show_predios else None
         if show_predios and (predios_gdf is None or predios_gdf.empty):
@@ -989,6 +988,9 @@ class ScenarioComparator:
         # Use swmm_gdf from metrics
         links_sol_gdf = solution.swmm_gdf if solution.swmm_gdf is not None and not solution.swmm_gdf.empty else None
         links_base_gdf = self.baseline.swmm_gdf if self.baseline.swmm_gdf is not None and not self.baseline.swmm_gdf.empty else None
+        
+        links_sol_gdf['Tramo'] = links_sol_gdf['InletNode'] + '-' + links_sol_gdf['OutletNode']
+        links_sol_gdf =  links_sol_gdf[~links_sol_gdf['Tramo'].isin(derivations['Tramo'])].copy()
         
         # Load predios using lazy cache
         predios_gdf = self._get_predios_gdf() if show_predios else None
