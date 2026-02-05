@@ -115,7 +115,7 @@ class ScenarioComparator:
         # === LEFT: TANK TABLE (col 0, rows 0-1) ===
         ax_table = fig.add_subplot(gs[:, 0])
         ax_table.axis('off')
-        ax_table.set_title('Tank Details', fontsize=12, fontweight='bold', pad=5)
+        # ax_table.set_title('Tank Details', fontsize=12, fontweight='bold', pad=5)
 
         # Build table data - compact format
         # L in km, Vol = actual volume rounded, Util% with warning color if low
@@ -159,7 +159,7 @@ class ScenarioComparator:
                     low_util_rows.append(i)
 
                 table_data.append([
-                    str(i),
+                    tank['ramal'],
                     predio_id,
                     f"{q_derivacion:.2f}",
                     f"{longitud_km:.2f}",
@@ -353,7 +353,7 @@ class ScenarioComparator:
         hrs_b, cum_b = self.get_cumulative(ax, baseline, "red", "Baseline")
         hrs_s, cum_s = self.get_cumulative(ax, solution, "blue", "Solution")
 
-        ax.set_title("Cumulative Flooding Volume Over Time")
+        ax.set_title("Cumulative Flooding Volume")
         ax.set_ylabel("Cumulative Volume (m³)")
         ax.set_xlabel("Time (hours)")
         ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
@@ -415,7 +415,7 @@ class ScenarioComparator:
         t_b, y_b = self.plot_series(ax, baseline, 'red', 'Baseline')
         t_s, y_s = self.plot_series(ax, solution, 'blue', 'Solution')
 
-        ax.set_title("Total System Flooding Rate (All Nodes)")
+        ax.set_title("Total System Flooding Rate ")
         ax.set_ylabel("Flooding Rate (cms)")
         ax.set_xlabel("Time (hours)")
         ax.set_xlim(0, PLOT_TIME_LIMIT_HOURS)  # Limit X-axis
@@ -1998,90 +1998,6 @@ class ScenarioComparator:
         ax.legend(loc='lower right')
         ax.set_title(f"ECDF: {xlabel}")
 
-    @staticmethod
-    def generate_tank_hydrograph_plots_old(solution: SystemMetrics, solution_name: str, save_dir: Path, detailed_links: Dict = None):
-        """Generates plots for detailed tank hydrographs (Inflow, Volume, Depth). Max 4 per page."""
-        if not solution.tank_data:
-            return
-
-        tank_ids = list(solution.tank_data.keys())
-        tank_ids.sort()
-        
-        batch_size = 4
-        
-        for batch_idx, i in enumerate(range(0, len(tank_ids), batch_size)):
-            batch_tanks = tank_ids[i : i + batch_size]
-            
-            n_rows = len(batch_tanks)
-            # 3 Columns: Inflow (calc), Volume (calc), Depth (measured)
-            fig = plt.figure(figsize=(24, 5 * n_rows))
-            gs = fig.add_gridspec(n_rows, 3)
-            
-            for row_idx, tk_id in enumerate(batch_tanks):
-                util_data = solution.tank_data[tk_id]
-                design_vol = util_data.get('total_volume', 0.0)
-                
-                # Axes
-                ax_flow = fig.add_subplot(gs[row_idx, 0])
-                ax_vol = fig.add_subplot(gs[row_idx, 1])
-                ax_depth = fig.add_subplot(gs[row_idx, 2])
-
-                # --- PLOT 1: INFLOW (Calculado) ---
-                variable = 'flow_series'
-                # CONVERSIÓN A HORAS RELATIVAS (X-axis fix)
-                t0 = util_data[variable].index[0]
-                hrs = [(t - t0).total_seconds() / 3600.0 for t in util_data[variable].index]
-                
-                ax_flow.plot(hrs, util_data[variable].to_numpy(), color='blue', linewidth=1.5, label='Est. Inflow')
-                ax_flow.set_title(f"{tk_id}\nInflow", fontweight='bold')
-                ax_flow.set_ylabel("Flow (m³/s)")
-                ax_flow.fill_between(hrs, util_data[variable].to_numpy(), color='blue', alpha=0.1)
-                ax_flow.grid(True, alpha=0.3)
-                ax_flow.text(0.95, 0.95, f"Peak: {util_data['max_flow']:.2f} m³/s", transform=ax_flow.transAxes, ha='right', va='top', fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
-                
-                # --- PLOT 2: VOLUME ---
-                variable = 'volume_series'
-                ax_vol.plot(hrs, util_data[variable].to_numpy(), color='green', linewidth=2, label='Volume')
-                ax_vol.set_title("Cumulative Volume")
-                ax_vol.set_ylabel("Volume (m³)")
-                ax_vol.fill_between(hrs, util_data[variable].to_numpy(), color='green', alpha=0.2)
-                ax_vol.axhline(design_vol, color='darkgreen', linestyle='--', label='Capacity')
-                ax_vol.grid(True, alpha=0.3)
-                ax_vol.text(0.95, 0.95, f"Stored: {util_data['max_stored_volume']:,.0f} m³", transform=ax_vol.transAxes, ha='right', va='top', fontsize=9, bbox=dict(facecolor='white', alpha=0.7))
-                
-                # --- PLOT 3: DEPTH ---
-                variable = 'depth_series'
-                ax_depth.plot(hrs, util_data[variable].to_numpy(), color='tab:red', linewidth=2, label='Depth')
-                ax_depth.axhline(config.TANK_DEPTH_M, color='darkred', linestyle='--', label=f'Design ({config.TANK_DEPTH_M}m)')
-                ax_depth.fill_between(hrs, util_data[variable].to_numpy(), color='tab:red', alpha=0.2)
-                
-                # Etiquetas de texto
-                vol_str = f"{util_data['total_volume']:,.0f} m³"
-                label_text = (f"Design Vol: {vol_str}\n"
-                           f"Design Depth: {config.TANK_DEPTH_M} m\n"
-                           f"Max Depth: {util_data['max_depth']:.2f} m\n"
-                           f"Util: {(util_data['max_depth']/config.TANK_DEPTH_M)*100:.0f}%")
-                ax_depth.text(0.98, 0.95, label_text, transform=ax_depth.transAxes,
-                           ha='right', va='top', fontsize=10,
-                           bbox=dict(facecolor='lemonchiffon', alpha=0.7, edgecolor='orange'))
-                ax_depth.set_title("Tank Depth (Filling Curve)")
-                ax_depth.set_ylabel("Depth (m)")
-                
-                # Etiquetas de ejes comunes
-                ax_flow.set_xlabel("Time (h)")
-                ax_vol.set_xlabel("Time (h)")
-                ax_depth.set_xlabel("Time (h)")
-                
-                # Límites del eje X (Ahora coinciden perfectamente)
-                ax_flow.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
-                ax_vol.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
-                ax_depth.set_xlim(0, PLOT_TIME_LIMIT_HOURS)
-                
-            fig.suptitle(f"{solution_name}: Tank Hydrographs (Page {batch_idx+1})", fontsize=16)
-            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-            fig.savefig(save_dir / f"04_{solution_name}_tank_hydrographs_page_{batch_idx+1}.png", dpi=100)
-            plt.close(fig)
-            print(f"  [Tanks] Saved page {batch_idx+1}")
 
     @staticmethod
     def generate_tank_hydrograph_plots(solution: SystemMetrics, solution_name: str, save_dir: Path, detailed_links: Dict = None):
@@ -2142,7 +2058,7 @@ class ScenarioComparator:
                 
                 # Etiquetas de texto mejoradas
                 vol_str = f"{util_data['total_volume']:,.0f} m³"
-                label_text = (f"Design Vol: {vol_str}\n"
+                label_text = (
                            f"Design Depth: {config.TANK_DEPTH_M} m\n"
                            f"Max Depth: {util_data['max_depth']:.2f} m\n"
                            f"Util: {(util_data['max_depth']/config.TANK_DEPTH_M)*100:.0f}%")

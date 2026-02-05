@@ -353,7 +353,7 @@ class MetricExtractor:
             q_at_capacity_series: Serie con capacidad máxima por link (m³/s)
         """
         exporter = NetworkExporter(str(in_file_path))
-        swmm_gdf = exporter.run(None, run_hydraulics=False, crs=config.PROJECT_CRS)
+        swmm_gdf, nodes_df = exporter.run(None, run_hydraulics=False, crs=config.PROJECT_CRS)
 
         # Calcular secciones
         swmm_gdf['Seccion'] = swmm_gdf['Shape'].map(self.parse_shape_from_swmm)
@@ -370,7 +370,7 @@ class MetricExtractor:
 
         q_at_capacity_series = pd.Series(np.round(q_at_capacity / 1000, 3), index=swmm_gdf.index)
 
-        return swmm_gdf, q_at_capacity_series
+        return swmm_gdf, nodes_df, q_at_capacity_series
 
     def extract(self, in_file_path, extrac_items) -> SystemMetrics:
         """
@@ -385,7 +385,7 @@ class MetricExtractor:
         # =========================================================================
         with tqdm(total=2, desc="Load INP file", unit="step") as pbar:
             pbar.set_description("Reading INP file")
-            swmm_gdf, q_at_capacity_series = self.load_swmm_network(in_file_path)
+            swmm_gdf, nodes_df, q_at_capacity_series = self.load_swmm_network(in_file_path)
             pbar.update(1)
 
             pbar.set_description("Running SWMM Simulation")
@@ -567,12 +567,10 @@ class MetricExtractor:
                 if flooding_volume > 0:
                     flooded_nodes_count += 1
 
-                if len(incoming_links) > 0:
-                    x = float(swmm_gdf.loc[incoming_links]['X2'].max())
-                    y = float(swmm_gdf.loc[incoming_links]['Y2'].max())
-                    invert_elevation = float(swmm_gdf.loc[incoming_links]['OutletNode_InvertElev'].max())
-                else:
-                    x, y, invert_elevation = 0.0, 0.0, 0.0
+                x = float(nodes_df.loc[nid_str, 'X'])
+                y = float(nodes_df.loc[nid_str, 'Y'])
+                invert_elevation = float(nodes_df.loc[nid_str, 'InvertElev'])
+
 
                 max_depth = float(depth_series.max()) if len(depth_series) > 0 else 0.0
 

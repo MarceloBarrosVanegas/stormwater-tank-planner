@@ -29,13 +29,16 @@ import geopandas as gpd
 import sys
 import subprocess
 import os
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
 
 # Import construction cost calculator from rut_21
 from rut_21_construction_cost import SewerConstructionCost
-from rut_25_from_inp_to_vector import NetworkExporter
-from rut_22_scenario_generator import generate_inp_file
 import rut_22_scenario_generator as rut_22
 from rut_21_risk_analysis import RiskAnalyzer
+from rut_25_from_inp_to_vector import NetworkExporter
+
+
 
 # Import pipe sizing module from pypiper
 from rut_06_pipe_sizing import SeccionParcialmenteLlena, PipeSizing

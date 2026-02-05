@@ -895,6 +895,7 @@ class SWMMModifier:
     
             previous_node = None
             total_rows = len(ramal_df)
+            # print(f"  [SWMM] Processing ramal {ramal}: {total_rows} rows, target_type={target_type}, node_id={node_metadata.get('node_id')}")
     
             # --- Process each segment in the ramal ---
             for row_number, row in enumerate(ramal_df.itertuples()):
@@ -955,16 +956,59 @@ class SWMMModifier:
                         final_node = tank_name
                         # print(f"  [Derivation] Created Tank {tank_name} at target {target_id}")
                     else:
-                        # Create junction with target_id as name
+                        # target_type == 'node': Connect to existing pipeline node
                         final_node = str(target_id)
-                        # print(f"  [Derivation] Created Junction {final_node} at target {target_id}")
+                        
+                        # Check if this node already exists in the model or added_nodes
+                        if final_node not in added_nodes:
+                            # Node doesn't exist yet - we need to create it
+                            # Look up the node info in last_design_gdf
+                            node_match = last_design_gdf[last_design_gdf['Pozo'].astype(str) == final_node]
+                            
+                            if not node_match.empty:
+                                # Get elevation and depth from the matched row
+                                node_elev = float(node_match.iloc[0]['ZFF'])
+                                node_depth = float(node_match.iloc[0]['HF'])
+                                node_x_coord = float(node_match.iloc[0].geometry.coords[-1][0])
+                                node_y_coord = float(node_match.iloc[0].geometry.coords[-1][1])
+                                
+                                # Create the junction
+                                self.add_junction(
+                                    name=final_node,
+                                    elev=node_elev,
+                                    max_depth=node_depth
+                                )
+                                self.add_coordinate(
+                                    name=final_node,
+                                    x=node_x_coord,
+                                    y=node_y_coord
+                                )
+                                added_nodes.add(final_node)
+                                print(f"  [Derivation] Created Junction {final_node} for pipeline connection (elev: {node_elev:.2f})")
+                            else:
+                                # Fallback: use metadata from this ramal if node not found
+                                # This shouldn't happen normally, but prevents crash
+                                print(f"  [Warning] Node {final_node} not found in last_design_gdf, using target coords")
+                                self.add_junction(
+                                    name=final_node,
+                                    elev=node_end_elev,  # Use current row's ZFF as approximation
+                                    max_depth=node_end_depth
+                                )
+                                self.add_coordinate(
+                                    name=final_node,
+                                    x=target_x,
+                                    y=target_y
+                                )
+                                added_nodes.add(final_node)
                     
                     # Update tramo to connect to final node
                     tramo = f"{node_start}-{final_node}"
                 else:
+                    # Intermediate node - assign final_node regardless
+                    final_node = node_end
                     
-                    if node_end not  in added_nodes:
-                        # Intermediate node - regular junction
+                    if node_end not in added_nodes:
+                        # Node not yet added - create junction
                         self.add_junction(
                             name=node_end,
                             elev=node_end_elev,
@@ -975,7 +1019,7 @@ class SWMMModifier:
                             x=row.X,
                             y=row.Y
                         )
-                        final_node = node_end
+                        added_nodes.add(node_end)  # Mark as added to prevent duplicates
         
                 # Add conduit
                 self.add_conduit(
@@ -1012,24 +1056,67 @@ class SWMMModifier:
         
         return final_inp_path
         
-        
-        
-
-
-
-
-
 
 
 if __name__ == "__main__":
+    # =========================================================================
+    # DEBUG: Iteración 20 - Analizar por qué no existe ramal 20
+    # =========================================================================
     inp_file = "COLEGIO_TR25_v6.inp"
-    out_pipe = "COLEGIO_TR25_v6_PIPELINE.inp"
-
-    gpkg_file =r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Seq_Iter_03\Seq_Iter_03.gpkg'
+    
+    # CAMBIAR ESTE PATH al GPKG de la iteración que falló
+    gpkg_file = r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Seq_Iter_20\Seq_Iter_20.gpkg'
+    
+    if not os.path.exists(gpkg_file):
+        print(f"[Error] No existe el archivo: {gpkg_file}")
+        print("Cambia gpkg_file al path correcto del GPKG de iteración 20")
+        exit(1)
+    
     last_design_gdf = gpd.read_file(gpkg_file)
     
+    # =========================================================================
+    # ANÁLISIS: Ver qué ramales hay y cuáles son sus propiedades
+    # =========================================================================
+    print("\n" + "="*80)
+    print("ANÁLISIS DE RAMALES EN EL GPKG")
+    print("="*80)
+    
+    ramales_unicos = last_design_gdf['Ramal'].unique()
+    print(f"Ramales únicos encontrados: {sorted(ramales_unicos, key=lambda x: (x is None, str(x)))}")
+    print(f"Total ramales: {len(ramales_unicos)}")
+    
+    # Buscar ramal 20 específicamente
+    ramal_20 = last_design_gdf[last_design_gdf['Ramal'] == '20']
+    print(f"\n¿Existe ramal '20'? {len(ramal_20) > 0}")
+    if len(ramal_20) > 0:
+        print(f"Filas de ramal 20: {len(ramal_20)}")
+        print(ramal_20[['Ramal', 'Tramo', 'Pozo', 'Obs']].head(10).to_string())
+    else:
+        print("  -> Ramal 20 NO existe en el GPKG!")
+    
+    # Análisis de Obs para ver node_id
+    print("\n" + "-"*80)
+    print("ANÁLISIS: node_id por ramal")
+    print("-"*80)
+    for ramal in sorted(ramales_unicos, key=lambda x: (x is None, str(x))):
+        ramal_df = last_design_gdf[last_design_gdf['Ramal'] == ramal]
+        try:
+            obs_parts = ramal_df['Obs'].iloc[0].split('|')
+            node_metadata = json.loads(obs_parts[1])
+            node_id = node_metadata.get('node_id', 'N/A')
+            target_type = node_metadata.get('target_type', 'N/A')
+            print(f"  Ramal {ramal}: node_id={node_id}, target_type={target_type}, filas={len(ramal_df)}")
+        except Exception as e:
+            print(f"  Ramal {ramal}: Error parseando Obs - {e}")
+    
+    print("\n" + "="*80)
+    print("Ejecutando add_derivation_to_model...")
+    print("="*80 + "\n")
+    
     case_dir = Path(os.getcwd())
-    solution_name = "casey"
+    solution_name = "debug_iter_20"
     
     swmm_modifier = SWMMModifier(inp_file=inp_file, crs=config.PROJECT_CRS)
     swmm_modifier.add_derivation_to_model(last_design_gdf, case_dir, solution_name)
+    
+    print("\n[Done] Revisar el archivo model_debug_iter_20.inp generado")

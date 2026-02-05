@@ -167,12 +167,12 @@ COST_COMPONENTS = {
 # =============================================================================
 # TANK DESIGN PARAMETERS
 # =============================================================================
-CAPACITY_MAX_HD = 0.8 # Maximum h/D ratio in conduits
+CAPACITY_MAX_HD = 0.75 # Maximum h/D ratio in conduits
 CAPACITY_MAX_FOR_AVOIDED_COST = 0.75
 
 # 'flooding' for just avoid flooding nodes   or  'capacity' for avoiding h/D > DERIVATION_MAX_HD in all conduits
-# TANK_OPT_OBJECTIVE = 'flooding'
-TANK_OPT_OBJECTIVE = 'capacity'
+TANK_OPT_OBJECTIVE = 'flooding'
+# TANK_OPT_OBJECTIVE = 'capacity'
 MINIMUN_FLOODING_FLOW = 0.1  # Minimum flooding flow to consider a node flooded (m3/s)
 MAX_ITERATIONS = 100  # Max iterations for tank sizing convergence
 MAX_RESIZE_ITERATIONS = 10 # Max iterations for tank resizing convergence
@@ -183,7 +183,7 @@ TANK_MAX_VOLUME_M3 = 100000.0    # Maximum tank volume in cubic meters
 
 TANK_MIN_UTILIZATION_PCT = 20.0 # Minimum tank utilization % (warn if below this)
 TANK_VOLUME_ROUND_M3 = 100      # Round volumes to this increment for display
-MAX_TANKS = 30
+MAX_TANKS = 10
 MAX_PRUNE_RETRIES =  2  # Max retries for pruning tanks
 MAX_PREDIO_SLOPE = 30.0 # Maximum allowed predio slope in %. Predios steeper than this are discarded.
 PREDIO_MAX_OCCUPANCY_RATIO = 0.85  # Exclude predios with >85% area occupied from path search
@@ -195,7 +195,7 @@ TANK_OCCUPATION_FACTOR = 150    # Extra space factor for access, pumps, maneuver
 
 WEIR_CREST_MIN_M = 0.1         # Minimum weir crest height above tank bottom (m)
 WEIR_DISCHARGE_COEFF = 1.84   # Weir discharge coefficient (Cd) for rectangular sharp-crested weir
-DERIVATION_MIN_DISTANCE_M = 200  # Minimum distance (m) between derivation points on same pipe line
+DERIVATION_MIN_DISTANCE_M = 50  # Minimum distance (m) between derivation points on same pipe line
 MIN_DETPH_FOR_DERIVATION_M = 6.0  # Minimum pipe depth tunnel
 
 # Pipeline Design Defaults (used in rut_16)
@@ -206,7 +206,8 @@ DEFAULT_PIPE_RUGOSITY = 'liso'   # Default pipe roughness category
 DEFAULT_POZO_DEPTH = 6.0         # Default manhole/pozo depth (m)
 MIN_PIPE_DIAMETER = 1.8          # Minimum pipe diameter (m)
 
-TOLERANCE = 20  # min distance to simplify paths
+TOLERANCE = 2  # min distance to simplify paths
+MIN_NODE_DISTANCE_M = 20  # min distance between nodes when simplifying paths
 
 # =============================================================================
 
@@ -242,9 +243,9 @@ DEFAULT_ROAD_PREFERENCES = {
 
 
 FLOODING_RANKING_WEIGHTS = {
-    'total_volume': 0.5,
-    'total_flow': 0.5,
-    'failure_probability': 0.,
+    'total_volume': 0.4,
+    'total_flow': 0.3,
+    'failure_probability': 0.3,
 }
 
 # =============================================================================

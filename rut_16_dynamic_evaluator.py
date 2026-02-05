@@ -895,9 +895,13 @@ class DynamicSolutionEvaluator:
             # PASO 2: Actualizar caudales de diseño con valores de simulación
             # ====================================================================
             old_flow = {}
+            
             for node_id, gdf_path in self.cumulative_paths.items():
                 ramal = gdf_path['node_ramal'].item()
-                target_link = f'{node_id}-{ramal}.1'
+                filtro_ramal = self.last_designed_gdf['Ramal'] ==  ramal
+                end_tramo_name = self.last_designed_gdf[filtro_ramal]['Tramo'].to_list()[0].split('-')[1]
+                
+                target_link = f'{node_id}-{end_tramo_name}'
                 
                 new_flow = float(self.current_metrics.link_data[target_link]['max_flow'])
                 old_flow[ramal] = float(gdf_path['total_flow'])
@@ -923,7 +927,10 @@ class DynamicSolutionEvaluator:
             # ====================================================================
             for node_id, gdf_path in self.cumulative_paths.items():
                 ramal = gdf_path['node_ramal'].item()
-                target_link = f'{node_id}-{ramal}.1'
+                filtro_ramal = self.last_designed_gdf['Ramal'] ==  ramal
+                end_tramo_name = self.last_designed_gdf[filtro_ramal]['Tramo'].to_list()[0].split('-')[1]
+                
+                target_link = f'{node_id}-{end_tramo_name}'
                 new_flow = float(self.current_metrics.link_data[target_link]['max_flow'])
                 
                 if abs(new_flow - old_flow[ramal]) / old_flow[ramal] > 0.05:
@@ -1124,7 +1131,7 @@ class DynamicSolutionEvaluator:
             )
 
             if best_path:
-                path_gdf = self.shared_path_finder.get_simplified_path(tolerance=config.TOLERANCE)
+                path_gdf = self.shared_path_finder.get_simplified_path(tolerance=config.TOLERANCE, min_distance=config.MIN_NODE_DISTANCE_M)
 
                 if path_gdf is not None:
                     # Ensure we operate on the geometry column safely
@@ -1163,7 +1170,7 @@ class DynamicSolutionEvaluator:
             else:
                 return [], None, pair  # Failed to find path
 
-        return path_gdfs, target_node_metadata, pair
+        return path_gdfs, target_node_metadata, pairs
 
     def _run_sewer_pipeline(
             self,
@@ -1197,8 +1204,8 @@ class DynamicSolutionEvaluator:
 
             # Build flows dictionary
             flows_dict = {}
-            for i, gdf in enumerate(new_path_gdfs):
-                ramal_name = str(i)
+            for gdf in new_path_gdfs:
+                ramal_name = gdf['node_ramal'].item()
                 flows_dict[ramal_name + ".0"] = gdf["total_flow"].iloc[0]
 
             # Initialize pipeline
@@ -1247,6 +1254,9 @@ class DynamicSolutionEvaluator:
         return out_gpkg
 
 
+
+
+
     def evaluate_solution(
             self,
             active_pairs: List[CandidatePair],
@@ -1285,7 +1295,16 @@ class DynamicSolutionEvaluator:
         print(f"  [Sticky] Reusing {len(active_pairs) - len(new_active_pairs)} paths, generating {len(new_active_pairs)} new.")
 
         # 5. Generate paths for new pairs only
-        new_path_gdfs, target_node_metadata, pair = self._generate_paths(new_active_pairs)
+        new_path_gdfs, target_node_metadata, pairs = self._generate_paths(new_active_pairs)
+        # 1. Crear un diccionario temporal para búsqueda rápida por node_id
+        pairs_map = {p['node_id']: p for p in pairs}
+        
+        # 2. Recorrer active_pairs y actualizar si existe coincidencia
+        for active in active_pairs:
+            n_id = active.get('node_id')
+            if n_id in pairs_map:
+                active.update(pairs_map[n_id])
+        
         if not target_node_metadata:
             return None, None
 
@@ -1294,7 +1313,7 @@ class DynamicSolutionEvaluator:
             if not gdf.empty:
                 self.cumulative_paths[gdf['node_id'].iloc[0]] = gdf
 
-        active_pairs[-1] = pair  # Update last pair with target metadata
+
 
         # 7. Save case summary
         self._save_case_summary(case_dir, active_pairs, solution_name)
@@ -1302,6 +1321,9 @@ class DynamicSolutionEvaluator:
         # 8. Prepare input GPKG for sewer design (rut_03)
         new_path_gdfs = list(self.cumulative_paths.values())
         input_gpkg = self._save_input_gpkg_for_rut03(new_path_gdfs, case_dir)
+       
+        
+        
 
         # 9. Run sewer pipeline design
         out_gpkg = self._run_sewer_pipeline(

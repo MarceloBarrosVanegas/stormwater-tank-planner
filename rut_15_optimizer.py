@@ -38,17 +38,13 @@ import config
 config.setup_sys_path()
 
 from rut_02_elevation import ElevationGetter, ElevationSource
-from rut_02_get_flodded_nodes import WeightedCandidateSelector
 from rut_13_cost_functions import CostCalculator
-from rut_14_swmm_modifier import SWMMModifier
+from rut_15_dashboard import EvolutionDashboardGenerator
 from rut_17_comparison_reporter import ScenarioComparator
 from rut_26_hydrological_impact import HydrologicalImpactAssessment
-from rut_15_dashboard import EvolutionDashboardGenerator
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-from matplotlib.patches import FancyBboxPatch
-from matplotlib.ticker import MaxNLocator, FuncFormatter
+
+
 
 DYNAMIC_EVALUATOR_AVAILABLE = True
 
@@ -585,26 +581,55 @@ class GreedyTankOptimizer:
             
             # Risk Proxy (Residual Flood Damage)
             residual_damage = self.current_metrics.total_flooding_volume * self.flooding_cost_per_m3
+            
+            # Calculate MARGINAL values
+            if results:
+                prev = results[-1]
+                marginal_cost = self.current_metrics.cost - prev['cost_total']
+                marginal_reduction = prev['flooding_volume'] - self.current_metrics.total_flooding_volume
+                marginal_tank_volume = total_tank_volume - prev['total_tank_volume']
+            else:
+                marginal_cost = self.current_metrics.cost
+                marginal_reduction = self.baseline_metrics.total_flooding_volume - self.current_metrics.total_flooding_volume
+                marginal_tank_volume = total_tank_volume
+            
+            # Get current tank's individual data
+            current_tank_cost = cand.get('cost_tank', 0) if cand.get('is_tank') else 0
+            current_tank_land_cost = cand.get('cost_land', 0) if cand.get('is_tank') else 0
+            current_tank_volume = cand.get('tank_volume_simulation', 0) if cand.get('is_tank') else 0
 
             results.append({
                 # --- Identification ---
                 'step': iteration,
                 'n_tanks': n_tanks,
                 'added_node': cand['node_id'],
+                'added_predio': cand.get('predio_id', ''),
                 
-                # --- Cost Breakdown (Raw Float) ---
-                'cost_total': self.current_metrics.cost, # This will be updated below
+                # --- Cost Breakdown (Cumulative) ---
+                'cost_total': self.current_metrics.cost,
                 'cost_links': cost_link,
                 'cost_tanks': total_tank_cost,
                 'cost_land': total_land_cost,
-                # Placeholder for replacement cost (invented as requested)
                 'cost_replacements': cost_link * 0.20, 
                 
-                # --- Hydraulic Performance ---
+                # --- Cost Breakdown (MARGINAL - This Tank Only) ---
+                'marginal_cost': marginal_cost,
+                'marginal_tank_cost': current_tank_cost,
+                'marginal_land_cost': current_tank_land_cost,
+                'marginal_tank_volume': marginal_tank_volume,
+                
+                # --- Hydraulic Performance (Cumulative) ---
                 'flooding_volume': self.current_metrics.total_flooding_volume,
                 'flooding_reduction': self.baseline_metrics.total_flooding_volume - self.current_metrics.total_flooding_volume,
                 'outfall_peak_flow': self.current_metrics.total_max_outfall_flow,
                 'flooded_nodes_count': self.current_metrics.flooded_nodes_count,
+                
+                # --- Hydraulic Performance (MARGINAL - This Tank Only) ---
+                'marginal_reduction': marginal_reduction,
+                
+                # --- Efficiency Metrics ---
+                'efficiency_m3_per_dollar': marginal_reduction / marginal_cost if marginal_cost > 0 else 0,
+                'cost_per_m3_reduced': marginal_cost / marginal_reduction if marginal_reduction > 0 else 0,
                 
                 # --- Network Health ---
                 'surcharged_links_count': self.current_metrics.surcharged_links_count,
@@ -613,6 +638,7 @@ class GreedyTankOptimizer:
                 
                 # --- Infrastructure Specs ---
                 'total_tank_volume': total_tank_volume,
+                'current_tank_volume': current_tank_volume,
                 
                 # --- Economic Risk (Proxy) ---
                 'residual_damage_usd': residual_damage,
@@ -620,131 +646,9 @@ class GreedyTankOptimizer:
                 
                 # --- Legacy/Display ---
                 'cost_display': format_currency(self.current_metrics.cost),
-                'cost': format_currency(self.current_metrics.cost), # Keep for backward compatibility if needed
+                'cost': format_currency(self.current_metrics.cost),
                 'flooding_remaining': self.current_metrics.total_flooding_volume 
             })
-            
-            print(results[-1])
-            
-            #
-            # # === BACKUP STATE FOR POTENTIAL ROLLBACK ===
-            # if hasattr(self.evaluator, 'last_designed_gdf') and self.evaluator.last_designed_gdf is not None:
-            #     self.evaluator.last_designed_gdf_backup = self.evaluator.last_designed_gdf.copy()
-            #
-            #
-            # # === ECONOMIC TRACKING (for graphing) ===
-            # # Get CLIMADA damage from evaluator
-            # current_damage = getattr(self.evaluator, 'last_flood_damage_usd', 0)
-            # baseline_damage = getattr(self.evaluator, 'baseline_flood_damage', 0)
-            #
-            # # Get Infrastructure Benefit (Deferred Investment savings)
-            # infrastructure_benefit = getattr(self.evaluator, 'last_economic_result', {}).get('infrastructure_benefit', 0)
-            #
-            # # Total Avoided Cost = CLIMADA savings + Infrastructure Benefit
-            # climada_savings = baseline_damage - current_damage
-            # cost_saved = climada_savings + infrastructure_benefit
-            #
-            # # Get flooding volume from metrics for display
-            # if hasattr(self.evaluator, 'last_metrics') and self.evaluator.last_metrics:
-            #     flooding_vol_display = self.evaluator.last_metrics.total_flooding_volume
-            # else:
-            #     flooding_vol_display = flooding_vol
-            # baseline_flood = self.evaluator.baseline_metrics.total_flooding_volume
-            # flooding_reduced = baseline_flood - flooding_vol_display
-    
-            # print(f"  [Economics] Baseline CLIMADA Damage: ${baseline_damage:,.2f}")
-            # print(f"  [Economics] Current CLIMADA Damage:  ${current_damage:,.2f}")
-            # print(f"  [Economics] Avoided Cost:            ${cost_saved:,.2f}")
-        #
-        # # Track for plotting
-        # economic_history.append({
-        #     'iteration': iteration,
-        #     'cost': cost,
-        #     'savings': cost_saved,
-        #     'n_tanks': len(active_candidates),
-        #     'flooding_reduced': flooding_reduced,
-        #     'flooding_remaining': flooding_vol_display,
-        #     'baseline_flooding': baseline_flood
-        # })
-        #
-        # # Calculate benefit-to-cost ratio
-        # if cost > 0:
-        #     benefit_ratio = cost_saved / cost
-        # else:
-        #     benefit_ratio = float('inf')
-        #
-        # print(f"  [Economic] Cost: ${cost:,.0f} | Savings: ${cost_saved:,.0f} | B/C Ratio: {benefit_ratio:.2f}")
-        #
-        # # === GENERATE ECONOMIC GRAPH PER ITERATION (only if config changed) ===
-        # current_config = tuple(sorted([c['node_id'] for c in active_candidates]))
-        # if economic_history and current_config != last_tank_config:
-        #     self._plot_economic_curve(economic_history, iteration)
-        #     last_tank_config = current_config
-        # elif current_config == last_tank_config:
-        #     print(f"  [Graph] Skipped (config unchanged)")
-        #
-        # # === BREAKEVEN CHECK ===
-        # # Stop when cost >= savings * multiplier (e.g., multiplier=1.5 allows 50% more investment)
-        # threshold = cost_saved * self.breakeven_multiplier
-        # if self.stop_at_breakeven and cost >= threshold:
-        #     print(f"\n  *** BREAKEVEN REACHED ***")
-        #     print(f"  Construction cost (${cost:,.0f}) >= Threshold (${threshold:,.0f})")
-        #     print(f"  [Threshold = Savings × {self.breakeven_multiplier:.2f}]")
-        #     print(f"  Stopping optimization at {len(active_candidates)} tanks.")
-        #     break
-        #
-        #
-  
-        #
-        #
-        #     # === PRUNING: REMOVE TANKS BASED ON UTILIZATION AND SYSTEMIC IMPACT ===
-        #     # Only prune if: (1) stored_volume < MIN, AND (2) flood reduction is minimal
-        #     tanks_to_remove = []
-        #
-        #
-        #     if hasattr(self.evaluator, 'last_metrics') and self.evaluator.last_metrics and self.evaluator.last_metrics.tank_utilization:
-        #         util_map = self.evaluator.last_metrics.tank_utilization
-        #
-        #         for ac in active_candidates:
-        #             # Tank name format: tank_{predio} (matches rut_16)
-        #             tk_name = f"tank_{ac['predio_id']}"
-        #
-        #             if tk_name in util_map:
-        #                 max_depth = util_map[tk_name]['max_depth']
-        #                 # Calculate stored volume approx: (Vol / Depth) * UsedDepth
-        #                 used_vol = (ac['total_volume'] / TANK_DEPTH) * max_depth
-        #                 utilization_pct = (used_vol / ac['total_volume']) * 100 if ac['total_volume'] > 0 else 0
-        #
-        #                 # New logic: Only prune if utilization is very low (< 20%)
-        #                 # Tanks with low stored_volume but decent utilization may have systemic impact
-        #                 if used_vol < MIN_TANK_VOLUME and utilization_pct < config.TANK_MIN_UTILIZATION_PCT:
-        #                     tanks_to_remove.append(ac)
-        #                     # Increment failure count
-        #                     node_id = ac['node_id']
-        #                     pruning_failures[node_id] = pruning_failures.get(node_id, 0) + 1
-        #                     retries_left = config.MAX_PRUNE_RETRIES - pruning_failures[node_id]
-        #                     print(f"  [Prune] {tk_name}: Stored {used_vol:.0f} m³ ({utilization_pct:.1f}%) - LOW IMPACT (Retries left: {retries_left})")
-        #                 elif used_vol < MIN_TANK_VOLUME:
-        #                     # Low stored but good utilization % - keep it (systemic impact likely)
-        #                     print(f"  [Keep] {tk_name}: Stored {used_vol:.0f} m³ but {utilization_pct:.1f}% utilization - possible systemic impact")
-        #
-        #
-        #     for ac in tanks_to_remove:
-        #         node_id = ac['node_id']
-        #         predio_idx = ac['predio_id']
-        #         # Restore area to predio
-        #         tank_area = (ac['total_volume'] / TANK_DEPTH) * OCCUPATION_FACTOR
-        #         predio_capacity[predio_idx]['used_area'] -= tank_area
-        #         predio_capacity[predio_idx]['n_tanks'] -= 1
-        #         # Remove from used_nodes so it could be reconsidered later
-        #         used_nodes.discard(node_id)
-        #         # Remove from active
-        #         active_candidates.remove(ac)
-
-
-
-
-
 
 
 
@@ -777,10 +681,7 @@ class GreedyTankOptimizer:
             df_results.to_csv(csv_path, index=False)
             print(f"  [Tracking] Saved CSV: {csv_path}")
 
-        # # === GENERATE ECONOMIC GRAPH ===
-        # if economic_history:
-        #     self._plot_economic_curve(economic_history)
-        #
+
         # # === GENERATE SUMMARY TEXT FILE ===
         # if active_candidates and self.evaluator:
         #     self._generate_summary_report(active_candidates, economic_history, predio_capacity)
@@ -835,155 +736,6 @@ class GreedyTankOptimizer:
 
 
 
-
-
-
-    def _plot_economic_curve(self, economic_history: list, current_iteration: int = None):
-        """Generate and save the Cost vs Savings economic curve."""
-        import matplotlib.pyplot as plt
-        from pathlib import Path
-        
-        iterations = [e['iteration'] for e in economic_history]
-        costs = [e['cost'] / 1e6 for e in economic_history]  # Convert to millions
-        savings = [e['savings'] / 1e6 for e in economic_history]
-        n_tanks = [e['n_tanks'] for e in economic_history]
-        
-        fig, ax1 = plt.subplots(figsize=(14, 7))
-        
-        # Plot Cost (red)
-        color_cost = '#e74c3c'
-        ax1.set_xlabel('Iteración', fontsize=12)
-        ax1.set_ylabel('Valor ($M)', fontsize=12)
-        line1 = ax1.plot(iterations, costs, color=color_cost, marker='o', linewidth=2, 
-                         label='Costo Construcción', markersize=8)
-        
-        # Plot Savings (green) on same axis
-        color_savings = '#27ae60'
-        line2 = ax1.plot(iterations, savings, color=color_savings, marker='s', linewidth=2,
-                         label='Ahorro por Flooding Evitado', markersize=8)
-        
-        ax1.set_ylim(bottom=0)
-        
-        # Fill area between curves
-        ax1.fill_between(iterations, costs, savings, 
-                         where=[s > c for s, c in zip(savings, costs)],
-                         alpha=0.2, color=color_savings, label='Beneficio Neto (+)')
-        ax1.fill_between(iterations, costs, savings,
-                         where=[s <= c for s, c in zip(savings, costs)],
-                         alpha=0.2, color=color_cost, label='Pérdida Neta (-)')
-        
-        # Secondary axis for number of tanks
-        ax2 = ax1.twinx()
-        color_tanks = '#3498db'
-        ax2.set_ylabel('Número de Tanques', color=color_tanks, fontsize=12)
-        line3 = ax2.bar(iterations, n_tanks, alpha=0.3, color=color_tanks, label='Tanques', width=0.4)
-        ax2.tick_params(axis='y', labelcolor=color_tanks)
-        ax2.set_ylim(bottom=0)
-        # Force integer ticks for tank count
-        from matplotlib.ticker import MaxNLocator
-        ax2.yaxis.set_major_locator(MaxNLocator(integer=True))
-        
-        # Legend
-        lines = line1 + line2
-        labels = [l.get_label() for l in lines]
-        ax1.legend(lines, labels, loc='upper left', fontsize=10)
-        
-        # === STATISTICS BOX ===
-        last_entry = economic_history[-1]
-        last_cost = last_entry['cost']
-        last_savings = last_entry['savings']
-        last_n_tanks = last_entry['n_tanks']
-        flooding_reduced = last_entry.get('flooding_reduced', 0)
-        
-        bc_ratio = last_savings / last_cost if last_cost > 0 else float('inf')
-        net_benefit = last_savings - last_cost
-        roi_pct = ((last_savings - last_cost) / last_cost * 100) if last_cost > 0 else 0
-        
-        # Residual risk calculation
-        flooding_remaining = last_entry.get('flooding_remaining', 0)
-        baseline_flooding = last_entry.get('baseline_flooding', 0)
-        residual_cost = flooding_remaining * self.flooding_cost_per_m3 if hasattr(self, 'flooding_cost_per_m3') else flooding_remaining * 1250
-        pct_controlled = ((baseline_flooding - flooding_remaining) / baseline_flooding * 100) if baseline_flooding > 0 else 0
-        
-        stats_text = (
-            f"═══ ESTADÍSTICAS ITER {current_iteration or len(iterations)} ═══\n"
-            f"Tanques Activos: {last_n_tanks}\n"
-            f"─────────────────────\n"
-            f"Costo Construcción: ${last_cost/1e6:.2f}M\n"
-            f"Ahorro Flooding:    ${last_savings/1e6:.2f}M\n"
-            f"─────────────────────\n"
-            f"Beneficio Neto:     ${net_benefit/1e6:.2f}M\n"
-            f"Ratio B/C:          {bc_ratio:.2f}\n"
-            f"ROI:                {roi_pct:.1f}%\n"
-            f"─────────────────────\n"
-            f"Flooding Reducido:  {flooding_reduced:,.0f} m³\n"
-            f"═══ RIESGO RESIDUAL ═══\n"
-            f"Flooding Restante:  {flooding_remaining:,.0f} m³\n"
-            f"% Controlado:       {pct_controlled:.1f}%"
-        )
-        
-        # Position stats box on right side
-        props = dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.95, edgecolor='orange')
-        ax1.text(0.98, 0.55, stats_text, transform=ax1.transAxes, fontsize=10,
-                verticalalignment='center', horizontalalignment='right',
-                bbox=props, fontfamily='monospace')
-        
-        # Title and grid
-        ax1.set_title('Análisis Económico: Costo vs Ahorro por Iteración', fontsize=14, fontweight='bold')
-        ax1.grid(True, alpha=0.3)
-        
-        # Find and mark breakeven point if exists
-        breakeven_found = False
-        for i, (c, s) in enumerate(zip(costs, savings)):
-            if c >= s:
-                ax1.axvline(x=iterations[i], color='purple', linestyle='--', linewidth=2, alpha=0.7)
-                ax1.annotate(f'BREAKEVEN\nIter {iterations[i]}', 
-                            xy=(iterations[i], c), xytext=(iterations[i]+0.3, c*1.05),
-                            fontsize=10, color='purple', fontweight='bold',
-                            arrowprops=dict(arrowstyle='->', color='purple'))
-                breakeven_found = True
-                break
-        
-        plt.tight_layout()
-        
-        # Save to optimization_results folder with iteration number
-        save_dir = Path("optimization_results")
-        save_dir.mkdir(exist_ok=True)
-        
-        if current_iteration:
-            save_path = save_dir / f"economic_analysis_iter_{current_iteration:02d}.png"
-        else:
-            save_path = save_dir / "economic_analysis.png"
-            
-        fig.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  [Graph] Saved: {save_path}")
-        plt.close(fig)
-
-    def plot_sequence_curve(self, df_results, save_path=None):
-        import matplotlib.pyplot as plt
-        if df_results.empty: return
-        
-        fig, ax1 = plt.subplots(figsize=(10, 6))
-        
-        color = 'tab:red'
-        ax1.set_xlabel('Número de Tanques (Agregados por Ranking)')
-        ax1.set_ylabel('Costo Total ($)', color=color)
-        ax1.plot(df_results['n_tanks'], df_results['cost'], color=color, marker='o', label='Costo')
-        ax1.tick_params(axis='y', labelcolor=color)
-        
-        ax2 = ax1.twinx()  
-        color = 'tab:blue'
-        ax2.set_ylabel('Volumen Inundación (m3)', color=color)  
-        ax2.plot(df_results['n_tanks'], df_results['flooding_remaining'], color=color, marker='s', linestyle='--', label='Inundación Restante')
-        ax2.tick_params(axis='y', labelcolor=color)
-        
-        plt.title('Análisis Secuencial: Costo vs Beneficio Marginal')
-        ax1.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path)
-            print(f"Curve saved to {save_path}")
 
     def _generate_summary_report(self, active_candidates: list, economic_history: list, predio_capacity: dict):
         """Generate a text file with optimization summary results."""

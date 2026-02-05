@@ -87,7 +87,7 @@ class PhysicalNetwork:
         geoms = shapely.from_ragged_array(shapely.GeometryType.LINESTRING, flat_coords, (offsets,))
         # 4. Crear GeoDataFrame
         gdf = gpd.GeoDataFrame(self.links_df, geometry=geoms, index=self.links_df['coords'].index, crs=config.PROJECT_CRS)
-        return gdf
+        return gdf , nodes_df
     
     
     def _identify_ramales(self):
@@ -284,7 +284,7 @@ class NetworkExporter:
             
             # 2. Build Physical
             physical = PhysicalNetwork(model)
-            gdf = physical.build()
+            gdf, nodes_df= physical.build()
             
             # 3. Hydraulics (Optional)
             if run_hydraulics:
@@ -323,13 +323,13 @@ class NetworkExporter:
                 gdf.to_file(output_gpkg, driver='GPKG')
                 # print("Done.")
                 
-            return gdf
+            return gdf, nodes_df
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             print(f"CRITICAL FAILURE: {e}")
-            return None
+            return None, None
 
 if __name__ == "__main__":
     inp_file = str(config.SWMM_FILE)

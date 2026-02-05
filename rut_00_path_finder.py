@@ -12,6 +12,8 @@ from shapely.geometry import LineString
 import geopandas as gpd
 from shapely.geometry import Point, MultiPoint
 from shapely.ops import split, linemerge, unary_union
+from rdp import rdp
+from simplification import cutil
 
 import config
 config.setup_sys_path()
@@ -589,79 +591,173 @@ class PathFinder:
                 acc = 0.0
         return parts
 
+
+    def simplify_gdf(self,
+        gdf: gpd.GeoDataFrame,
+        method: str = "rdp",       # "rdp" o "vw"
+        tolerance: float = 5.0,    # epsilon para RDP, threshold para VW
+        protected_points: list = None,  # [(x,y), ...] puntos a preservar
+        min_distance: float = 0    # Distancia mínima entre puntos resultantes
+    ) -> gpd.GeoDataFrame:
+        """
+        Simplifica las geometrías de un GeoDataFrame de LineStrings.
+    
+        Args:
+            gdf: GeoDataFrame con geometrías LineString
+            method: "rdp" (por distancia) o "vw" (por ángulo/área)
+            tolerance: epsilon para RDP, threshold para VW
+            protected_points: Lista de (x,y) de puntos que NO deben eliminarse
+                             (ej: intersecciones de vías)
+            min_distance: Distancia mínima entre puntos finales (metros).
+                         Después de simplificar, elimina puntos más cercanos que esto.
+    
+        Returns:
+            GeoDataFrame con las geometrías simplificadas
+        """
+        # Convertir protected_points a set de tuplas redondeadas para búsqueda rápida
+        protected_set = set()
+        if protected_points:
+            for pt in protected_points:
+                protected_set.add((round(pt[0], 1), round(pt[1], 1)))
+        
+        rows = []
+    
+        for idx, row in gdf.iterrows():
+            coords = np.array(row.geometry.coords)
+            points = coords[:, :2].copy()
+            
+            if not protected_set:
+                # Sin puntos protegidos: simplificación normal
+                if method == "rdp":
+                    simplified = rdp(points, epsilon=tolerance)
+                elif method == "vw":
+                    simplified = cutil.simplify_coords_vw(points, tolerance)
+                else:
+                    raise ValueError(f"method debe ser 'rdp' o 'vw', recibió: '{method}'")
+            else:
+                # Con puntos protegidos: simplificar por segmentos
+                # Encontrar índices de puntos protegidos
+                protected_indices = [0]  # Siempre mantener inicio
+                for i, pt in enumerate(points):
+                    if (round(pt[0], 1), round(pt[1], 1)) in protected_set:
+                        protected_indices.append(i)
+                protected_indices.append(len(points) - 1)  # Siempre mantener fin
+                protected_indices = sorted(set(protected_indices))
+                
+                # Simplificar cada segmento entre puntos protegidos
+                simplified_list = []
+                for j in range(len(protected_indices) - 1):
+                    start_idx = protected_indices[j]
+                    end_idx = protected_indices[j + 1]
+                    segment = points[start_idx:end_idx + 1]
+                    
+                    if len(segment) <= 2:
+                        seg_simplified = segment
+                    elif method == "rdp":
+                        seg_simplified = rdp(segment, epsilon=tolerance)
+                    elif method == "vw":
+                        seg_simplified = cutil.simplify_coords_vw(segment, tolerance)
+                    else:
+                        raise ValueError(f"method debe ser 'rdp' o 'vw', recibió: '{method}'")
+                    
+                    # Añadir evitando duplicar punto de unión
+                    if simplified_list:
+                        simplified_list.extend(seg_simplified[1:])
+                    else:
+                        simplified_list.extend(seg_simplified)
+                
+                simplified = np.array(simplified_list)
+            
+            # ================================================================
+            # FILTRO FINAL: Eliminar puntos muy cercanos (min_distance)
+            # ================================================================
+            if min_distance and min_distance > 0 and len(simplified) > 2:
+                filtered_coords = [simplified[0]]  # Siempre mantener inicio
+                for pt in simplified[1:-1]:  # Recorrer puntos intermedios
+                    last_pt = filtered_coords[-1]
+                    dist = math.sqrt((pt[0] - last_pt[0])**2 + (pt[1] - last_pt[1])**2)
+                    if dist >= min_distance:
+                        filtered_coords.append(pt)
+                filtered_coords.append(simplified[-1])  # Siempre mantener fin
+                simplified = np.array(filtered_coords)
+    
+            row_new = row.copy()
+            row_new.geometry = LineString(simplified)
+            rows.append(row_new)
+    
+        return gpd.GeoDataFrame(rows, crs=gdf.crs)
+
+
     def get_simplified_path(
         self,
-        tolerance: float = 20,
+        tolerance: float = 2,
+        min_distance: float = 30,  # Distancia mínima entre intersecciones a preservar
         must_keep: list[tuple[float, float]] = None
     ) -> gpd.GeoDataFrame | None:
         """
-        Simplifica la ruta pero preserva:
-          1) todos los vértices que queden tras un primer .simplify(preserve_topology=True)
-          2) los nodos de self.shortest_path
-          3) cualquier punto adicional en must_keep
+        Simplifica la ruta preservando intersecciones reales de vías.
+        
+        Una intersección real es un nodo del grafo con grado >= 3 
+        (3 o más calles conectadas).
+        
+        Args:
+            tolerance: Tolerancia para simplificación RDP (metros)
+            min_distance: Distancia mínima entre puntos protegidos (metros)
+                         Si dos intersecciones están más cerca, solo se mantiene una
+            must_keep: Puntos adicionales a preservar (opcional)
+        
+        Returns:
+            GeoDataFrame con la línea simplificada o None
         """
-        from shapely.ops import linemerge
         poly_gdf = self.get_path_as_gdf()
         if poly_gdf is None:
             return None
-    
-        # nos aseguramos de usar el CRS correcto
-        poly_gdf = poly_gdf.to_crs(self.source_crs)
-        merged: LineString = poly_gdf.geometry.iloc[0]
-    
-        # 1) extraemos los vértices "seguros" del primer simplify con preserve_topology
-        base_simpl = merged.simplify(15, preserve_topology=True)
         
+        # ================================================================
+        # IDENTIFICAR INTERSECCIONES REALES (grado >= 3)
+        # ================================================================
+        raw_intersection_points = []
+        for node_id in self.shortest_path:
+            if self.graph.degree(node_id) >= 3:
+                x = self.graph.nodes[node_id]['x']
+                y = self.graph.nodes[node_id]['y']
+                raw_intersection_points.append((x, y))
         
-        safe_pts = []
-        # Check geometry type to avoid Shapely error when accessing .coords on MultiLineString
-        if base_simpl.geom_type == 'LineString':
-            # Es LineString simple
-            safe_pts = list(base_simpl.coords)
-        elif base_simpl.geom_type == 'MultiLineString':
-            # Es MultiLineString - extraer coordenadas de cada segmento
-            for line in base_simpl.geoms:
-                safe_pts.extend(list(line.coords))
-        else:
-            # Fallback: intentar convertir a LineString con linemerge
-            merged_line = linemerge(base_simpl)
-            if merged_line.geom_type == 'LineString':
-                safe_pts = list(merged_line.coords)
+        print(f"  [Simplify] Intersecciones detectadas: {len(raw_intersection_points)}")
+        
+        # ================================================================
+        # FILTRAR POR DISTANCIA MÍNIMA
+        # ================================================================
+        intersection_points = []
+        for pt in raw_intersection_points:
+            if not intersection_points:
+                # Primer punto siempre se agrega
+                intersection_points.append(pt)
             else:
-                # Si aún es multi-parte, extraer de cada geometría
-                for line in merged_line.geoms:
-                    safe_pts.extend(list(line.coords))
+                # Calcular distancia al último punto agregado
+                last_pt = intersection_points[-1]
+                dist = math.sqrt((pt[0] - last_pt[0])**2 + (pt[1] - last_pt[1])**2)
+                if dist >= min_distance:
+                    intersection_points.append(pt)
+        
+        print(f"  [Simplify] Después de filtro min_distance={min_distance}m: {len(intersection_points)} puntos protegidos")
+        
+        # Agregar puntos adicionales si se especifican
+        if must_keep:
+            intersection_points.extend(must_keep)
+        
+        # Usar tu función simplify_gdf con puntos protegidos y filtro de distancia
+        return self.simplify_gdf(
+            poly_gdf, 
+            method="rdp", 
+            tolerance=tolerance,
+            protected_points=intersection_points if intersection_points else None,
+            min_distance=min_distance
+        )
     
-        # 2) construimos el conjunto completo de splitters
-        node_pts = [
-            Point(self.graph.nodes[n]['x'], self.graph.nodes[n]['y'])
-            for n in self.shortest_path
-        ]
-        extra_pts = [Point(x, y) for x, y in (must_keep or [])]
-        splitter = MultiPoint(node_pts + extra_pts + [Point(x, y) for x, y in safe_pts])
     
-        # 3) cortamos en todos esos puntos
-        raw = split(merged, splitter)
-        segments = list(raw.geoms) if hasattr(raw, 'geoms') else [raw]
     
-        # 4) dividimos cada segmento para que no supere tolerance de longitud
-        pieces = []
-        for seg in segments:
-            pieces.extend(self.split_by_length(seg, tolerance))
-    
-        # 5) simplificamos cada pieza, preserve_topology evita borrar extremos
-        simplified = [
-            seg.simplify(tolerance, preserve_topology=True)
-            for seg in pieces
-        ]
-    
-        # 6) unimos de nuevo
-        uni = unary_union(simplified)
-        final = uni if isinstance(uni, LineString) else linemerge(uni)
-    
-        # 7) devolvemos GeoDataFrame en source_crs
-        return gpd.GeoDataFrame(geometry=[final], crs=self.source_crs)
-    
+
 
     def run(self,
             title: str,
