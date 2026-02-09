@@ -3,6 +3,7 @@ import geopandas as gpd
 from pathlib import Path
 import json
 import numpy as np
+from natsort import natsorted, index_natsorted
 
 import config
 config.setup_sys_path()
@@ -873,9 +874,15 @@ class SWMMModifier:
         
         added_nodes = set()
         tank_volume_dict = {}
-        
+
+
+        # Usando index_natsorted para ordenar por Ramal y Pozo de forma natural
+        sorted_gdf = last_design_gdf.iloc[
+            index_natsorted(last_design_gdf[['Ramal', 'Pozo']].apply(tuple, axis=1))
+        ]
+
         # --- Process each ramal (branch) ---
-        for ramal, ramal_df in last_design_gdf.groupby('Ramal'):
+        for ramal, ramal_df in sorted_gdf.groupby('Ramal', sort=False):
             ramal_geom = SeccionLlena.section_str2float(
                 ramal_df['D_ext'],
                 return_all=True,
@@ -901,27 +908,25 @@ class SWMMModifier:
             for row_number, row in enumerate(ramal_df.itertuples()):
                 # Determine if this is the last node
                 is_last_node = (row_number == total_rows - 1)
+                is_first_node = (row_number == 0)
                 node_end = row.Pozo
-                node_end_elev = row.ZFF
-                node_end_depth = row.HF
+                node_end_elev = min(row.ZFF, ramal_df.iloc[row_number + 1].ZFI) if not is_last_node else row.ZFF
+                node_end_depth = max(row.HF, ramal_df.iloc[row_number + 1].HI) if not is_last_node else row.HF
                 manning_roughness = row.Rug
                 length = row.L
-                
-                if target_type == 'tank':
-                    outlet_offset = row.SALTO if not is_last_node else config.TANK_DEPTH_M
-                else:
-                    outlet_offset = row.SALTO
+                outlet_offset = ramal_df.iloc[row_number + 1].SALTO if not is_last_node else config.TANK_DEPTH_M if target_type == 'tank' else 0.0
+
 
                 # Determine start node and inlet offset
-                if row_number == 0:
+                if is_first_node:
                     node_start = node_metadata['node_id']
                     existing_height = self.get_existing_conduit_geom1(node_start)
                     inlet_offset = round(config.CAPACITY_MAX_HD * existing_height, 2)
-                    tramo = f"{node_start}-{node_end}"
+                    tramo = f"{node_start}-{node_end}" if not is_last_node else f"{node_start}-{target_id}"
                 else:
                     node_start = previous_node
                     inlet_offset = 0
-                    tramo = row.Tramo
+                    tramo = row.Tramo if not is_last_node else f"{node_start}-{target_id}"
     
                 # Get cross-section data
                 shape_swmm = ramal_seccion.iloc[row_number]
@@ -1057,7 +1062,6 @@ class SWMMModifier:
         return final_inp_path
         
 
-
 if __name__ == "__main__":
     # =========================================================================
     # DEBUG: Iteración 20 - Analizar por qué no existe ramal 20
@@ -1065,7 +1069,7 @@ if __name__ == "__main__":
     inp_file = "COLEGIO_TR25_v6.inp"
     
     # CAMBIAR ESTE PATH al GPKG de la iteración que falló
-    gpkg_file = r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Seq_Iter_20\Seq_Iter_20.gpkg'
+    gpkg_file = r'C:\Users\Alienware\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Seq_Iter_20\Seq_Iter_20.gpkg'
     
     if not os.path.exists(gpkg_file):
         print(f"[Error] No existe el archivo: {gpkg_file}")

@@ -113,55 +113,34 @@ class StormwaterOptimizationRunner:
             )
 
             try:
-                df_seq = greedy_opt.run_sequential()
+                result_object = greedy_opt.run_sequential()
+
+                return result_object
                 
-                print(f"\n{'='*60}")
-                print("SEQUENTIAL ANALYSIS RESULTS:")
-                print(f"{'='*60}")
-                print(df_seq.to_string(index=False))
+                # print(f"\n{'='*60}")
+                # print("SEQUENTIAL ANALYSIS RESULTS:")
+                # print(f"{'='*60}")
+                # print(df_seq.to_string(index=False))
+                #
+                # # Save results
+                # csv_path = self.work_dir / "sequential_results.csv"
+                # df_seq.to_csv(csv_path, index=False)
+                # print(f"\n  Saved: {csv_path}")
                 
-                # Save results
-                csv_path = self.work_dir / "sequential_results.csv"
-                df_seq.to_csv(csv_path, index=False)
-                print(f"\n  Saved: {csv_path}")
+                # # Generate Damage Curves (rut_20) - ITZI is always used
+                # print(f"\n  Generating flood damage curves...")
+                # try:
+                #     from rut_20_plot_damage_curves import plot_all_curves_combined, plot_individual_curves, save_curves_as_csv
+                #     curves_dir = self.work_dir / "damage_curves"
+                #     curves_dir.mkdir(parents=True, exist_ok=True)
+                #     plot_all_curves_combined(output_dir=curves_dir)
+                #     plot_individual_curves(output_dir=curves_dir)
+                #     save_curves_as_csv(output_dir=curves_dir)
+                #     print(f"  Damage curves saved to: {curves_dir}")
+                # except Exception as e:
+                #     print(f"  Warning: Could not generate damage curves: {e}")
                 
-                # Plot Curve
-                curve_path = self.work_dir / "sequential_curve.png"
-                greedy_opt.plot_sequence_curve(df_seq, save_path=str(curve_path))
-                
-                # Generate Damage Curves (rut_20) - ITZI is always used
-                print(f"\n  Generating flood damage curves...")
-                try:
-                    from rut_20_plot_damage_curves import plot_all_curves_combined, plot_individual_curves, save_curves_as_csv
-                    curves_dir = self.work_dir / "damage_curves"
-                    curves_dir.mkdir(parents=True, exist_ok=True)
-                    plot_all_curves_combined(output_dir=curves_dir)
-                    plot_individual_curves(output_dir=curves_dir)
-                    save_curves_as_csv(output_dir=curves_dir)
-                    print(f"  Damage curves saved to: {curves_dir}")
-                except Exception as e:
-                    print(f"  Warning: Could not generate damage curves: {e}")
-                
-                # Step 3.5: Hydrological Impact Assessment (Per Outfall)
-                print(f"\n  [Impact] Starting Hydrological Impact Assessment...")
-                try:
-                    # Find the latest successful Step INP (search recursively in subdirs for Seq_Iter)
-                    step_inps = sorted(list(self.work_dir.glob("**/model_Seq_Iter_*.inp")), key=lambda x: os.path.getmtime(x))
-                    if step_inps:
-                        final_solution_inp = step_inps[-1]
-                        print(f"  [Impact] Final Solution found for analysis: {final_solution_inp}")
-                        impact_eval = HydrologicalImpactAssessment(str(self.work_dir))
-                        impact_eval.run_assessment(
-                            baseline_inp=str(config.SWMM_FILE),
-                            solution_inp=str(final_solution_inp)
-                        )
-                        print(f"  [Impact] ✓ Hydrological Impact Assessment complete.")
-                    else:
-                        print(f"  [Impact] Warning: No Seq_Step INP files found to analyze.")
-                except Exception as e:
-                    print(f"  [Impact] Warning: Hydrological assessment failed: {e}")
-                    import traceback
-                    traceback.print_exc()
+      
                 
             except Exception as e:
                 print(f"  [Error] Sequential analysis failed: {e}")

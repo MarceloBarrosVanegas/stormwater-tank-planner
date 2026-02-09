@@ -619,9 +619,19 @@ class PathFinder:
         if protected_points:
             for pt in protected_points:
                 protected_set.add((round(pt[0], 1), round(pt[1], 1)))
-        
+
+        # 1) Explode multipart geometries -> one row per part
+        gdf_exp = gdf.explode(index_parts=False).reset_index(drop=True)
+
+        # 3) Compute lengths and select the longest
+        gdf_exp["geom_len"] = gdf_exp.geometry.length
+        idx_longest = gdf_exp["geom_len"].idxmax()
+
+        # 4) New GeoDataFrame with only the longest geometry row
+        gdf = gdf_exp.loc[[idx_longest]].drop(columns=["geom_len"])
+
+
         rows = []
-    
         for idx, row in gdf.iterrows():
             coords = np.array(row.geometry.coords)
             points = coords[:, :2].copy()

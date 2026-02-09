@@ -351,22 +351,7 @@ class DeferredInvestmentCost:
         self.spll = SeccionParcialmenteLlena()
         self.ps = PipeSizing()
 
-    @staticmethod
-    def extract_link_data(inp_path: str):
-        """
-        Extrae toda la información de conduits + nodos desde SWMM.
-        """
-        print(f"  [DeferredInvestmentCost] Leyendo INP: {inp_path}")
 
-        # Use new NetworkExporter class
-        exporter = NetworkExporter(inp_path)
-        # We don't save a file here, just want the dataframe
-        gdf = exporter.run()
-
-        if gdf is None or gdf.empty:
-            sys.exit("  [DeferredInvestmentCost] Error: Extractor returned empty data.")
-
-        return gdf
 
     def _classify_pz(self, diameter: float, in_offset: float) -> str:
         """Clasifica el tipo de pozo según diámetro y offset de entrada (salto)."""
@@ -1065,10 +1050,9 @@ class DeferredInvestmentCost:
         print("=" * 60)
 
         # Step 1: Extraer datos
-        if not self.flood_metrics:
-            self.swmm_gdf = self.extract_link_data(inp_path)
-        else:
-            self.swmm_gdf = self.flood_metrics.swmm_gdf.copy()
+        self.swmm_gdf = self.flood_metrics.swmm_gdf.copy()
+        self.swmm_gdf = self.swmm_gdf.dropna(axis=1, how="all")
+        self.swmm_gdf = self.swmm_gdf.drop(columns=['XX'], errors='ignore')
 
         # Step 2: Identificar tuberías fallando
         print(f"\n Tuberías fallando (h/D >= {self.capacity_threshold}) ---")

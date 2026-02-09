@@ -39,9 +39,9 @@ from rut_06_pipe_sizing import SeccionLlena, SeccionParcialmenteLlena, Capacidad
 from rut_02_get_flodded_nodes import CandidatePair
 from rut_13_cost_functions import CostCalculator
 from rut_14_swmm_modifier import SWMMModifier
-from rut_17_comparison_reporter import ScenarioComparator
-from rut_18_itzi_flood_model import run_itzi_for_case
-from rut_19_flood_damage_climada import calculate_flood_damage_climada
+# from rut_17_comparison_reporter import ScenarioComparator
+# from rut_18_itzi_flood_model import run_itzi_for_case
+# from rut_19_flood_damage_climada import calculate_flood_damage_climada
 from rut_20_avoided_costs import AvoidedCostRunner
 from rut_21_construction_cost import SewerConstructionCost
 from rut_27_model_metrics import MetricExtractor, SystemMetrics
@@ -451,7 +451,7 @@ class DynamicSolutionEvaluator:
 
         # Save directly to case directory
         gpkg_path = case_dir / "input_routes.gpkg"
-        input_gdf.to_file(str(gpkg_path), driver="GPKG")
+        input_gdf.to_file(str(gpkg_path), driver="GPKG", OVERWRITE='YES')
 
         return str(gpkg_path)
 
@@ -752,7 +752,7 @@ class DynamicSolutionEvaluator:
                 has_capacity, msg = self._check_predio_has_capacity(predio_id, source_volume)
                 
                 if has_capacity:
-                    print(f"  [Target] *** SELECTED: predio {predio_id} (OSM: {path_length:.1f}m) ***")
+                    print(f"  [Target] SELECTED: predio {predio_id} ({candidate['x'], candidate['y']}) (OSM: {path_length:.1f}m)")
                     return (candidate['x'], candidate['y'], target_type, candidate)
                 else:
                     print(f"  [Capacity] Predio {predio_id} skipped: {msg}")
@@ -899,10 +899,14 @@ class DynamicSolutionEvaluator:
             for node_id, gdf_path in self.cumulative_paths.items():
                 ramal = gdf_path['node_ramal'].item()
                 filtro_ramal = self.last_designed_gdf['Ramal'] ==  ramal
+                length_tramos = len(self.last_designed_gdf[filtro_ramal])
                 end_tramo_name = self.last_designed_gdf[filtro_ramal]['Tramo'].to_list()[0].split('-')[1]
-                
+
+                if length_tramos == 1:
+                    if gdf_path.target_type.item() == 'tank':
+                        end_tramo_name = 'tank_' + str(gdf_path['target_id'].item())
+
                 target_link = f'{node_id}-{end_tramo_name}'
-                
                 new_flow = float(self.current_metrics.link_data[target_link]['max_flow'])
                 old_flow[ramal] = float(gdf_path['total_flow'])
                 gdf_path['total_flow'] = new_flow
@@ -927,13 +931,18 @@ class DynamicSolutionEvaluator:
             # ====================================================================
             for node_id, gdf_path in self.cumulative_paths.items():
                 ramal = gdf_path['node_ramal'].item()
-                filtro_ramal = self.last_designed_gdf['Ramal'] ==  ramal
+                filtro_ramal = self.last_designed_gdf['Ramal'] == ramal
+                length_tramos = len(self.last_designed_gdf[filtro_ramal])
                 end_tramo_name = self.last_designed_gdf[filtro_ramal]['Tramo'].to_list()[0].split('-')[1]
-                
+
+                if length_tramos == 1:
+                    if gdf_path.target_type.item() == 'tank':
+                        end_tramo_name = 'tank_' + str(gdf_path['target_id'].item())
+
                 target_link = f'{node_id}-{end_tramo_name}'
                 new_flow = float(self.current_metrics.link_data[target_link]['max_flow'])
                 
-                if abs(new_flow - old_flow[ramal]) / old_flow[ramal] > 0.05:
+                if abs(new_flow - old_flow[ramal]) > 0.05 * old_flow[ramal]:  # Cambio >5%
                     print(f"  [Resize Iter {iteration}] Significant flow change detected on link {target_link}: "
                           f"old {old_flow[ramal]:.2f} m³/s -> new {new_flow:.2f} m³/s")
                     
@@ -1050,9 +1059,7 @@ class DynamicSolutionEvaluator:
             print(f"  [Warning] Max resize iterations ({config.MAX_RESIZE_ITERATIONS}) reached - some tanks may still have exceedance")
         
         # Convergencia exitosa (con o sin advertencia)
-        return False  # ✓ RETORNAR FALSE (sin problemas que requieran retry)
-
-
+        return False  # sin problemas que requieran retry
 
     def _generate_paths(self,
                        active_pairs: List[CandidatePair],
@@ -1254,9 +1261,6 @@ class DynamicSolutionEvaluator:
         return out_gpkg
 
 
-
-
-
     def evaluate_solution(
             self,
             active_pairs: List[CandidatePair],
@@ -1266,66 +1270,72 @@ class DynamicSolutionEvaluator:
     ) -> Tuple[float, float]:
         """
         Evaluate a complete solution using SewerPipeline + SWMM.
+        
+        Pipeline Steps:
+        ===============
+        1. Initialize: Store metrics and setup case directory
+        2. Path Generation: Identify and generate paths for new pairs (sticky paths)
+        3. Sewer Design: Run SewerPipeline to design pipes
+        4. SWMM Integration: Add derivation to model and run simulation
+        5. Tank Sizing: Resize tanks based on exceedance volume
+        6. Cost Calculation: Run final SWMM simulation and calculate costs
+        
+        Returns:
+            Tuple[cost, current_inp_file, overflow, small_tanks]
         """
-        # 1. Store current metrics
+       
+        # =====================================================================
+        # STEP 1: INITIALIZE - Store metrics and setup
+        # =====================================================================
         self.current_metrics = current_metrics
         self.nodes_gdf = current_metrics.nodes_gdf
         self.predios_gdf = current_metrics.predios_gdf
         self._solution_counter = iteration
         self.solution_name = solution_name
 
-        # 2. Setup case directory
         case_dir = self.case_dir = self._create_case_directory(solution_name)
 
-        # 3. Initialize tracking structures
+        # Initialize tracking structures (first iteration only)
         if not hasattr(self, 'cached_active_pairs'):
             self.cached_active_pairs = {}  # NodeID -> CandidatePair
-
-
-
         if not hasattr(self, 'cumulative_paths'):
             self.cumulative_paths = {}  # NodeID -> path_gdf
 
-        # 4. Identify new paths to generate (sticky paths: reuse existing ones)
-        new_active_pairs = []
-        for pair in active_pairs:
-            if pair['node_id'] not in self.cumulative_paths:
-                new_active_pairs.append(pair)
-
+        # =====================================================================
+        # STEP 2: PATH GENERATION - Identify new paths (sticky paths reuse)
+        # =====================================================================
+        new_active_pairs = [
+            pair for pair in active_pairs
+            if pair['node_id'] not in self.cumulative_paths
+        ]
         print(f"  [Sticky] Reusing {len(active_pairs) - len(new_active_pairs)} paths, generating {len(new_active_pairs)} new.")
 
-        # 5. Generate paths for new pairs only
+        # Generate paths for new pairs only
         new_path_gdfs, target_node_metadata, pairs = self._generate_paths(new_active_pairs)
-        # 1. Crear un diccionario temporal para búsqueda rápida por node_id
-        pairs_map = {p['node_id']: p for p in pairs}
-        
-        # 2. Recorrer active_pairs y actualizar si existe coincidencia
-        for active in active_pairs:
-            n_id = active.get('node_id')
-            if n_id in pairs_map:
-                active.update(pairs_map[n_id])
-        
+
+        # # Update active_pairs with generated path data
+        # pairs_map = {p['node_id']: p for p in pairs}
+        # for active in active_pairs:
+        #     n_id = active.get('node_id')
+        #     if n_id in pairs_map:
+        #         active.update(pairs_map[n_id])
+
         if not target_node_metadata:
             return None, None
 
-        # 6. Store new paths in cumulative collection
+        # Store new paths in cumulative collection
         for gdf in new_path_gdfs:
             if not gdf.empty:
                 self.cumulative_paths[gdf['node_id'].iloc[0]] = gdf
 
-
-
-        # 7. Save case summary
+        # =====================================================================
+        # STEP 3: SEWER DESIGN - Run SewerPipeline
+        # =====================================================================
         self._save_case_summary(case_dir, active_pairs, solution_name)
 
-        # 8. Prepare input GPKG for sewer design (rut_03)
         new_path_gdfs = list(self.cumulative_paths.values())
         input_gpkg = self._save_input_gpkg_for_rut03(new_path_gdfs, case_dir)
-       
-        
-        
 
-        # 9. Run sewer pipeline design
         out_gpkg = self._run_sewer_pipeline(
             input_gpkg=input_gpkg,
             new_path_gdfs=new_path_gdfs,
@@ -1333,10 +1343,10 @@ class DynamicSolutionEvaluator:
             case_dir=case_dir,
         )
 
-        # 10. Load designed pipeline for tree-based routing in next iteration
+        # Load designed pipeline for tree-based routing in next iteration
         self.last_designed_gdf = gpd.read_file(out_gpkg).copy()
 
-        # 11. Update active_pairs with pipeline design data
+        # Update active_pairs with pipeline design data
         for i, pair in enumerate(active_pairs):
             ramal_str = pair['ramal']
             ramal_data = self.last_designed_gdf[self.last_designed_gdf['Ramal'] == ramal_str]
@@ -1346,30 +1356,66 @@ class DynamicSolutionEvaluator:
                 if 'L' in ramal_data.columns:
                     pair['pipeline_length'] = float(ramal_data['L'].sum())
 
-        # 12. Run SWMM simulation
-        print("  Running SWMM simulation...")
-        cost, current_inp_file = self._run_swmm_simulation(
-            vector_path=Path(out_gpkg),
-            solution_name=solution_name,
-            case_dir=case_dir
-        )
+        # =====================================================================
+        # STEP 4: SWMM INTEGRATION - Add derivation to model
+        # =====================================================================
+        swmm_modifier = SWMMModifier(inp_file=self.inp_file, crs=config.PROJECT_CRS)
+        current_inp_file = swmm_modifier.add_derivation_to_model(self.last_designed_gdf, case_dir, solution_name)
 
-        # 13. Resize tanks based on exceedance volume
+        self.metrics_extractor.run(current_inp_file, self.last_designed_gdf)
+        self.current_metrics = self.metrics_extractor.metrics
+
+        # =====================================================================
+        # STEP 5: TANK SIZING - Resize based on exceedance volume
+        # =====================================================================
         overflow = self.resize_tanks_based_on_exceedance(current_inp_file, active_pairs)
-        
         small_tanks = self.check_minimun_tank_size()
+
+        if overflow or small_tanks:
+            print(f"  [Evaluation] Detected overflow or undersized tanks - returning for handling")
+            return 0, current_inp_file, overflow, small_tanks
+
+        # =====================================================================
+        # STEP 6: COST CALCULATION - Run final SWMM simulation
+        # =====================================================================
+        print("  Running SWMM simulation...")
+        cost, current_inp_file = self._run_cost_simulation(
+            vector_path=Path(out_gpkg),
+            case_dir=case_dir,
+            active_pairs=active_pairs,
+            current_inp_file=current_inp_file
+        )
 
         return cost, current_inp_file, overflow, small_tanks
 
-    def _run_swmm_simulation(self,
+    def _run_cost_simulation(self,
                             vector_path: Path,
-                            solution_name: str,
-                            case_dir: Path) -> Tuple[float, float]:
+                            case_dir: Path,
+                            active_pairs: list = None,
+                             current_inp_file: Path =  None) -> Tuple[dict, str]:
         """
-        Integrate designed pipes into SWMM, run sim, calc cost & flooding.
+        Integrate designed pipes into SWMM, run simulation, and calculate all costs.
+        
+        Cost Structure:
+        ===============
+        1. Investment Cost (CAPEX):
+           - cost_links: Pipeline construction cost
+           - cost_tanks: Tank construction cost  
+           - cost_land: Land acquisition cost for tanks
+           
+        2. Residual Cost (Damages with solution):
+           - flood_damage_cost: Economic damage from remaining floods
+           - infrastructure_repair_cost: Pipe replacement cost for failing pipes
+           
+        Returns:
+            Tuple[dict, str]: (cost_dict, current_inp_file_path)
         """
+        active_pairs = active_pairs or []
 
-        # --- CONSTRUCTION COST CALCULATION ---
+        
+        # =====================================================================
+        # STEP 2: CALCULATE PIPELINE CONSTRUCTION COST
+        # =====================================================================
         calculator = SewerConstructionCost(
             vector_path=vector_path,
             tipo='pluvial',
@@ -1378,23 +1424,94 @@ class DynamicSolutionEvaluator:
             base_precios=config.BASE_PRECIOS,
         )
 
-        # Excel
         excel_path = str(vector_path.with_suffix('.xlsx'))
-        total_cost = calculator.run(excel_output_path=excel_path, excel_metadata=config.EXCEL_METADATA)
-
-        # --- INTEGRATE SOLUTION INTO SWMM MODEL ---
-        swmm_modifier = SWMMModifier(inp_file=self.inp_file, crs=config.PROJECT_CRS)
-        current_inp_file = swmm_modifier.add_derivation_to_model(self.last_designed_gdf, case_dir, solution_name)
-
-        # Ejecutar simulación inicial y extraer métricas base
-        self.metrics_extractor.run(current_inp_file)
-        self.current_metrics = self.metrics_extractor.metrics
-
-
+        cost_links = calculator.run(excel_output_path=excel_path, excel_metadata=config.EXCEL_METADATA)
         
+        
+        # =====================================================================
+        # STEP 3: CALCULATE TANK AND LAND COSTS
+        # =====================================================================
+        cost_tanks = 0.0
+        cost_land = 0.0
+        n_tanks = 0
+        
+        for pair in active_pairs:
+            if pair.get('is_tank', False):
+                n_tanks += 1
+                predio_id = pair['predio_id']
+                tank_id = f"tank_{predio_id}"
+                
+                if tank_id in self.current_metrics.tank_data:
+                    tank_data = self.current_metrics.tank_data[tank_id]
+                    tank_volume = tank_data['total_volume']
+                    tank_depth = tank_data['max_depth']
+                    
+                    # Store in pair for reporting
+                    pair['tank_volume_simulation'] = tank_volume
+                    pair['tank_max_depth'] = tank_depth
+                    pair['cost_tank'] = CostCalculator.calculate_tank_cost(tank_volume)
+                    pair['cost_land'] = (tank_volume / config.TANK_DEPTH_M) * config.LAND_COST_PER_M2
+                    
+                    # Accumulate totals
+                    cost_tanks += pair['cost_tank']
+                    cost_land += pair['cost_land']
+        
+        # =====================================================================
+        # STEP 4: CALCULATE RESIDUAL COSTS (DAMAGES WITH SOLUTION IN PLACE)
+        # =====================================================================
+        runner = AvoidedCostRunner(
+            output_base=str(case_dir / "00_avoided_costs"),
+            base_precios_path=str(config.BASE_PRECIOS),
+            base_inp_path=str(current_inp_file),
+            flood_metrics=self.current_metrics
+        )
 
+        damage_results = runner.run(tr_list=[config.BASE_INP_TR])
+        results = damage_results.get('results', [])
+        
+        if results:
+            if self.is_probabilistic_mode:
+                residual_cost = self._calculate_probabilistic_baseline(results)
+            else:
+                residual_cost = self._calculate_deterministic_baseline(results[0])
+        
+        # =====================================================================
+        # STEP 5: BUILD COST SUMMARY DICTIONARY
+        # =====================================================================
+        investment_cost = cost_links + cost_tanks + cost_land
+        total_residual = residual_cost.get('total_cost', 0.0)
+        total_cost = investment_cost + total_residual
+        
+        cost = {
+            # Investment costs (CAPEX)
+            'investment': {
+                'links': cost_links,
+                'tanks': cost_tanks,
+                'land': cost_land,
+                'total': investment_cost,
+            },
+            # Residual costs (remaining damages)
+            'residual': {
+                'flood_damage': residual_cost.get('flood_damage_cost', 0.0),
+                'infrastructure_repair': residual_cost.get('infrastructure_repair_cost', 0.0),
+                'total': residual_cost.get('flood_damage_cost', 0.0) + residual_cost.get('infrastructure_repair_cost', 0.0),
+            },
 
+            # Metadata
+            'n_tanks': n_tanks,
+        }
+        
+        # Store in metrics for downstream access
+        self.current_metrics.cost = cost
+        
+        print(f"  [Cost] Investment: ${investment_cost:,.0f} (Links: ${cost_links:,.0f}, Tanks: ${cost_tanks:,.0f}, Land: ${cost_land:,.0f})")
+        print(f"  [Cost] Residual: ${total_residual:,.0f} (Flood: ${residual_cost.get('flood_damage_cost', 0.0):,.0f}, Infrastructure: ${residual_cost.get('infrastructure_repair_cost', 0.0):,.0f})")
+        print(f"  [Cost] Total: ${total_cost:,.0f}")
 
+        return cost, current_inp_file
+    
+        
+        
         # # --- RUN ITZI FLOOD MODEL (if flood_damage enabled) ---
         # itzi_result = {}
         # if config.COST_COMPONENTS.get('flood_damage', False):
@@ -1512,7 +1629,3 @@ class DynamicSolutionEvaluator:
         # self.last_economic_result = economic_res
         
         # Store final INP path for next iteration's re-ranking
-        
-        
-        return total_cost, current_inp_file
-    

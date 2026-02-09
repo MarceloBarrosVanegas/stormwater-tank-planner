@@ -79,6 +79,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
+import swmmio
+import networkx as nx
 from concurrent.futures import ThreadPoolExecutor
 from pyproj import CRS
 from pyswmm import Output, SystemSeries, Simulation
@@ -126,7 +128,7 @@ def _instantiate_candidate_pair(task):
         node_x=float(task['start_xy'][0]),
         node_y=float(task['start_xy'][1]),
         node_geometry=n['geometry'],
-        node_probability_failure=n['failure_prob'],
+        node_probability_failure=n['failure_probability'],
         node_flow_over_capacity=n['flow_over_capacity'],
         node_flooding_flow=n['flow_node_flooding'],
         node_volume_over_capacity=n['vol_over_capacity'],
@@ -150,37 +152,6 @@ def _instantiate_candidate_pair(task):
         target_id=""
     )
 
-
-@dataclass
-class SystemMetrics:
-    """
-    Stores system-wide hydraulic metrics and detailed per-node data.
-    """
-
-    # SYSTEM-WIDE
-    total_flooding_volume: float = 0.0  # m3
-    total_outfall_volume: float = 0.0  # m3
-    total_max_outfall_flow: float = 0.0  # m3
-    total_max_flooding_flow: float = 0.0  # m3
-    system_flood_hydrograph: Dict[str, np.ndarray] = field(default_factory=dict)  # {'times': [], 'total_rate': []}
-    system_outfall_flow_hydrograph: Dict[str, np.ndarray] = field(default_factory=dict)  # {'times': [], 'total_rate': []}
-
-    # Per-Node Stats (NodeID -> Stats Dict)
-    node_data: Dict[str, Dict] = field(default_factory=dict)
-    link_data: Dict[str, Dict] = field(default_factory=dict)
-    tank_data: Dict[str, Dict] = field(default_factory=dict)
-
-    swmm_gdf: gpd.GeoDataFrame = field(default_factory=gpd.GeoDataFrame)
-    flooded_nodes_gdf: gpd.GeoDataFrame = field(default_factory=gpd.GeoDataFrame)
-
-    flooded_nodes_count: int = 0
-    cost: float = 0.0
-
-    # NETWORK HEALTH
-    surcharged_links_count: int = 0
-    overloaded_links_length: float = 0.0
-    system_mean_utilization: float = 0.0
-    
 
 @dataclass
 class CandidatePair:
@@ -238,6 +209,39 @@ class CandidatePair:
     target_id: str = ""  # ID del nodo/tanque al que finalmente descarga
 
 
+@dataclass
+class SystemMetrics:
+    """
+    Stores system-wide hydraulic metrics and detailed per-node data.
+    """
+
+    # SYSTEM-WIDE
+    total_flooding_volume: float = 0.0  # m3
+    total_outfall_volume: float = 0.0  # m3
+    total_max_outfall_flow: float = 0.0  # m3
+    total_max_flooding_flow: float = 0.0  # m3
+    system_flood_hydrograph: Dict[str, np.ndarray] = field(default_factory=dict)  # {'times': [], 'total_rate': []}
+    system_outfall_flow_hydrograph: Dict[str, np.ndarray] = field(default_factory=dict)  # {'times': [], 'total_rate': []}
+
+    # Per-Node Stats (NodeID -> Stats Dict)
+    node_data: Dict[str, Dict] = field(default_factory=dict)
+    link_data: Dict[str, Dict] = field(default_factory=dict)
+    tank_data: Dict[str, Dict] = field(default_factory=dict)
+
+    swmm_gdf: gpd.GeoDataFrame = field(default_factory=gpd.GeoDataFrame)
+    flooded_nodes_gdf: gpd.GeoDataFrame = field(default_factory=gpd.GeoDataFrame)
+
+    flooded_nodes_count: int = 0
+    cost: float = 0.0
+
+    # NETWORK HEALTH
+    surcharged_links_count: int = 0
+    overloaded_links_length: float = 0.0
+    system_mean_utilization: float = 0.0
+    
+
+
+
 class MetricExtractor:
     """
     Extracts metrics from SWMM binary output (.out), loads predios, and ranks candidates.
@@ -249,6 +253,7 @@ class MetricExtractor:
         print(f"Project Root: {self.project_root}")
 
         # Default configuration
+        self.graph_cache = None
         self.predios_gdf = self.get_predios_gdf(predios_path)
         self.nodes_gdf = None
         self.swmm_gdf = None
@@ -258,6 +263,78 @@ class MetricExtractor:
         self.at_capacity_flow = CapacidadMaximaTuberia()
         self.parse_shape_from_swmm = {'RECT_CLOSED': 'rectangular', 'RECT_OPEN': 'rectangular', 'MODBASKETHANDLE': 'rectangular', 'CIRCULAR': 'circular'}
         self.risk_file_path = config.FAILIURE_RISK_FILE
+
+    def build_swmm_graph_cache(self, inp_file_path):
+        """
+        Construye y cachea el grafo de SWMM.
+        """
+        modelo= self.modelo = swmmio.Model(inp_file_path)
+        grafo = modelo.network
+        outfalls = set(modelo.inp.outfalls.index)
+
+        self.graph_cache = {
+            'graph': grafo,
+            'outfalls': outfalls,
+            'model': modelo
+        }
+
+        print(f"✓ Graph cached: {len(grafo.nodes)} nodes, {len(outfalls)} outfalls")
+
+    def get_outfall_for_node(self, nid, out_object):
+        """
+        Encuentra el outfall más cercano aguas abajo y obtiene su caudal.
+        """
+        nid_str = str(nid).strip()
+        G = self.graph_cache['graph']
+        outfalls = self.graph_cache['outfalls']
+
+        # Verificar que el nodo existe en el grafo
+        if nid_str not in G.nodes():
+            # Probar variaciones del nombre
+            nid_upper = nid_str.upper()
+            nid_lower = nid_str.lower()
+
+            if nid_upper in G.nodes():
+                nid_str = nid_upper
+            elif nid_lower in G.nodes():
+                nid_str = nid_lower
+            else:
+                # Nodo no existe en el grafo - pass
+                return {'outfall_id': None, 'outfall_peak_flow': 0.0, 'path_length': 0}
+
+        # Encontrar todos los nodos aguas abajo y aguas arriba
+        downstream = nx.descendants(G, nid_str)
+        upstream = nx.ancestors(G, nid_str)
+
+        # Intentar con descendants (dirección del grafo)
+        candidates = downstream.intersection(outfalls)
+
+        # Si no hay candidatos, probar con ancestors (grafo invertido)
+        if not candidates:
+            candidates = upstream.intersection(outfalls)
+
+        # Si todavía no hay candidatos, el nodo mismo es outfall
+        if not candidates:
+            if nid_str in outfalls:
+                outfall_id = nid_str
+                path_length = 0
+            else:
+                # Nodo desconectado - pass
+                return {'outfall_id': None, 'outfall_peak_flow': 0.0, 'path_length': 0}
+        else:
+            # Elegir el más cercano topológicamente
+            outfall_id = min(candidates, key=lambda x: nx.shortest_path_length(G, nid_str, x))
+            path_length = nx.shortest_path_length(G, nid_str, outfall_id)
+
+        # Obtener caudal del outfall
+        outfall_flow_series = pd.Series(out_object.node_series(outfall_id, NodeAttribute.TOTAL_INFLOW))
+        peak_flow = float(outfall_flow_series.max())
+
+        return {
+            'outfall_id': outfall_id,
+            'outfall_peak_flow': peak_flow,
+            'path_length': path_length
+        }
 
     @staticmethod
     def parse_seccion_to_pypiper(conduit_row: pd.Series) -> str:
@@ -370,15 +447,17 @@ class MetricExtractor:
 
         q_at_capacity_series = pd.Series(np.round(q_at_capacity / 1000, 3), index=swmm_gdf.index)
 
-        return swmm_gdf, nodes_df, q_at_capacity_series
+        return swmm_gdf.copy(), nodes_df.copy(), q_at_capacity_series
 
-    def extract(self, in_file_path, extrac_items) -> SystemMetrics:
+    def extract(self, in_file_path, extrac_items, last_designed_gdf = None) -> SystemMetrics:
         """
         Parses output file and returns SystemMetrics.
         Extracts hydrographs, link data, node data, tank data, and flooded_nodes_gdf.
         """
         metrics = SystemMetrics()
         in_file_path = str(in_file_path)
+        skip_nodes = last_designed_gdf['Pozo'].tolist() if last_designed_gdf is not None else []
+
 
         # =========================================================================
         # 1. OBTENER RED FÍSICA
@@ -392,6 +471,10 @@ class MetricExtractor:
             out_file_path = self.run_swmm_simulation(in_file_path)
             pbar.update(1)
 
+
+        print("Building SWMM graph cache...")
+        self.build_swmm_graph_cache(in_file_path)
+
         # =========================================================================
         # 2. EXTRACCIÓN DE DATOS DE SWMM OUTPUT
         # =========================================================================
@@ -399,7 +482,7 @@ class MetricExtractor:
         with Output(str(out_file_path)) as out:
             all_nodes = list(out.nodes)
             all_links = list(out.links)
-            tank_nodes = [nid for nid in all_nodes if nid.startswith("tank_")]
+            tank_nodes = self.modelo.inp.storage.index.to_list() if self.modelo.inp.storage is not None else []
 
             if len(extrac_items.get('include_nodes', {})) == 0:
                 extrac_items['include_nodes'] = all_nodes
@@ -529,6 +612,8 @@ class MetricExtractor:
                 flow_incoming_series = pd.Series([0.0])
                 capacity_incoming = 0.0
 
+                outfall_info = self.get_outfall_for_node(nid, out)
+
                 if len(incoming_links) > 0:
                     excesses = swmm_gdf['flow_over_pipe_capacity'].loc[incoming_links]
                     link_with_max_excess = excesses.idxmax()
@@ -546,6 +631,9 @@ class MetricExtractor:
                 flooding_series = pd.Series(out.node_series(nid, NodeAttribute.FLOODING_LOSSES))
                 depth_series = pd.Series(out.node_series(nid, NodeAttribute.INVERT_DEPTH))
                 max_flooding_flow = float(flooding_series.max())
+
+                if nid_str in skip_nodes:
+                    max_over_capacity_flow = 0.0
 
                 if config.TANK_OPT_OBJECTIVE == 'capacity':
                     max_flow = max_flooding_flow + max_over_capacity_flow
@@ -588,6 +676,9 @@ class MetricExtractor:
                     'x': x,
                     'y': y,
                     'invert_elevation': invert_elevation,
+                    'outfall_id': outfall_info['outfall_id'],
+                    'outfall_peak_flow': outfall_info['outfall_peak_flow'],
+                    'path_to_outfall_length': outfall_info['path_length'],
                 }
 
                 
@@ -601,6 +692,7 @@ class MetricExtractor:
                     'vol_over_capacity': over_capacity_volume,
                     'vol_node_flooding': flooding_volume,
                     'total_volume': total_volume,
+                    'outfall_peak_flow': outfall_info['outfall_peak_flow'],
                     'node_depth': max_depth,
                     'invert_elevation': invert_elevation,
                     'geometry': Point(x, y),
@@ -644,12 +736,12 @@ class MetricExtractor:
     def get_spatial_risk(self, df):
         """Maps risk data to nodes using spatial proximity (nearest neighbor)."""
         if not self.risk_file_path or not Path(self.risk_file_path).exists() or df.empty:
-            df['failure_prob'] = 0
+            df['failure_probability'] = 0
             return df
 
         risk_gdf = gpd.read_file(self.risk_file_path)
 
-        if not risk_gdf.empty and 'failure_prob' in risk_gdf.columns:
+        if not risk_gdf.empty and 'failure_probability' in risk_gdf.columns:
             # Ensure geometries are valid
             risk_gdf = risk_gdf[risk_gdf.geometry.is_valid & ~risk_gdf.geometry.is_empty]
 
@@ -674,16 +766,16 @@ class MetricExtractor:
                 matched_gdf_indices = coords_risk_df_index[nearest_coord_idx]
 
                 # Retrieve probabilities using .loc (label-based lookup)
-                nearest_probs = risk_gdf.loc[matched_gdf_indices, 'failure_prob'].values
+                nearest_probs = risk_gdf.loc[matched_gdf_indices, 'failure_probability'].values
 
                 # Assign failure_prob only if distance < 0.1, otherwise 0
-                df['failure_prob'] = np.where(min_dists < 0.1, nearest_probs, 0.0)
+                df['failure_probability'] = np.where(min_dists < 0.1, nearest_probs, 0.0)
             else:
                 print("Warning: Coordinate mismatch or empty geometries for risk/nodes.")
-                df['failure_prob'] = 0.0
+                df['failure_probability'] = 0.0
         else:
-            print("Warning: Risk GPKG empty or missing 'failure_prob' column.")
-            df['failure_prob'] = 0.0
+            print("Warning: Risk GPKG empty or missing 'failure_probability' column.")
+            df['failure_probability'] = 0.0
 
         return df
 
@@ -804,49 +896,64 @@ class MetricExtractor:
 
         return self.predios_gdf
 
-
     def calculate_scores(self, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         """
         Calculates weighted scores for flooding nodes based on available metrics.
-        Normalizes all values to 0-1 range before weighting.
-        
-        Metrics used:
-        - total_volume: Higher is better (flooding + over capacity)
-        - total_flow: Higher is better (flooding + over capacity)
-        - failure_prob: Higher is better (risk)
+        Uses config.FLOODING_RANKING_WEIGHTS keys as the metric names (no hardcodes).
+        Normalizes each metric to 0-1 (min-max) before weighting.
         """
         self.weights = config.FLOODING_RANKING_WEIGHTS
+
         if gdf.empty:
-            gdf['score'] = 0.0
+            gdf = gdf.copy()
+            gdf["score"] = 0.0
             return gdf
-        
+
         df = gdf.copy()
-        
-        # --- Normalization (Min-Max) ---
-        def normalize(series):
-            if series.max() == series.min():
-                return np.zeros(len(series))
-            return (series - series.min()) / (series.max() - series.min())
-        
-        # Normalize available metrics
-        df['norm_vol'] = normalize(df['total_volume'])
-        df['norm_flow'] = normalize(df['total_flow'])
-        df['norm_risk'] = normalize(df['failure_prob'])
-        
-        # Calculate weighted score (only with available metrics)
-        score = (
-            self.weights.get('total_volume', 0.4) * df['norm_vol'] +
-            self.weights.get('total_flow', 0.3) * df['norm_flow'] +
-            self.weights.get('failure_probability', 0.3) * df['norm_risk']
-        )
-        
-        df['score'] = score
-        
-        # Clean up temporary columns
-        df.drop(columns=['norm_vol', 'norm_flow', 'norm_risk'], inplace=True)
-        
-        return df.sort_values(by='score', ascending=False)
-    
+
+        def normalize(s):
+            s = s.astype(float)
+            mn, mx = np.nanmin(s), np.nanmax(s)
+            if not np.isfinite(mn) or not np.isfinite(mx) or mx == mn:
+                return np.zeros(len(s), dtype=float)
+            out = (s - mn) / (mx - mn)
+            out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+            return out
+
+        # 1) metrics present both in weights and in df
+        available = [m for m in self.weights.keys() if m in df.columns]
+
+        if not available:
+            df["score"] = 0.0
+            return df
+
+        # 2) normalize metrics + build score
+        norm_cols = []
+        for m in available:
+            col = f"__norm__{m}"
+            df[col] = normalize(df[m])
+            norm_cols.append(col)
+
+        # 3) optionally renormalize weights among available metrics
+        w = np.array([float(self.weights[m]) for m in available], dtype=float)
+        w_sum = w.sum()
+        if w_sum <= 0:
+            # fallback: equal weights
+            w = np.ones_like(w) / len(w)
+        else:
+            w = w / w_sum
+
+        # 4) weighted score
+        score = np.zeros(len(df), dtype=float)
+        for wi, m in zip(w, available):
+            score += wi * df[f"__norm__{m}"]
+
+        df["score"] = score
+
+        # 5) cleanup + sort
+        df.drop(columns=norm_cols, inplace=True)
+        return df.sort_values("score", ascending=False)
+
 
     @staticmethod
     def get_candidate_pairs(
@@ -903,13 +1010,13 @@ class MetricExtractor:
 
         return valid_pairs
 
-    def run(self, inp_file_path: str = None):
+    def run(self, inp_file_path: str = None, last_designed_gdf= None):
         """
         Single run method: Extracts flooding metrics, maps spatial risk, and ranks candidates.
         Populates entity attributes instead of returning values.
         """
         # Extract flooding metrics
-        metrics = self.extract(inp_file_path, {})
+        metrics = self.extract(inp_file_path, {}, last_designed_gdf=last_designed_gdf)
         self.swmm_gdf = metrics.swmm_gdf
         self.nodes_gdf = metrics.flooded_nodes_gdf
 
@@ -940,23 +1047,32 @@ class MetricExtractor:
         # Convert back to list of dicts and store in entity
         self.ranked_candidates = df.to_dict('records')
         self.metrics = metrics
-        
-        print("\n" + "="*100)
+
+        print("\n" + "=" * 100)
         print("CANDIDATOS PARA TANQUE DE TORMENTA")
-        print("="*100)
-        cols = ['node_id', 'total_flow', 'total_volume', 'failure_prob', 'score']
-        headers = ['ID Nodo', 'Caudal (m³/s)', 'Vol', 'Prob. Falla', 'score']
+        print("=" * 100)
+
+        # columnas a imprimir = keys del weights que existan en df
+        cols = [k for k in config.FLOODING_RANKING_WEIGHTS.keys() if k in df.columns]
+
+        # opcional: incluir node_id al inicio si existe
+        if "node_id" in df.columns:
+            cols = ["node_id"] + cols
+
+        # opcional: incluir score si existe
+        if "score" in df.columns and "score" not in cols:
+            cols = cols + ["score"]
+
         print(tabulate(
             df[cols].head(5),
-            headers=headers,
-            tablefmt='grid',
-            floatfmt=('.0f', '.2f', '.1f', '.2f', '.3f'),
+            headers="keys",
+            tablefmt="grid",
             showindex=False,
-            numalign='right',
-            stralign='left'
+            numalign="right",
+            stralign="left"
         ))
-        print("="*100 + "\n")
 
+        print("=" * 100 + "\n")
   
 
 if __name__ == "__main__":

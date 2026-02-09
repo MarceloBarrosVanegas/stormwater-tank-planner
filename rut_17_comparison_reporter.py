@@ -13,6 +13,8 @@ from typing import List, Dict
 from pathlib import Path
 from line_profiler import profile
 import json
+from scipy.interpolate import griddata
+
 import config
 PLOT_TIME_LIMIT_HOURS = config.ITZI_SIMULATION_DURATION_HOURS
 from rut_27_model_metrics import SystemMetrics
@@ -27,7 +29,10 @@ class ScenarioComparator:
     def __init__(self, baseline_metrics: SystemMetrics, baseline_inp_path: str = None):
         self.baseline = baseline_metrics
         self.baseline_inp_path = baseline_inp_path
-        self._predios_gdf_cache = None  # Cache for lazy loading
+        self._predios_gdf_cache = None
+
+        
+        
         
     @profile
     def generate_comparison_plots(self,
@@ -42,8 +47,13 @@ class ScenarioComparator:
                                   ):
 
         """Generates all comparison plots for a given solution."""
-        save_dir = Path(save_dir)
+        save_dir = Path(save_dir) / Path("02_figure_results")
         save_dir.mkdir(parents=True, exist_ok=True)
+        self.fig_cont = 0
+
+
+
+
 
         # 1. Combined Map (Spatial + Scatter + Hydro + Hists + Tank Table)
         self.generate_combined_map(solution=solution,
@@ -53,7 +63,7 @@ class ScenarioComparator:
                                    tank_details=tank_details,
                                    show_predios=show_predios)
         
-
+        # self.plot_node_solution_spatial(save_dir, solution, grid_resolution = 500)
 
         # 1.1 Capacity Comparison Maps (Baseline, Solution, Delta) - Single 2x2 figure
         self.generate_capacity_comparison_maps(solution,
@@ -217,8 +227,9 @@ class ScenarioComparator:
         self._plot_outfall_hydrograph(ax_outfall, self.baseline, solution)
 
         plt.tight_layout()
-        plt.savefig(save_dir / "00_dashboard_map.png", dpi=100)
+        plt.savefig(save_dir / f"{self.fig_cont:02}_dashboard_map.png", dpi=100)
         plt.close(fig)
+        self.fig_cont = self.fig_cont + 1
 
     @profile
     def _plot_spatial_diff(self, ax, nodes_gdf: gpd.GeoDataFrame, base_vols: Dict, sol_vols: Dict, derivations: gpd.GeoDataFrame, show_predios: bool = False):
@@ -977,7 +988,8 @@ class ScenarioComparator:
 
         fig.suptitle("Pipe Capacity Usage Comparison (h/D)", fontsize=16, fontweight='bold')
         plt.tight_layout(rect=(0, 0, 1, 0.96))
-        plt.savefig(save_dir / "01_dashboard_map_capacity.png", dpi=150)
+        plt.savefig(save_dir / f"{self.fig_cont:02}_dashboard_map_capacity.png", dpi=150)
+        self.fig_cont = self.fig_cont + 1
         plt.close(fig)
     
     @profile
@@ -1038,7 +1050,8 @@ class ScenarioComparator:
 
         fig.suptitle("Pipe Velocity Comparison (m/s)", fontsize=16, fontweight='bold')
         plt.tight_layout(rect=[0, 0, 1, 0.96])
-        plt.savefig(save_dir / "02_dashboard_map_velocity.png", dpi=150)
+        plt.savefig(save_dir / f"{self.fig_cont:02}_dashboard_map_velocity.png", dpi=150)
+        self.fig_cont = self.fig_cont + 1
         plt.close(fig)
         print("  [MetricMaps] Saved dashboard_map_velocity_comparison.png (2x2)")
 
@@ -1440,8 +1453,10 @@ class ScenarioComparator:
                 
             fig.suptitle(f"Hydrograph Analysis ({i+1}-{i+len(batch_nodes)}): {solution_name}", fontsize=16)
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-            plt.savefig(save_dir / f"03_dashboard_comparison_batch_{batch_idx+1}.png", dpi=100)
+            plt.savefig(save_dir / f"{self.fig_cont:02}_dashboard_comparison_batch_{batch_idx+1}.png", dpi=100)
+            self.fig_cont = self.fig_cont + 1
             plt.close(fig)
+
 
     def _overlay_annotations(self, ax, derivations, annotations_data):
         """Helper to draw simple numbered labels on derivation lines."""
@@ -1929,7 +1944,8 @@ class ScenarioComparator:
         ax.set_title("Hydraulic Annotations: Derivations", fontsize=20)
         ax.set_axis_off()
         plt.tight_layout()
-        plt.savefig(save_dir / "dashboard_annotations.png", dpi=100)
+        plt.savefig(save_dir / f"{self.fig_cont:02}_dashboard_annotations.png", dpi=100)
+        self.fig_cont = self.fig_cont + 1
         plt.close(fig)
 
 
@@ -2079,6 +2095,162 @@ class ScenarioComparator:
             fig.savefig(save_dir / f"04_{solution_name}_tank_hydrographs_page_{batch_idx+1}.png", dpi=100)
             plt.close(fig)
             print(f"  [Tanks] Saved page {batch_idx+1}")
+
+
+    def plot_node_solution_spatial(self, save_dir, metrics, grid_resolution=100, figsize=(22, 12)):
+        """
+        Figure 1: Solution spatial maps (2x2).
+        - Volume, Flow, Duration, Isochrones
+        """
+        plt.style.use('ggplot')
+
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+
+        # Get network geometry
+        links_gdf = metrics.swmm_gdf.copy()
+        # Extract node data
+        nodes_list = []
+        for node_id, data in metrics.node_data.items():
+            x = data.get('x', 0)
+            y = data.get('y', 0)
+            flooding_volume = data.get('flooding_volume', 0)
+            max_flooding_flow = data.get('max_flooding_flow', 0)
+
+            # Calculate duration and start time from flooding_series
+            flooding_series = data.get('flooding_series', pd.Series())
+            duration_hours = 0
+            start_minutes = np.nan
+
+            if len(flooding_series) > 0:
+                active = flooding_series > 0
+                if active.any():
+                    active_times = flooding_series[active].index
+                    start_time = active_times[0]
+                    end_time = active_times[-1]
+                    duration_hours = (end_time - start_time).total_seconds() / 3600
+
+                    sim_start = flooding_series.index[0]
+                    start_minutes = (start_time - sim_start).total_seconds() / 60
+
+            nodes_list.append({
+                'node_id': node_id,
+                'x': x,
+                'y': y,
+                'flooding_volume': flooding_volume,
+                'max_flooding_flow': max_flooding_flow,
+                'duration_hours': duration_hours,
+                'start_minutes': start_minutes,
+                'has_flooding': flooding_volume > 0
+            })
+
+        df = pd.DataFrame(nodes_list)
+        df = df[(df['x'] != 0) | (df['y'] != 0)]
+
+        # Normalize sizes
+        vol_max = df['flooding_volume'].max() if df['flooding_volume'].max() > 0 else 1
+        flow_max = df['max_flooding_flow'].max() if df['max_flooding_flow'].max() > 0 else 1
+
+        df['size_vol'] = np.sqrt(df['flooding_volume'] / vol_max) * 500 + 20
+        df['size_flow'] = np.sqrt(df['max_flooding_flow'] / flow_max) * 500 + 20
+
+        # Common limits
+        xlim = (df['x'].min() - 50, df['x'].max() + 50)
+        ylim = (df['y'].min() - 50, df['y'].max() + 50)
+
+
+        # 1,1: Flooding Volume
+        ax1 = axes[0, 0]
+        links_gdf.plot(ax=ax1, color='gray', linewidth=0.5, alpha=0.6, zorder=1)
+        no_flood = df[~df['has_flooding']]
+        flood = df[df['has_flooding']]
+
+        ax1.scatter(no_flood['x'], no_flood['y'], c='lightgray', s=10, alpha=0.5, zorder=2)
+        scatter1 = ax1.scatter(flood['x'], flood['y'], c=flood['flooding_volume'],
+                               s=flood['size_vol'], cmap='YlOrRd', alpha=0.7,
+                               edgecolors='black', linewidth=0.3, vmin=0, vmax=vol_max, zorder=3)
+        plt.colorbar(scatter1, ax=ax1, fraction=0.046, pad=0.04, label='Flooding Volume (m³)')
+        ax1.set_title('Flooding Volume\n(size ∝ volume)', fontweight='bold')
+        ax1.set_xlabel('X (m)')
+        ax1.set_ylabel('Y (m)')
+        ax1.set_aspect('equal')
+        ax1.set_xlim(xlim)
+        ax1.set_ylim(ylim)
+
+        # 1,2: Max Flooding Flow
+        ax2 = axes[0, 1]
+        links_gdf.plot(ax=ax2, color='gray', linewidth=0.5, alpha=0.6, zorder=1)
+        ax2.scatter(no_flood['x'], no_flood['y'], c='lightgray', s=10, alpha=0.5, zorder=2)
+        scatter2 = ax2.scatter(flood['x'], flood['y'], c=flood['max_flooding_flow'],
+                               s=flood['size_flow'], cmap='YlGnBu', alpha=0.7,
+                               edgecolors='black', linewidth=0.3, vmin=0, vmax=flow_max, zorder=3)
+        plt.colorbar(scatter2, ax=ax2, fraction=0.046, pad=0.04, label='Max Flow (m³/s)')
+        ax2.set_title('Max Flooding Flow\n(size ∝ flow)', fontweight='bold')
+        ax2.set_xlabel('X (m)')
+        ax2.set_ylabel('Y (m)')
+        ax2.set_aspect('equal')
+        ax2.set_xlim(xlim)
+        ax2.set_ylim(ylim)
+
+        # 2,1: Duration
+        ax3 = axes[1, 0]
+        links_gdf.plot(ax=ax3, color='gray', linewidth=0.5, alpha=0.6, zorder=1)
+        ax3.scatter(no_flood['x'], no_flood['y'], c='lightgray', s=15, alpha=0.5, zorder=2)
+        flood_dur = flood[flood['duration_hours'] > 0]
+        if len(flood_dur) > 0:
+            scatter3 = ax3.scatter(flood_dur['x'], flood_dur['y'], c=flood_dur['duration_hours'],
+                                   s=80, cmap='Purples', alpha=0.8, edgecolors='black', linewidth=0.3, zorder=3)
+            plt.colorbar(scatter3, ax=ax3, fraction=0.046, pad=0.04, label='Duration (hours)')
+        ax3.set_title('Flooding Duration\n(color = duration)', fontweight='bold')
+        ax3.set_xlabel('X (m)')
+        ax3.set_ylabel('Y (m)')
+        ax3.set_aspect('equal')
+        ax3.set_xlim(xlim)
+        ax3.set_ylim(ylim)
+
+        # 2,2: Isochrones
+        ax4 = axes[1, 1]
+        links_gdf.plot(ax=ax4, color='gray', linewidth=0.5, alpha=0.6, zorder=1)
+        ax4.scatter(no_flood['x'], no_flood['y'], c='lightgray', s=10, alpha=0.3, zorder=2)
+
+        df_iso = flood[flood['start_minutes'].notna()].copy()
+        if len(df_iso) >= 3:
+            x_min, x_max = df['x'].min(), df['x'].max()
+            y_min, y_max = df['y'].min(), df['y'].max()
+            x_pad = (x_max - x_min) * 0.1
+            y_pad = (y_max - y_min) * 0.1
+
+            xi = np.linspace(x_min - x_pad, x_max + x_pad, grid_resolution)
+            yi = np.linspace(y_min - y_pad, y_max + y_pad, grid_resolution)
+            xi, yi = np.meshgrid(xi, yi)
+
+            zi = griddata((df_iso['x'], df_iso['y']), df_iso['start_minutes'], (xi, yi),
+                          method='linear', fill_value=np.nan)
+
+            t_min = df_iso['start_minutes'].min()
+            t_max = df_iso['start_minutes'].max()
+
+            if t_max > t_min:
+                step = max(15, (t_max - t_min) / 8)
+                levels = np.arange(t_min, t_max + step, step)
+                cf = ax4.contourf(xi, yi, zi, levels=levels, cmap='RdYlBu_r', alpha=0.6, zorder=3)
+                cs = ax4.contour(xi, yi, zi, levels=levels, colors='black', linewidths=0.8, zorder=4)
+                ax4.clabel(cs, inline=True, fontsize=8, fmt='%d min')
+                plt.colorbar(cf, ax=ax4, fraction=0.046, pad=0.04,
+                             label='Minutes from simulation start')
+
+        ax4.scatter(df_iso['x'], df_iso['y'], c='black', s=15, zorder=5, alpha=0.7)
+        ax4.set_title('Flooding Start Isochrones\n(lines = same start time)', fontweight='bold')
+        ax4.set_xlabel('X (m)')
+        ax4.set_ylabel('Y (m)')
+        ax4.set_aspect('equal')
+        ax4.set_xlim(xlim)
+        ax4.set_ylim(ylim)
+
+        plt.suptitle('Spatial Flooding Analysis - Solution', fontsize=14, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        plt.savefig(save_dir / f"{self.fig_cont:02}_spatial_node_flooding.png", dpi=100)
+        plt.close(fig)
+        self.fig_cont = self.fig_cont + 1
 
 
 if __name__ == "__main__":

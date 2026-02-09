@@ -167,7 +167,7 @@ COST_COMPONENTS = {
 # =============================================================================
 # TANK DESIGN PARAMETERS
 # =============================================================================
-CAPACITY_MAX_HD = 0.75 # Maximum h/D ratio in conduits
+CAPACITY_MAX_HD = 0.  # Maximum h/D ratio in conduits
 CAPACITY_MAX_FOR_AVOIDED_COST = 0.75
 
 # 'flooding' for just avoid flooding nodes   or  'capacity' for avoiding h/D > DERIVATION_MAX_HD in all conduits
@@ -177,14 +177,14 @@ MINIMUN_FLOODING_FLOW = 0.1  # Minimum flooding flow to consider a node flooded 
 MAX_ITERATIONS = 100  # Max iterations for tank sizing convergence
 MAX_RESIZE_ITERATIONS = 10 # Max iterations for tank resizing convergence
 
-TANK_DEPTH_M = 10.0              # Default tank depth in meters
+TANK_DEPTH_M = 15.0              # Default tank depth in meters
 TANK_MIN_VOLUME_M3 = 1000.0     # Minimum tank volume in cubic meters
 TANK_MAX_VOLUME_M3 = 100000.0    # Maximum tank volume in cubic meters
 
 TANK_MIN_UTILIZATION_PCT = 20.0 # Minimum tank utilization % (warn if below this)
 TANK_VOLUME_ROUND_M3 = 100      # Round volumes to this increment for display
-MAX_TANKS = 10
-MAX_PRUNE_RETRIES =  2  # Max retries for pruning tanks
+MAX_TANKS = 3  # Maximum number of tanks to consider in optimization
+MAX_PRUNE_RETRIES = 2  # Max retries for pruning tanks
 MAX_PREDIO_SLOPE = 30.0 # Maximum allowed predio slope in %. Predios steeper than this are discarded.
 PREDIO_MAX_OCCUPANCY_RATIO = 0.85  # Exclude predios with >85% area occupied from path search
 
@@ -195,7 +195,7 @@ TANK_OCCUPATION_FACTOR = 150    # Extra space factor for access, pumps, maneuver
 
 WEIR_CREST_MIN_M = 0.1         # Minimum weir crest height above tank bottom (m)
 WEIR_DISCHARGE_COEFF = 1.84   # Weir discharge coefficient (Cd) for rectangular sharp-crested weir
-DERIVATION_MIN_DISTANCE_M = 50  # Minimum distance (m) between derivation points on same pipe line
+DERIVATION_MIN_DISTANCE_M = 100  # Minimum distance (m) between derivation points on same pipe line
 MIN_DETPH_FOR_DERIVATION_M = 6.0  # Minimum pipe depth tunnel
 
 # Pipeline Design Defaults (used in rut_16)
@@ -242,11 +242,18 @@ DEFAULT_ROAD_PREFERENCES = {
 }
 
 
+
 FLOODING_RANKING_WEIGHTS = {
-    'total_volume': 0.4,
-    'total_flow': 0.3,
-    'failure_probability': 0.3,
+    'flow_over_capacity': 0.3,
+    'flow_node_flooding': 0.3,
+    'vol_over_capacity': 0.,
+    'vol_node_flooding': 0.2,
+    'outfall_peak_flow':0.,
+    'failure_probability': 0.2,
 }
+
+
+CAPACITY_MATERIAL = {'HA': 1.0, 'PVC': 0.8, 'PEAD': 0.9}  # Relative capacity factors by material type
 
 # =============================================================================
 # INITIALIZATION MESSAGE

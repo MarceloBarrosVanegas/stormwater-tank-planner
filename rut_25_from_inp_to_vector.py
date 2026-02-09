@@ -1,11 +1,8 @@
-
 import swmmio
 import networkx as nx
 import geopandas as gpd
 import pandas as pd
-from shapely.geometry import LineString
 import os
-import shutil
 from pathlib import Path
 import unicodedata
 import numpy as np
@@ -145,8 +142,6 @@ class PhysicalNetwork:
         self.links_df['Ramal'] = self.links_df.apply(
             lambda row: edge_ids.get((row['InletNode'], row['OutletNode']), 0), axis=1
         ).astype('U256')
-
-
 
 
 class HydraulicNetwork:
@@ -322,7 +317,7 @@ class NetworkExporter:
                 print(f"Saving to {output_gpkg}...")
                 gdf.to_file(output_gpkg, driver='GPKG')
                 # print("Done.")
-                
+
             return gdf, nodes_df
 
         except Exception as e:

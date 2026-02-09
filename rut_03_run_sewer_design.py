@@ -23825,21 +23825,22 @@ if __name__ == "__main__":
     project_root = Path(os.getcwd()).parent
     elev_file = project_root / r"gis\01_raster\elev_10_dmq_reprojected.tif"
 
+
+    df = gpd.read_file(r'C:\Users\Alienware\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Seq_Iter_20\input_routes.gpkg', engine='pyogrio')
     flows_dict = {}
     pozo_hmin_dict = {}
-    for i, pair in enumerate([7.12, 1.658, 0.49, 0.9, 0.86, 0.5, 0.153]):
+    for i, pair in enumerate([4] * len(df)):
         ramal_name = str(i)
         flows_dict[ramal_name + '.0'] = pair
-        pozo_hmin_dict[ramal_name + '.0'] = 1.5
+        pozo_hmin_dict[ramal_name + '.0'] = 6
 
     pipeline = SewerPipeline(
         elev_file_path=str(elev_file),
-        vector_file_path=r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Case_0001\input_routes.gpkg',
-        project_name='Case_0001',
-        pozo_hmin_dict=pozo_hmin_dict,
+        vector_file_path=r'C:\Users\Alienware\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Seq_Iter_20\input_routes.gpkg',
+        project_name='Seq_Iter_20',
         flows_dict=flows_dict,
         proj_to=str(proj_to),
-        path_out=r'C:\Users\chelo\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Case_0001'
+        path_out=r'C:\Users\Alienware\OneDrive\SANTA_ISABEL\00_tanque_tormenta\codigos\optimization_results\Seq_Iter_20'
     )
 
     pipeline.run()

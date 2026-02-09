@@ -17,17 +17,13 @@ Dependencies
 """
 
 from __future__ import annotations
-import os
-import sys
 import numpy as np
 import pandas as pd
 import shutil
 import geopandas as gpd
 from pathlib import Path
-from collections import defaultdict
-
-
-
+from dataclasses import dataclass
+from dataclasses import asdict
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -53,6 +49,47 @@ DYNAMIC_EVALUATOR_AVAILABLE = True
 def format_currency(value: float, decimals: int = 2) -> str:
     """Format float as currency with thousands separator."""
     return f"${value:,.{decimals}f}"
+
+
+
+
+@dataclass
+class GreedyOptimizationResult:
+    flooding_vol_reduction: float
+    flooding_vol_reduction_pct: float
+    flooding_peak_flow_reduction: float
+    flooding_peak_flow_reduction_pct: float
+    outfall_peak_flow_reduction: float
+    outfall_peak_flow_reduction_pct: float
+    network_health: float
+    total_cost: float
+    n_tanks: int
+    n_iterations: int
+    results_df: pd.DataFrame
+
+    def get_objectives_array(self) -> np.ndarray:
+        """
+        Devuelve array [f0, f1, f2, f3, f4] para pymoo.
+        Todos negativos porque pymoo minimiza.
+        """
+
+        return np.array([
+            -self.flooding_vol_reduction_pct,  # maximizar → minimizar negativo
+            -self.flooding_peak_flow_reduction_pct,  # maximizar → minimizar negativo
+            -self.outfall_peak_flow_reduction_pct,  # maximizar → minimizar negativo
+            -self.network_health,  # maximizar → minimizar negativo
+            self.total_cost,  # minimizar directo
+        ])
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convierte a diccionario para serialización."""
+
+        result = asdict(self)
+        # Eliminar objetos no serializables si existen
+        result.pop('baseline_metrics', None)
+        result.pop('solution_metrics', None)
+        result.pop('results_df', None)
+        return result
 
 
 class GreedyTankOptimizer:
@@ -342,126 +379,141 @@ class GreedyTankOptimizer:
         return respuesta, max_by_tank, sink_by_ramal
     
 
-    def run_sequential(self) -> pd.DataFrame:
+    def run_sequential(self) -> GreedyOptimizationResult:
         """
-        Runs the iterative Greedy Sequential selection process.
+        Algoritmo Greedy Secuencial para optimización de tanques de tormenta.
         
-        Logic:
-        1. Select the top candidate from the ranked list.
-        2. Apply filtering (technical, spatial, and economic constraints).
-        3. If valid, 'install' the tank by updating predio area and used nodes.
-        4. Run a full SWMM simulation with the new configuration.
-        5. Generate comparison reports and update residual flooding.
+        Proceso Iterativo:
+        ===================
+        1. Selecciona el mejor candidato del ranking de nodos inundados
+        2. Aplica filtros (técnicos, espaciales, económicos)
+        3. Si es válido, "instala" el tanque actualizando el estado
+        4. Ejecuta simulación SWMM con la nueva configuración
+        5. Evalúa resultados y maneja errores (overflow, tanques pequeños)
+        6. Registra métricas y continúa hasta alcanzar condición de parada
+        
+        Returns:
+            pd.DataFrame: Historial de resultados por iteración
         """
-        # --- 1. INITIALIZATION & STATE SETUP ---
-        results = []
-        active_candidates = []
-        used_nodes = set()
-        permanently_excluded = set()
-        pruning_failures = {}
+        # =====================================================================
+        # FASE 1: INICIALIZACIÓN DEL ESTADO
+        # =====================================================================
+        results = []                    # Historial de resultados por iteración
+        active_candidates = []          # Tanques activamente instalados
+        used_nodes = set()              # Nodos ya ocupados por tanques
+        permanently_excluded = set()    # Nodos permanentemente excluidos
+        pruning_failures = {}           # Contador de fallos por nodo (para retry)
         
-        # Local metrics references
+        # Métricas de referencia (baseline sin intervención)
         self.baseline_metrics = self.metrics_extractor.metrics
         self.predios_gdf = self.metrics_extractor.predios_gdf
         self.nodes_gdf = self.metrics_extractor.nodes_gdf
         candidates = self.metrics_extractor.ranked_candidates.copy()
-
-        economic_history = []  # [(iteration, cost, savings, n_tanks)]
-        last_tank_config = None  # Track tank config to skip redundant graphs
         
+        # Log de inicio
         print(f"\n{'='*60}")
         print(f"  ITERATIVE GREEDY SEQUENTIAL ANALYSIS")
         print(f"{'='*60}")
         print(f"  Tank Depth: {config.TANK_DEPTH_M}m | Volume: {config.TANK_MIN_VOLUME_M3}-{config.TANK_MAX_VOLUME_M3} m³")
         print(f"  Max Prune Retries: {config.MAX_PRUNE_RETRIES}")
 
-        # --- 2. MAIN ITERATIVE SELECTION LOOP ---
+        # =====================================================================
+        # FASE 2: BUCLE PRINCIPAL DE SELECCIÓN ITERATIVA
+        # =====================================================================
         iteration = 0
         volume_condition = True
         
         while volume_condition:
+            # -----------------------------------------------------------------
+            # 2.1 VERIFICAR DISPONIBILIDAD DE CANDIDATOS
+            # -----------------------------------------------------------------
             if not candidates:
                 print("  [Warning] No more candidates available in ranked list.")
+                print(candidates)
                 break
-                
-            cand = candidates.pop(0)  # Take the current best
+            self.old_candidates = candidates.copy()  # Guardar estado antes de modificaciones
+            cand = candidates.pop(0)  # Toma el mejor candidato actual
 
-            # Skip if flooding volume is below threshold
+            # -----------------------------------------------------------------
+            # 2.2 APLICAR FILTROS DE ELEGIBILIDAD
+            # -----------------------------------------------------------------
+            # Filtro: Volumen mínimo de inundación
             if cand['total_volume'] < config.TANK_MIN_VOLUME_M3:
                 continue
-                
-            # Skip if node is already occupied
+            
+            # Filtro: Nodo ya ocupado
             if cand['node_id'] in used_nodes:
                 continue
             
-            # Skip if node has been permanently excluded
+            # Filtro: Nodo permanentemente excluido
             if cand['node_id'] in permanently_excluded:
                 continue
             
-            # Skip if node belongs to a newly designed pipeline (not original node)
+            # Filtro: Nodo pertenece a tubería diseñada (no es nodo original)
             if self.evaluator.last_designed_gdf is not None:
                 if cand['node_id'] in self.evaluator.last_designed_gdf['Pozo'].to_list():
                     continue
-                    
-            # Skip if pruning retry limit reached
+            
+            # Filtro: Límite de reintentos de poda alcanzado
             if pruning_failures.get(cand['node_id'], 0) >= config.MAX_PRUNE_RETRIES:
                 permanently_excluded.add(cand['node_id'])
                 continue
             
-            # Proximity check: Avoid clustering tanks too close to each other
+            # Filtro: Proximidad mínima entre tanques
             if config.DERIVATION_MIN_DISTANCE_M > 0 and active_candidates:
                 too_close = False
                 for active in active_candidates:
-                    dist = np.sqrt((cand['node_x'] - active['node_x'])**2 + (cand['node_y'] - active['node_y'])**2)
+                    dist = np.sqrt((cand['node_x'] - active['node_x'])**2 + 
+                                   (cand['node_y'] - active['node_y'])**2)
                     if dist < config.DERIVATION_MIN_DISTANCE_M:
                         too_close = True
                         break
                 if too_close:
-                    print('Aviso Casey: Candidate too close to existing tank, skipping.')
+                    print('  [Skip] Candidate too close to existing tank.')
                     continue
 
-            
+            # -----------------------------------------------------------------
+            # 2.3 REGISTRAR TANQUE COMO ACTIVO
+            # -----------------------------------------------------------------
             iteration += 1
-            # --- 2c. TANK INSTALLATION & REGISTRATION ---
             used_nodes.add(cand['node_id'])
             active_candidates.append(cand)
             
-            # Step logging
             print(f"\n  STEP {iteration}: Adding Tank @ {cand['node_id']}")
-            # print(f"  {'-'*45}")
-            # print(f"  Target Predio: (Tank #{n_tanks_in_predio})")
-            # print(f"  Flooding Volume: {cand['total_volume']:,.0f} m³")
-            # print(f"  Area Required: {required_area:,.0f} m² | Remaining: {predio_capacity[predio_idx]['total_area'] - predio_capacity[predio_idx]['used_area']:,.0f} m²")
 
-            # --- 2d. SIMULATION & EVALUATION ---
+            # -----------------------------------------------------------------
+            # 2.4 EJECUTAR SIMULACIÓN Y EVALUACIÓN
+            # -----------------------------------------------------------------
             print(f"  Running SWMM simulation for {len(active_candidates)} tanks...")
             self.solution_name = f"Seq_Iter_{iteration:02d}"
+            self.old_last_designed_gdf = self.evaluator.last_designed_gdf.copy() if self.evaluator.last_designed_gdf is not None else None
+
             
-            cost_link,  current_inp_file, overflow, small_tanks = self.evaluator.evaluate_solution(
+            cost, current_inp_file, overflow, small_tanks = self.evaluator.evaluate_solution(
                 active_candidates,
                 solution_name=self.solution_name,
                 current_metrics=self.metrics_extractor,
-                iteration = iteration
+                iteration=iteration
             )
             
+            # Verificar si la evaluación falló
             if current_inp_file is None:
-                print('No pair was evaluated successfully, continue the optimization.')
+                print('  [Warning] No pair was evaluated successfully, continuing...')
                 continue
             
-            # Update current state references
+            # Actualizar referencias de estado
             self.current_inp_file = current_inp_file
             self.case_dir = self.evaluator.case_dir
             self.current_metrics = self.evaluator.current_metrics
-       
-            
-            # ========================================================================
-            # EVALUACIÓN CONSISTENTE:
-            # - overflow: list (problemas) o False (OK)
-            # - small_tanks: list (problemas) o False (OK)
-            # ========================================================================
-            
+
+            # -----------------------------------------------------------------
+            # 2.5 MANEJAR PROBLEMAS (OVERFLOW / TANQUES PEQUEÑOS)
+            # -----------------------------------------------------------------
             if overflow or small_tanks:
-                node2info, _, _ = self.node_id_a_ramal_max_del_tanque(self.evaluator.cumulative_paths, return_tank_id=True)
+                # Obtener mapeo nodo → ramal máximo del tanque
+                node2info, _, _ = self.node_id_a_ramal_max_del_tanque(
+                    self.evaluator.cumulative_paths, return_tank_id=True
+                )
                 
                 if not hasattr(self.evaluator, 'forbidden_pairs'):
                     self.evaluator.forbidden_pairs = set()
@@ -469,228 +521,238 @@ class GreedyTankOptimizer:
                 overflow_nodes = set()
                 small_tank_nodes = set()
                 
-                # ====================================================================
-                # PARTE A: PROCESAR OVERFLOWS (Agregar a forbidden_pairs)
-                # ====================================================================
-                if overflow:  # overflow es list (nunca True)
+                # --- PROCESAR OVERFLOWS (inviabilidad física) ---
+                if overflow:
                     print(f"\n  [Overflow Summary] Found {len(overflow)} predio capacity overflow(s):")
-                    
                     for idx, ovf in enumerate(overflow, 1):
                         node_id = ovf['node_id']
                         target_id = ovf['target_id']
-                        
                         print(f"    {idx}. Tank {ovf['tank_id']} at predio {ovf['predio_id']} (node {node_id})")
                         print(f"       → Exceeded physical capacity")
                         
-                        # CRÍTICO: Agregar a forbidden_pairs (inviabilidad física)
+                        # Agregar a forbidden_pairs (permanente)
                         self.evaluator.forbidden_pairs.add((str(node_id), str(target_id)))
                         print(f"       → Added ({node_id}, {target_id}) to FORBIDDEN pairs")
-                        
                         overflow_nodes.add(node_id)
-                
-                # ====================================================================
-                # PARTE B: PROCESAR SMALL TANKS (NO agregar a forbidden_pairs)
-                # ====================================================================
-                if small_tanks:  # small_tanks es list (nunca True)
+
+                # --- PROCESAR TANQUES PEQUEÑOS (puede reintentarse) ---
+                if small_tanks:
                     print(f"\n  [Small Tank Summary] Found {len(small_tanks)} undersized tank(s):")
-                    
                     for idx, st in enumerate(small_tanks, 1):
                         node_id = st['node_id']
-                        
                         print(f"    {idx}. Tank {st['tank_id']} at predio {st['predio_id']} (node {node_id})")
                         print(f"       → Volume: {st['stored_volume']:.2f} m³ < {config.TANK_MIN_VOLUME_M3} m³")
-                        
-                        # CRÍTICO: NO agregar a forbidden_pairs (podría funcionar con otro candidato)
                         print(f"       → Will retry (NOT adding to forbidden pairs)")
-                        
                         small_tank_nodes.add(node_id)
                 
-                # ====================================================================
-                # PARTE C: CONSOLIDAR Y LIMPIAR
-                # ====================================================================
+                # --- LIMPIAR ESTADO PARA RETRY ---
                 all_nodes = overflow_nodes.union(small_tank_nodes)
-                
                 print(f"\n  [Cleanup Summary]")
                 print(f"    - Overflows (forbidden): {len(overflow_nodes)} node(s)")
                 print(f"    - Small tanks (not forbidden): {len(small_tank_nodes)} node(s)")
                 print(f"    - Total to clean: {len(all_nodes)} node(s)")
-                
-                
 
-
-                # Limpiar paths
+                # Limpiar paths de nodos problemáticos
                 for node_id in all_nodes:
                     if node_id in self.evaluator.cumulative_paths:
                         data_to_erase = node2info[node_id]
                         ramal_to_erase = str(data_to_erase['max_ramal'])
-                        node_id_to_erase = [_ for _, __ in self.evaluator.cumulative_paths.items() if ramal_to_erase == __.node_ramal.item()][0]
+                        node_id_to_erase = [
+                            nid for nid, gdf in self.evaluator.cumulative_paths.items() 
+                            if ramal_to_erase == gdf.node_ramal.item()
+                        ][0]
+
+                        used_nodes.discard(node_id_to_erase)
                         del self.evaluator.cumulative_paths[node_id_to_erase]
-                
+
+                        contador  = 1
+                        for node_id, path_gdf in self.evaluator.cumulative_paths.items():
+                            if contador != int(path_gdf.node_ramal.item()):
+                                path_gdf['node_ramal'] = str(contador)
+                                path_gdf['target_ramal'] = str(contador)
+                            contador += 1
+
+
                 # Limpiar candidatos activos
                 active_candidates = [
                     p for p in active_candidates
                     if str(p.get('node_id')) not in {str(nid) for nid in [node_id_to_erase]}
                 ]
+
+
                 
-                # Limpiar directorio
-                self._remove_case_directory()
-                
-                # Preparar para retry
-                iteration = iteration - 1
-                candidates = self.metrics_extractor.ranked_candidates.copy()
-                
+                # Limpiar directorio y preparar retry
+                # self._remove_case_directory()
+                iteration -= 1
+                candidates = self.old_candidates
+
+                self.evaluator.last_designed_gdf = self.old_last_designed_gdf.copy() if self.old_last_designed_gdf is not None else None
                 print(f"\n  [Retry] Continuing with {len(active_candidates)} remaining candidate(s)\n")
-                
-                # Continuar con siguiente candidato
                 continue
 
-
-
-
-
-            n_tanks = 0
-            for pair in active_candidates:
-                if pair['is_tank']:
-                    n_tanks += 1
-                    # Get tank volume from designed data
-                    predio_id = pair['predio_id']
-                    tank_id = f"tank_{predio_id}"
-                    tank_volume = self.current_metrics.tank_data[tank_id]['total_volume']
-                    tank_depth = self.current_metrics.tank_data[tank_id]['max_depth']
-                    pair['tank_volume_simulation'] = tank_volume
-                    pair['tank_max_depth'] = tank_depth
-                    pair['cost_tank'] = CostCalculator.calculate_tank_cost(tank_volume)
-                    pair['cost_land'] = (tank_volume / config.TANK_DEPTH_M ) * config.LAND_COST_PER_M2
-                
-            cost_tank_land = 0.0
-            for pair in active_candidates:
-                if pair['is_tank']:
-                    cost_tank_land += pair['cost_tank'] + pair['cost_land']
-                
-            self.current_metrics.cost = cost_link + cost_tank_land
+            # -----------------------------------------------------------------
+            # 2.6 REGISTRAR RESULTADOS DE ITERACIÓN EXITOSA
+            # -----------------------------------------------------------------
+            # # Comparación visual con baseline
+            # self.compare_solutions(active_candidates)
             
-            # Detailed visual and tabular comparison
-            self.compare_solutions(active_candidates)
-
+            # Refrescar candidatos para siguiente iteración
             candidates = self.metrics_extractor.ranked_candidates.copy()
 
-            # Sum component costs
-            total_tank_cost = sum(p['cost_tank'] for p in active_candidates if p['is_tank'])
-            total_land_cost = sum(p['cost_land'] for p in active_candidates if p['is_tank'])
-            total_tank_volume = sum(p['tank_volume_simulation'] for p in active_candidates if p['is_tank'])
+            # Extraer datos de costos del diccionario estructurado
+            cost_dict = self.current_metrics.cost
+            n_tanks = cost_dict['n_tanks']
             
-            # Risk Proxy (Residual Flood Damage)
-            residual_damage = self.current_metrics.total_flooding_volume * self.flooding_cost_per_m3
+            # Volumen total de tanques acumulado
+            total_tank_volume = sum(
+                p['tank_volume_simulation'] for p in active_candidates 
+                if p.get('is_tank')
+            )
             
-            # Calculate MARGINAL values
-            if results:
-                prev = results[-1]
-                marginal_cost = self.current_metrics.cost - prev['cost_total']
-                marginal_reduction = prev['flooding_volume'] - self.current_metrics.total_flooding_volume
-                marginal_tank_volume = total_tank_volume - prev['total_tank_volume']
-            else:
-                marginal_cost = self.current_metrics.cost
-                marginal_reduction = self.baseline_metrics.total_flooding_volume - self.current_metrics.total_flooding_volume
-                marginal_tank_volume = total_tank_volume
-            
-            # Get current tank's individual data
-            current_tank_cost = cand.get('cost_tank', 0) if cand.get('is_tank') else 0
-            current_tank_land_cost = cand.get('cost_land', 0) if cand.get('is_tank') else 0
-            current_tank_volume = cand.get('tank_volume_simulation', 0) if cand.get('is_tank') else 0
+            # Iteración anterior (para cálculos marginales)
+            prev = results[-1] if results else None
 
-            results.append({
-                # --- Identification ---
+            # Construir diccionario de resultados
+            result = {
+                # Identificación
                 'step': iteration,
                 'n_tanks': n_tanks,
                 'added_node': cand['node_id'],
                 'added_predio': cand.get('predio_id', ''),
                 
-                # --- Cost Breakdown (Cumulative) ---
-                'cost_total': self.current_metrics.cost,
-                'cost_links': cost_link,
-                'cost_tanks': total_tank_cost,
-                'cost_land': total_land_cost,
-                'cost_replacements': cost_link * 0.20, 
+                # Costos de inversión (CAPEX)
+                'cost_investment_total': cost_dict['investment']['total'],
+                'cost_links': cost_dict['investment']['links'],
+                'cost_tanks': cost_dict['investment']['tanks'],
+                'cost_land': cost_dict['investment']['land'],
                 
-                # --- Cost Breakdown (MARGINAL - This Tank Only) ---
-                'marginal_cost': marginal_cost,
-                'marginal_tank_cost': current_tank_cost,
-                'marginal_land_cost': current_tank_land_cost,
-                'marginal_tank_volume': marginal_tank_volume,
+                # Costos residuales (daños)
+                'cost_residual_total': cost_dict['residual']['total'],
+                'cost_residual_flood': cost_dict['residual']['flood_damage'],
+                'cost_residual_infra': cost_dict['residual']['infrastructure_repair'],
                 
-                # --- Hydraulic Performance (Cumulative) ---
+                # Datos del tanque actual
+                'current_tank_cost': cand.get('cost_tank', 0) if cand.get('is_tank') else 0,
+                'current_tank_land': cand.get('cost_land', 0) if cand.get('is_tank') else 0,
+                'current_tank_volume': cand.get('tank_volume_simulation', 0) if cand.get('is_tank') else 0,
+                
+                # Desempeño hidráulico
                 'flooding_volume': self.current_metrics.total_flooding_volume,
                 'flooding_reduction': self.baseline_metrics.total_flooding_volume - self.current_metrics.total_flooding_volume,
+                'marginal_reduction': (prev['flooding_volume'] - self.current_metrics.total_flooding_volume) if prev else (self.baseline_metrics.total_flooding_volume - self.current_metrics.total_flooding_volume),
                 'outfall_peak_flow': self.current_metrics.total_max_outfall_flow,
                 'flooded_nodes_count': self.current_metrics.flooded_nodes_count,
                 
-                # --- Hydraulic Performance (MARGINAL - This Tank Only) ---
-                'marginal_reduction': marginal_reduction,
+                # Métricas de eficiencia
+                'efficiency_m3_per_dollar': ((prev['flooding_volume'] - self.current_metrics.total_flooding_volume) / cost_dict['investment']['total']) if prev and cost_dict['investment']['total'] > 0 else 0,
+                'cost_per_m3_reduced': (cost_dict['investment']['total'] / (prev['flooding_volume'] - self.current_metrics.total_flooding_volume)) if prev and (prev['flooding_volume'] - self.current_metrics.total_flooding_volume) > 0 else 0,
                 
-                # --- Efficiency Metrics ---
-                'efficiency_m3_per_dollar': marginal_reduction / marginal_cost if marginal_cost > 0 else 0,
-                'cost_per_m3_reduced': marginal_cost / marginal_reduction if marginal_reduction > 0 else 0,
-                
-                # --- Network Health ---
+                # Salud de la red
                 'surcharged_links_count': self.current_metrics.surcharged_links_count,
                 'overloaded_links_length': self.current_metrics.overloaded_links_length,
                 'system_mean_utilization': self.current_metrics.system_mean_utilization,
                 
-                # --- Infrastructure Specs ---
+                # Infraestructura
                 'total_tank_volume': total_tank_volume,
-                'current_tank_volume': current_tank_volume,
                 
-                # --- Economic Risk (Proxy) ---
-                'residual_damage_usd': residual_damage,
-                'total_social_cost': self.current_metrics.cost + residual_damage,
-                
-                # --- Legacy/Display ---
-                'cost_display': format_currency(self.current_metrics.cost),
-                'cost': format_currency(self.current_metrics.cost),
-                'flooding_remaining': self.current_metrics.total_flooding_volume 
-            })
+                # Display
+                'cost_display': format_currency(cost_dict['investment']['total']),
+                'flooding_remaining': self.current_metrics.total_flooding_volume
+            }
+            
+            # Guardar CSV de esta iteración
+            df_result = pd.DataFrame([result])
+            df_result.to_csv(Path(self.case_dir) / f"step_{iteration:02d}_summary.csv", index=False)
+            results.append(result)
 
-
-
-            # === SPATIAL EXPORT (Network Health Snapshot) ===
-            # Export the network state (with utilization) for this iteration
+            # Exportar snapshot espacial de la red
             if hasattr(self.current_metrics, 'swmm_gdf') and not self.current_metrics.swmm_gdf.empty:
                 self._export_spatial_snapshot(iteration, self.current_metrics.swmm_gdf)
             
-            # === BREAK CONDITIONS ===
-            # 1. Volume Condition: Stop if flooding is effectively zero
+            # -----------------------------------------------------------------
+            # 2.7 VERIFICAR CONDICIONES DE PARADA
+            # -----------------------------------------------------------------
+            # Condición 1: Inundación efectivamente eliminada
             if self.current_metrics.total_flooding_volume < config.TANK_MIN_VOLUME_M3:
                 print(f"  [Stop] Flooding reduced to near zero ({self.current_metrics.total_flooding_volume:.1f} m³).")
                 volume_condition = False
                 break
-                
-            # 2. Hard Stop: Max iterations safety
+            
+            # Condición 2: Máximo de iteraciones alcanzado
             if iteration >= config.MAX_TANKS:
                 print(f"  [Stop] Max sequential iterations ({config.MAX_TANKS}) reached.")
                 volume_condition = False
                 break
-
-        # === GENERATE VISUAL RESULTS DASHBOARD (New Series 07) ===
-        if results:
-            df_results = pd.DataFrame(results)
-            dash_gen = EvolutionDashboardGenerator(df_results, Path("optimization_results"))
-            dash_gen.generate_all()
-            
-            # Save CSV tracking
-            csv_path = Path("optimization_results") / "sequence_tracking.csv"
-            df_results.to_csv(csv_path, index=False)
-            print(f"  [Tracking] Saved CSV: {csv_path}")
-
-
-        # # === GENERATE SUMMARY TEXT FILE ===
-        # if active_candidates and self.evaluator:
-        #     self._generate_summary_report(active_candidates, economic_history, predio_capacity)
         #
-        # # === EXPORT SELECTED PREDIOS AS GPKG ===
-        # if active_candidates:
-        #     self._export_selected_predios_gpkg(active_candidates, predio_capacity)
-        
-        return pd.DataFrame(results)
+        # # =====================================================================
+        # # FASE 3: GENERAR REPORTES FINALES
+        # # =====================================================================
+        # if results:
+        #     df_results = pd.DataFrame(results)
+        #
+        #     # Dashboard visual de evolución
+        #     dash_gen = EvolutionDashboardGenerator(df_results, Path("optimization_results"))
+        #     dash_gen.generate_all()
+        #
+        #     # CSV consolidado
+        #     csv_path = Path("optimization_results") / "sequence_tracking.csv"
+        #     df_results.to_csv(csv_path, index=False)
+        #     print(f"  [Tracking] Saved CSV: {csv_path}")
+
+
+        #optimization results
+        # Calcular métricas vs baseline
+        baseline = self.baseline_metrics
+        final = self.current_metrics
+
+        flooding_vol_reduction = baseline.total_flooding_volume - final.total_flooding_volume
+        flooding_vol_reduction_pct = flooding_vol_reduction / baseline.total_flooding_volume if baseline.total_flooding_volume > 0 else 0
+
+        # Flooding peak flow (max de todos los nodos)
+        baseline_flood_flow = max((d.get('max_flooding_flow', 0) for d in baseline.node_data.values()), default=0)
+        final_flood_flow = max((d.get('max_flooding_flow', 0) for d in final.node_data.values()), default=0)
+        flooding_peak_flow_reduction = baseline_flood_flow - final_flood_flow
+        flooding_peak_flow_reduction_pct = flooding_peak_flow_reduction / baseline_flood_flow if baseline_flood_flow > 0 else 0
+
+        # Outfall peak flow
+        outfall_reduction = baseline.total_max_outfall_flow - final.total_max_outfall_flow
+        outfall_reduction_pct = outfall_reduction / baseline.total_max_outfall_flow if baseline.total_max_outfall_flow > 0 else 0
+
+        # Network health: capacity ponderada por caudal
+        if hasattr(final, 'swmm_gdf') and not final.swmm_gdf.empty:
+            gdf = final.swmm_gdf
+            valid = gdf[gdf['Capacity'] > 0].copy()
+            if not valid.empty and 'MaxFlow' in valid.columns:
+                total_flow = valid['MaxFlow'].sum()
+                if total_flow > 0:
+                    weighted_util = (valid['Capacity'] * valid['MaxFlow']).sum() / total_flow
+                    network_health = 1.0 - weighted_util  # Mayor es mejor
+                else:
+                    network_health = 0.0
+            else:
+                network_health = 0.0
+        else:
+            network_health = 0.0
+
+        # Del último resultado
+        last = results[-1]
+        total_cost = last['cost_investment_total']
+        n_tanks = last['n_tanks']
+
+        return GreedyOptimizationResult(
+            flooding_vol_reduction=flooding_vol_reduction,
+            flooding_vol_reduction_pct=flooding_vol_reduction_pct,
+            flooding_peak_flow_reduction=flooding_peak_flow_reduction,
+            flooding_peak_flow_reduction_pct=flooding_peak_flow_reduction_pct,
+            outfall_peak_flow_reduction=outfall_reduction,
+            outfall_peak_flow_reduction_pct=outfall_reduction_pct,
+            network_health=network_health,
+            total_cost=total_cost,
+            n_tanks=n_tanks,
+            n_iterations=len(results),
+            results_df=pd.DataFrame(results),
+        )
+
 
     def _export_spatial_snapshot(self, iteration: int, swmm_gdf: gpd.GeoDataFrame):
         """

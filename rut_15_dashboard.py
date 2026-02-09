@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 from pathlib import Path
+import matplotlib.transforms as mtransforms
 from datetime import datetime
 from matplotlib.ticker import MaxNLocator, FuncFormatter
 
@@ -41,8 +42,6 @@ class EvolutionDashboardGenerator:
         self.plot_cost_reduction_evolution()
         self.plot_roi_curve()
 
-
-        
     def format_currency_smart(self, x, pos=None):
         """Dynamic formatting for large currency values."""
         if x >= 1e9:
@@ -68,23 +67,43 @@ class EvolutionDashboardGenerator:
             tank_id = is_new_tank.cumsum()
             
             # Group by physical tank - sum all costs
+            # Calculate marginal cost from consecutive investment totals
+            self.df['_marginal_cost'] = self.df['cost_investment_total'].diff().fillna(self.df['cost_investment_total'].iloc[0])
+            
             tank_groups = self.df.groupby(tank_id).agg({
-                'marginal_cost': 'sum',
+                '_marginal_cost': 'sum',
                 'marginal_reduction': 'sum',
                 'current_tank_volume': 'first',
                 'added_predio': 'first',
                 'step': 'first',
             }).reset_index(drop=True)
             
-            tank_cost = tank_groups['marginal_cost']
+            tank_cost = tank_groups['_marginal_cost']
             tank_reduction = tank_groups['marginal_reduction']
             tank_volume = tank_groups['current_tank_volume'].fillna(1000)
             tank_predio = tank_groups['added_predio']
             tank_step = tank_groups['step']
             
             # Calculate efficiency: $/m³ reduced
+            # Mark as invalid (inf) if cost <= 0 OR reduction <= 0
             cost_per_m3 = tank_cost / tank_reduction.replace(0, np.nan)
-            cost_per_m3 = cost_per_m3.fillna(cost_per_m3.max())
+            
+            # Identify invalid entries (negative cost, negative reduction, or zero)
+            is_invalid = (tank_cost <= 0) | (tank_reduction <= 0) | (cost_per_m3 < 0)
+            
+            # For valid entries only, get min/max for colormap
+            valid_cpm = cost_per_m3[~is_invalid]
+            if len(valid_cpm) > 0:
+                cpm_valid_max = valid_cpm.max()
+            else:
+                cpm_valid_max = 1000  # fallback
+            
+            # Replace invalid with a very high value for sorting (will go to bottom)
+            cost_per_m3_for_sort = cost_per_m3.copy()
+            cost_per_m3_for_sort[is_invalid] = np.inf
+            
+            # For display, keep original but mark as invalid
+            cost_per_m3 = cost_per_m3.fillna(cpm_valid_max)
             
             # Normalize for colormap (inverted: lower = better = green)
             cpm_min, cpm_max = cost_per_m3.min(), cost_per_m3.max()
@@ -92,20 +111,17 @@ class EvolutionDashboardGenerator:
                 cpm_normalized = 1 - ((cost_per_m3 - cpm_min) / (cpm_max - cpm_min))
             else:
                 cpm_normalized = pd.Series([0.5] * len(cost_per_m3))
+
             
-            # Size based on tank volume
-            if tank_volume.max() > 0:
-                sizes = 100 + (tank_volume / tank_volume.max()) * 200
-            else:
-                sizes = 400
+            # Create figure with table left, two charts stacked on right
+            fig = plt.figure(figsize=(24, 14))
             
-            # Create figure with two panels: table left, scatter right
-            fig = plt.figure(figsize=(22, 10))
-            
-            # Create GridSpec
-            gs = fig.add_gridspec(1, 2, width_ratios=[0.28, 0.72], wspace=0.15)
-            ax_table = fig.add_subplot(gs[0, 0])
-            ax = fig.add_subplot(gs[0, 1])
+            # Create GridSpec: left column for table, right column for 2 stacked charts
+            gs = fig.add_gridspec(2, 2, width_ratios=[0.25, 0.75], height_ratios=[1, 1], 
+                                  wspace=0.12, hspace=0.25)
+            ax_table = fig.add_subplot(gs[:, 0])  # Table spans both rows
+            ax_bar = fig.add_subplot(gs[0, 1])    # Bar chart on top
+            ax_evo = fig.add_subplot(gs[1, 1])    # Evolution chart on bottom
             
             # === LEFT PANEL: TABLE ===
             ax_table.axis('off')
@@ -113,6 +129,11 @@ class EvolutionDashboardGenerator:
             # Prepare table data - KEEP ORIGINAL ORDER FIRST
             table_rows = []
             for i in range(len(tank_groups)):
+                # Check if this entry is invalid
+                is_inv = is_invalid.iloc[i] if hasattr(is_invalid, 'iloc') else is_invalid[i]
+                eff_display = "N/A" if is_inv else f"${cost_per_m3.iloc[i]:,.0f}"
+                eff_sort = cost_per_m3_for_sort.iloc[i] if hasattr(cost_per_m3_for_sort, 'iloc') else cost_per_m3_for_sort[i]
+                
                 table_rows.append({
                     'original_idx': i,  # Track original index
                     'tank_label': f"T{i+1}",
@@ -120,11 +141,12 @@ class EvolutionDashboardGenerator:
                     'costo': self.format_currency_smart(tank_cost.iloc[i]),
                     'reduccion': f"{tank_reduction.iloc[i]:,.0f}",
                     'volumen': f"{tank_volume.iloc[i]:,.0f}",
-                    'eficiencia': f"${cost_per_m3.iloc[i]:,.0f}",
-                    'eficiencia_num': cost_per_m3.iloc[i]  # For sorting
+                    'eficiencia': eff_display,
+                    'eficiencia_num': eff_sort,  # For sorting (inf for invalid)
+                    'is_invalid': is_inv
                 })
             
-            # Sort by efficiency (lowest first = best)
+            # Sort by efficiency (lowest first = best, inf goes to bottom)
             table_rows_sorted = sorted(table_rows, key=lambda x: x['eficiencia_num'])
 
             
@@ -157,14 +179,20 @@ class EvolutionDashboardGenerator:
             table.set_fontsize(10)
             table.scale(1.0, 2.0)
             
-            # Style table
+            # Style table - mark invalid rows with light red
             for (i, j), cell in table.get_celld().items():
                 if i == 0:  # Header
                     cell.set_text_props(fontweight='bold', color='white', fontsize=11)
                     cell.set_facecolor('#2e5cb8')
                     cell.set_height(0.08)
                 else:  # Data rows
-                    cell.set_facecolor('#f0f0f0' if i % 2 == 0 else 'white')
+                    row_data = table_rows_sorted[i-1] if i-1 < len(table_rows_sorted) else None
+                    if row_data and row_data.get('is_invalid', False):
+                        # Invalid entries: light red background
+                        cell.set_facecolor('#ffcdd2')
+                        cell.set_text_props(color='#b71c1c')
+                    else:
+                        cell.set_facecolor('#f0f0f0' if i % 2 == 0 else 'white')
                     cell.set_height(0.08)
                 cell.set_edgecolor('#aaaaaa')
                 cell.set_linewidth(1.5)
@@ -172,117 +200,159 @@ class EvolutionDashboardGenerator:
             ax_table.set_title('Ranking de Eficiencia\n(Ordenado: Mejor → Peor)',
                               fontsize=14, fontweight='bold', pad=15)
             
-            # === RIGHT PANEL: SCATTER PLOT ===
-            scatter = ax.scatter(
-                tank_cost,
-                tank_reduction,
-                c=cpm_normalized,
-                cmap='RdYlGn',
-                s=sizes,
-                alpha=1.0,
-                edgecolors='black',
-                linewidths=2.5,
-                zorder=5,
-                vmin=0,
-                vmax=1
-            )
+            # === TOP RIGHT: BAR CHART - Eficiencia por Tanque ===
+            tank_labels = [f"T{i+1}" for i in range(len(tank_groups))]
             
-            # Labels - USE ORIGINAL ORDER (T1, T2, ..., T8)
-            for i, (cost, reduction, predio) in enumerate(zip(tank_cost, tank_reduction, tank_predio)):
-                # Color code the label based on rank
-                eff_rank = [r['original_idx'] for r in table_rows_sorted].index(i) + 1
+            # Get efficiency values (use a high value for invalid ones for display)
+            eff_values = cost_per_m3.copy()
+            eff_display = eff_values.copy()
+            
+            # For invalid entries, set to 0 for bar height (will show as N/A)
+            for i in range(len(eff_display)):
+                if is_invalid.iloc[i] if hasattr(is_invalid, 'iloc') else is_invalid[i]:
+                    eff_display.iloc[i] = 0
+            
+            # Colors: normalize valid entries only (green = low/good, red = high/bad)
+            valid_eff = eff_values[~is_invalid]
+            if len(valid_eff) > 0:
+                eff_mean ,eff_min, eff_max = valid_eff.mean(), valid_eff.min(), valid_eff.max()
+            else:
+                eff_min, eff_max = 0, 1000
                 
-                # Color label based on efficiency ranking
-                if eff_rank <= 3:
-                    label_color = '#1b5e20'  # Dark green for best
-                elif eff_rank >= 6:
-                    label_color = '#b71c1c'  # Dark red for worst
+            # Create color array
+            colors = []
+            for i in range(len(eff_values)):
+                is_inv = is_invalid.iloc[i] if hasattr(is_invalid, 'iloc') else is_invalid[i]
+                if is_inv:
+                    colors.append('#cccccc')  # Gray for invalid
                 else:
-                    label_color = '#f57f17'  # Amber for middle
+                    # Normalize: 0 = best (green), 1 = worst (red)
+                    if eff_max > eff_min:
+                        norm = (eff_values.iloc[i] - eff_min) / (eff_max - eff_min)
+                    else:
+                        norm = 0.5
+                    colors.append(plt.cm.RdYlGn(1 - norm))  # Invert so green=low
+            
+            # Create bar chart
+            x_pos = np.arange(len(tank_labels))
+            bars = ax_bar.bar(x_pos, eff_display, color=colors, edgecolor='black', linewidth=1.5)
+            
+            # Add value labels on bars
+            for i, (bar, val) in enumerate(zip(bars, eff_values)):
+                is_inv = is_invalid.iloc[i] if hasattr(is_invalid, 'iloc') else is_invalid[i]
+                if is_inv:
+                    label = "N/A"
+                    y_pos = eff_max * 0.1 if eff_max > 0 else 100
+                    color = '#888888'
+                else:
+                    label = f"${val:,.0f}"
+                    y_pos = bar.get_height()
+                    color = 'black'
                 
-                ax.annotate(
-                    f"T{i+1}",
-                    xy=(cost, reduction),
-                    xytext=(12, 0),
-                    textcoords='offset points',
-                    fontsize=12,
-                    fontweight='bold',
-                    ha='left',
-                    va='center',
-                    color=label_color,
-                    bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
-                             alpha=0.95, edgecolor=label_color, linewidth=2),
-                )
+                ax_bar.text(bar.get_x() + bar.get_width()/2, y_pos + eff_max*0.02,
+                       label, ha='center', va='bottom', fontsize=9, fontweight='bold',
+                       color=color, rotation=45)
+            
+            # Styling
+            ax_bar.set_xticks(x_pos)
+            ax_bar.set_xticklabels(tank_labels, fontsize=10, fontweight='bold')
+            ax_bar.set_xlabel('Tanque', fontsize=12, fontweight='bold')
+            ax_bar.set_ylabel('Eficiencia ($/m³)', fontsize=12, fontweight='bold')
+            ax_bar.set_title(f'Eficiencia por Tanque: Costo por m³ Reducido\n({len(tank_groups)} Tanques, {is_invalid.sum()} N/A)',
+                         fontsize=14, fontweight='bold', pad=10)
             
             # Grid
-            ax.grid(True, linestyle='--', alpha=0.3, color='#cccccc', linewidth=1)
-            ax.set_axisbelow(True)
+            ax_bar.grid(True, linestyle='--', alpha=0.4, color='#cccccc', axis='y', linewidth=1)
+            ax_bar.set_axisbelow(True)
             
-            # Trend line
-            if len(tank_cost) > 1:
-                z = np.polyfit(tank_cost, tank_reduction, 1)
-                p = np.poly1d(z)
-                y_pred = p(tank_cost)
-                ss_res = np.sum((tank_reduction - y_pred) ** 2)
-                ss_tot = np.sum((tank_reduction - np.mean(tank_reduction)) ** 2)
-                r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-                
-                x_trend = np.linspace(tank_cost.min() * 0.8, tank_cost.max() * 1.1, 100)
-                ax.plot(x_trend, p(x_trend), '--', color='#1a237e', alpha=0.8, linewidth=3)
-                
-                eq_text = f"y = {z[0]:.4f}x + {z[1]:,.0f}\nR² = {r_squared:.3f}"
-                ax.text(0.98, 0.02, eq_text, transform=ax.transAxes, fontsize=11,
-                        verticalalignment='bottom', horizontalalignment='right',
-                        bbox=dict(boxstyle='round,pad=0.5', facecolor='#bbdefb',
-                                 alpha=0.95, edgecolor='#1a237e', linewidth=2),
-                        fontfamily='monospace')
+            # Y axis formatting
+            ax_bar.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
             
-            # Colorbar
-            cbar = plt.colorbar(scatter, ax=ax, shrink=0.7, pad=0.02)
-            cbar.set_label('Eficiencia ($/m³)\nVERDE=Mejor | ROJO=Peor', fontsize=12, fontweight='bold')
-            cbar.set_ticks([0, 0.5, 1])
-            cbar.set_ticklabels([f'${cpm_max:,.0f}', f'${(cpm_max+cpm_min)/2:,.0f}', f'${cpm_min:,.0f}'])
+            # # Add average line
+            # if len(valid_eff) > 0:
+            #
+            #     ax_bar.axhline(y=eff_mean, color='#1976d2', linestyle='--', linewidth=2.5,
+            #               label=f'Promedio: ${eff_mean:,.0f}/m³')
+            #     ax_bar.legend(loc='upper right', fontsize=11, framealpha=0.95)
             
-            # Axis formatting
-            ax.set_xlabel('Costo Total del Tanque ($)', fontsize=14, fontweight='bold')
-            ax.set_ylabel('Reducción de Inundación (m³)', fontsize=14, fontweight='bold')
-            ax.set_title(f'Eficiencia por Tanque: Costo vs Reducción\n({len(tank_groups)} Tanques)',
-                         fontsize=16, fontweight='bold', pad=15)
+            # === BOTTOM RIGHT: EVOLUTION CHART - Eficiencia Promedio Acumulada ===
+            # Calculate running average efficiency: total_cost / total_reduction at each tank
+            tank_numbers = np.arange(1, len(tank_groups) + 1)  # 1 to N tanks
             
-            ax.xaxis.set_major_formatter(FuncFormatter(self.format_currency_smart))
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:,.0f}'))
+            # Calculate cumulative cost and reduction for each tank
+            cumulative_cost = np.cumsum(tank_cost.values)
+            cumulative_reduction = np.cumsum(tank_reduction.values)
             
-            # Axis limits
-            x_margin = (tank_cost.max() - tank_cost.min()) * 0.25
-            y_margin = (tank_reduction.max() - tank_reduction.min()) * 0.15
-            ax.set_xlim(max(0, tank_cost.min() - x_margin), tank_cost.max() + x_margin)
-            ax.set_ylim(max(0, tank_reduction.min() - y_margin), tank_reduction.max() + y_margin)
+            # Running average efficiency
+            running_avg_eff = np.where(cumulative_reduction > 0, 
+                                       cumulative_cost / cumulative_reduction, 
+                                       np.nan)
             
-            # Summary box
-            total_cost_sum = self.df['cost_total'].iloc[-1]
+            # Plot line
+            ax_evo.plot(tank_numbers, running_avg_eff, 'o-', color='#1976d2', linewidth=2.5,
+                       markersize=10, markeredgecolor='#0d47a1', markeredgewidth=1.5,
+                       label='Eficiencia Promedio Acumulada')
+            
+            # Fill area under curve
+            ax_evo.fill_between(tank_numbers, 0, running_avg_eff, alpha=0.2, color='#64b5f6')
+            
+            # Add value labels
+            for i, (tank_num, eff) in enumerate(zip(tank_numbers, running_avg_eff)):
+                if not np.isnan(eff):
+                    ax_evo.annotate(f'${eff:,.0f}', xy=(tank_num, eff), xytext=(0, 10),
+                                   textcoords='offset points', ha='center', va='bottom',
+                                   fontsize=9, fontweight='bold', color='#0d47a1',
+                                   bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
+                                            alpha=0.8, edgecolor='none'))
+            
+            # Styling
+            ax_evo.set_xticks(tank_numbers)
+            ax_evo.set_xticklabels([f'T{i}' for i in tank_numbers], fontsize=9, fontweight='bold')
+            ax_evo.set_xlabel('Tanque (Acumulado)', fontsize=12, fontweight='bold')
+            ax_evo.set_ylabel('Eficiencia Promedio ($/m³)', fontsize=12, fontweight='bold')
+            ax_evo.set_title('Evolución de la Eficiencia Promedio: $/m³ al Agregar Tanques',
+                            fontsize=14, fontweight='bold', pad=10)
+            
+            ax_evo.grid(True, linestyle='--', alpha=0.4, color='#cccccc', linewidth=1)
+            ax_evo.set_axisbelow(True)
+            ax_evo.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'${x:,.0f}'))
+            ax_evo.legend(loc='upper left', fontsize=10, framealpha=0.95)
+            
+            # Summary box (on bar chart)
+            total_cost_sum = self.df['cost_investment_total'].iloc[-1]
             total_reduction_sum = self.df['flooding_reduction'].iloc[-1]
             avg_cpm = total_cost_sum / total_reduction_sum if total_reduction_sum > 0 else 0
-            best_idx = cost_per_m3.idxmin()
-            worst_idx = cost_per_m3.idxmax()
+            
+            # Find best/worst from VALID entries only
+            valid_indices = cost_per_m3_for_sort[cost_per_m3_for_sort != np.inf].index
+            if len(valid_indices) > 0:
+                valid_cpm_series = cost_per_m3_for_sort[valid_indices]
+                best_idx = valid_cpm_series.idxmin()
+                worst_idx = valid_cpm_series.idxmax()
+                best_text = f"Mejor: T{best_idx+1} (${cost_per_m3.iloc[best_idx]:,.0f}/m3)"
+                worst_text = f"Peor:  T{worst_idx+1} (${cost_per_m3.iloc[worst_idx]:,.0f}/m3)"
+            else:
+                best_text = "Mejor: N/A"
+                worst_text = "Peor:  N/A"
+            
+            n_invalid = is_invalid.sum()
             
             stats = (
                 f"=== RESUMEN ===\n"
-                f"Tanques: {len(tank_groups)}\n"
+                f"Tanques: {len(tank_groups)} ({n_invalid} N/A)\n"
                 f"Inversion: {self.format_currency_smart(total_cost_sum)}\n"
                 f"Reduccion: {total_reduction_sum:,.0f} m3\n"
                 f"Costo Prom: ${avg_cpm:,.0f}/m3\n"
                 f"---------------\n"
-                f"Mejor: T{best_idx+1} (${cost_per_m3.iloc[best_idx]:,.0f}/m3)\n"
-                f"Peor:  T{worst_idx+1} (${cost_per_m3.iloc[worst_idx]:,.0f}/m3)"
+                f"{best_text}\n"
+                f"{worst_text}"
             )
             
-            ax.text(0.02, 0.98, stats, transform=ax.transAxes, fontsize=11,
+            ax_bar.text(0.02, 0.98, stats, transform=ax_bar.transAxes, fontsize=10,
                     verticalalignment='top', horizontalalignment='left',
-                    bbox=dict(boxstyle='round,pad=0.6', facecolor='#fffacd',
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor='#fffacd',
                              alpha=0.95, edgecolor='#daa520', linewidth=2),
                     fontfamily='monospace')
-            
-            plt.grid(True, linestyle='--', color='#cccccc', alpha=0.4, axis='y', linewidth=1)
             
             # === EXPORT TABLE TO CSV ===
             csv_data = []
@@ -309,118 +379,189 @@ class EvolutionDashboardGenerator:
             fig.savefig(save_path, bbox_inches='tight', dpi=150)
             plt.close(fig)
             print(f"  [Dashboard] Saved: {save_path}")
-        
+
     def plot_cost_reduction_evolution(self):
-        """
-        Dual-axis line chart showing:
-        - Left axis: Cumulative cost (bars)
-        - Right axis: Cumulative flood reduction (line)
-        Shows how investment grows with flood reduction step by step.
-        """
         if len(self.df) < 1:
             return
-        
-        fig, ax1 = plt.subplots(figsize=(14, 9))
-        
-        steps = self.df['step'].values
-        cost_total = self.df['cost_total'].values
-        reduction_total = self.df['flooding_reduction'].values
-        flooding_remaining = self.df['flooding_volume'].values if 'flooding_volume' in self.df.columns else None
-        
-        # Bar chart for cumulative cost (left axis) - FIXED: darker, more saturated colors
-        colors = plt.cm.Blues(np.linspace(0.4, 0.8, len(steps)))  # Darker range
-        bars = ax1.bar(steps, cost_total, color=colors, edgecolor='#2c5aa0',
-                      linewidth=2, label='Inversion Acumulada', alpha=1.0)  # FIXED: alpha=1.0
-        
-        ax1.set_xlabel('Paso de Optimizacion (Tanque Agregado)', fontsize=13, fontweight='bold')
-        ax1.set_ylabel('Inversion Acumulada ($)', fontsize=13, fontweight='bold', color='#1a4d8f')
-        ax1.tick_params(axis='y', labelcolor='#1a4d8f')
+    
+        fig, ax1 = plt.subplots(figsize=(22, 10))
+    
+        steps = self.df["step"].values
+        cost_total = self.df["cost_investment_total"].values
+        reduction_total = self.df["flooding_reduction"].values
+        flooding_remaining = self.df["flooding_volume"].values if "flooding_volume" in self.df.columns else None
+    
+        # Bars (cost)
+        colors = plt.cm.Blues(np.linspace(0.4, 0.8, len(steps)))
+        ax1.bar(
+            steps,
+            cost_total,
+            color=colors,
+            edgecolor="#2c5aa0",
+            linewidth=2,
+            label="Inversion Acumulada",
+            alpha=0.6,
+        )
+    
+        ax1.set_ylabel("Inversion Acumulada ($)", fontsize=13, fontweight="bold", color="#1a4d8f", labelpad=5)
+        ax1.tick_params(axis="y", labelcolor="#1a4d8f")
         ax1.yaxis.set_major_formatter(FuncFormatter(self.format_currency_smart))
-        ax1.set_xticks(steps)
-        
-        # Add cost labels on bars - alternate positions to avoid overlap
-        for i, (bar, cost) in enumerate(zip(bars, cost_total)):
-            y_offset = cost_total.max() * 0.02 if i % 2 == 0 else cost_total.max() * 0.06
-            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + y_offset,
-                    self.format_currency_smart(cost), ha='center', va='bottom',
-                    fontsize=9, fontweight='bold', color='#1a4d8f')
-        
-        # Line chart for cumulative reduction (right axis) - FIXED: darker green
+    
+        # Right axis line (reduction)
         ax2 = ax1.twinx()
-        line = ax2.plot(steps, reduction_total, 'o-', color='#2e7d32',  # FIXED: darker green
-                       linewidth=3.5, markersize=12, markeredgecolor='#1b5e20',
-                       markeredgewidth=2, label='Reduccion Acumulada', alpha=1.0)  # FIXED: alpha=1.0
-        
-        ax2.set_ylabel('Reduccion de Inundacion Acumulada (m3)', fontsize=13, fontweight='bold', color='#2e7d32')
-        ax2.tick_params(axis='y', labelcolor='#2e7d32')
-        ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:,.0f}'))
-        
-        # Add reduction labels on line - alternate positions
-        for i, (step, red) in enumerate(zip(steps, reduction_total)):
-            y_offset = 20 if i % 2 == 0 else -25
-            va = 'bottom' if i % 2 == 0 else 'top'
-            ax2.annotate(f'{red:,.0f} m3', xy=(step, red), xytext=(0, y_offset),
-                        textcoords='offset points', ha='center', va=va, fontsize=9,
-                        fontweight='bold', color='#2e7d32',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
-                                 alpha=0.9, edgecolor='#2e7d32'))
-        
-        # If we have flooding remaining, show it as secondary line - FIXED: darker red
+        ax2.plot(
+            steps,
+            reduction_total,
+            "o-",
+            color="#2e7d32",
+            linewidth=2.0,
+            markersize=10,
+            markeredgecolor="#1b5e20",
+            markeredgewidth=1,
+            label="Reduccion Acumulada",
+            alpha=1.0,
+        )
+    
+        ax2.set_ylabel(
+            "Reduccion de Inundacion Acumulada (m3)",
+            fontsize=14,
+            fontweight="bold",
+            color="#2e7d32",
+            labelpad=32,  # more separation from ticks/figure edge
+        )
+        ax2.tick_params(axis="y", labelcolor="#2e7d32", pad=10)
+        ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"{x:,.0f}"))
+    
+        # Optional third axis (residual) with more outward spacing
         if flooding_remaining is not None:
             ax3 = ax1.twinx()
-            ax3.spines['right'].set_position(('outward', 60))
-            ax3.plot(steps, flooding_remaining, 's--', color='#c62828',  # FIXED: darker red
-                    linewidth=2.5, markersize=7, markeredgecolor='#8e0000',
-                    markeredgewidth=1.5, label='Inundacion Residual', alpha=1.0)  # FIXED: alpha=1.0
-            ax3.set_ylabel('Inundacion Residual (m3)', fontsize=11, color='#c62828', fontweight='bold')
-            ax3.tick_params(axis='y', labelcolor='#c62828')
-            ax3.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:,.0f}'))
-        
-        # Title and grid
-        ax1.set_title('Evolucion de Inversion vs Reduccion de Inundacion\nAnalisis Costo-Beneficio por Paso',
-                     fontsize=16, fontweight='bold', pad=20)
-        ax1.grid(True, linestyle='--', color='#cccccc', alpha=0.4, axis='y', linewidth=1)
+            ax3.spines["right"].set_position(("outward", 95))
+            ax3.plot(
+                steps,
+                flooding_remaining,
+                "s--",
+                color="#c62828",
+                linewidth=2.0,
+                markersize=7,
+                markeredgecolor="#8e0000",
+                markeredgewidth=1.5,
+                label="Inundacion Residual",
+                alpha=1.0,
+            )
+            ax3.set_ylabel("Inundacion Residual (m3)", fontsize=11, color="#c62828", fontweight="bold", labelpad=26)
+            ax3.tick_params(axis="y", labelcolor="#c62828", pad=10)
+            ax3.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"{x:,.0f}"))
+    
+        # --- reduction labels at TOP (outside) ---
+        for i, (step, red) in enumerate(zip(steps, reduction_total)):
+            y_offset_pts = 35
+            ax2.annotate(
+                f"{red:,.0f} m3",
+                xy=(step, 1.0),
+                xycoords=("data", "axes fraction"),
+                xytext=(0, y_offset_pts),
+                textcoords="offset points",
+                ha="center",
+                va="center",
+                fontsize=14,
+                fontweight="bold",
+                color="#2e7d32",
+                rotation=45,              # angle in degrees (e.g., 0, 45, 90, -30)
+                rotation_mode="anchor",   # keeps the text anchored to (x, y)
+                # bbox=dict(
+                #     boxstyle="round,pad=0.3",
+                #     facecolor="white",
+                #     alpha=0.9,
+                #     edgecolor="#2e7d32",
+                # ),
+                clip_on=False,
+                annotation_clip=False,  # important: do not clip outside axes
+                zorder=20,
+            )
+    
+        # --- custom 2-line x labels (step + $M in blue) ---
+        ax1.set_xlabel("Paso de Optimizacion (Tanque Agregado)", fontsize=13, fontweight="bold", labelpad=120)
+        ax1.set_xticks(steps)
+        ax1.set_xticklabels([])
+        ax1.tick_params(axis="x", length=0)
+    
+        trans = mtransforms.blended_transform_factory(ax1.transData, ax1.transAxes)
+        for s, c in zip(steps, cost_total):
+            ax1.annotate(
+                f"{s}",
+                xy=(s, 0.03),
+                xycoords=trans,
+                xytext=(0, -26),
+                textcoords="offset points",
+                ha="center",
+                va="top",
+                fontsize=14,
+                fontweight="bold",
+                color="black",
+                clip_on=False,
+            )
+            ax1.annotate(
+                f"{c/1_000_000:,.1f} M",
+                xy=(s, 0.0),
+                xycoords=trans,
+                xytext=(0, -48),
+                textcoords="offset points",
+                ha="center",
+                va="top",
+                fontsize=14,
+                fontweight="bold",
+                color="#1976d2",
+                clip_on=False,
+                rotation=45            ,  # angle in degrees (e.g., 0, 45, 90, -30)
+                rotation_mode="anchor",   # keeps the text anchored to (x, y)
+            )
+    
+        # Grid
+        ax1.grid(True, linestyle="--", color="#cccccc", alpha=0.4, axis="y", linewidth=1)
         ax1.set_axisbelow(True)
-        
-        # Summary box
-        initial_flooding = self.df['flooding_volume'].iloc[0] + self.df['flooding_reduction'].iloc[0] if 'flooding_volume' in self.df.columns else reduction_total[-1]
-        final_reduction_pct = (reduction_total[-1] / initial_flooding * 100) if initial_flooding > 0 else 0
-        
-        summary = (
-            f"=== RESUMEN ===\n"
-            f"Pasos: {len(steps)}\n"
-            f"Inversion Final: {self.format_currency_smart(cost_total[-1])}\n"
-            f"Reduccion Total: {reduction_total[-1]:,.0f} m3\n"
-            f"Reduccion: {final_reduction_pct:.1f}%\n"
-            f"Eficiencia Prom: ${cost_total[-1]/reduction_total[-1]:,.0f}/m3"
-        )
-        
-        ax1.text(0.02, 0.98, summary, transform=ax1.transAxes, fontsize=11,
-                verticalalignment='top', horizontalalignment='left',
-                bbox=dict(boxstyle='round,pad=0.6', facecolor='#fffacd',
-                         alpha=0.95, edgecolor='#daa520', linewidth=2),
-                fontfamily='monospace')
-        
-        # Combined legend - center top
+    
+        # Figure titles (top)
+        main_title = "Evolucion de Inversion vs Reduccion de Inundacion"
+        sub_title = "Analisis Costo-Beneficio por Paso"
+    
+        # More room top/bottom so outside labels do not get cut
+        plt.subplots_adjust(bottom=0.10, top=0.85)
+        # fig.text(0.5, 0.965, main_title, ha="center", va="top", fontsize=18, fontweight="bold")
+        # fig.text(0.5, 0.935, sub_title, ha="center", va="top", fontsize=14, fontweight="bold")
+    
+        # Legend (kept, but move a bit lower due to bigger bottom area)
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         if flooding_remaining is not None:
             lines3, labels3 = ax3.get_legend_handles_labels()
-            ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3,
-                      loc='upper center', bbox_to_anchor=(0.5, -0.08), ncol=3,
-                      fontsize=11, framealpha=0.95, edgecolor='black', fancybox=True)
+            ax1.legend(
+                lines1 + lines2 + lines3,
+                labels1 + labels2 + labels3,
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.16),
+                ncol=3,
+                fontsize=14,
+                framealpha=0.95,
+                edgecolor="black",
+                fancybox=True,
+            )
         else:
-            ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper center',
-                      bbox_to_anchor=(0.5, -0.08), ncol=2, fontsize=11, framealpha=0.9)
-        
-        plt.tight_layout()
-        plt.subplots_adjust(bottom=0.15)
-        
+            ax1.legend(
+                lines1 + lines2,
+                labels1 + labels2,
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.16),
+                ncol=2,
+                fontsize=14,
+                framealpha=0.9,
+            )
+    
         save_path = self.output_dir / "01_cost_reduction_evolution.png"
-        fig.savefig(save_path, bbox_inches='tight', dpi=150)
+        fig.savefig(save_path, bbox_inches="tight", dpi=150)
         plt.close(fig)
         print(f"  [Dashboard] Saved: {save_path}")
-
+    
+    
     def plot_roi_curve(self):
         """
         ROI curve showing flood reduction obtained per $1M invested.
@@ -431,7 +572,7 @@ class EvolutionDashboardGenerator:
         
         # Get cumulative data
         steps = self.df['step'].values
-        cost_total = self.df['cost_total'].values
+        cost_total = self.df['cost_investment_total'].values
         reduction_total = self.df['flooding_reduction'].values
         
         # Calculate ROI: m³ reduced per $1M invested
@@ -445,7 +586,7 @@ class EvolutionDashboardGenerator:
         marginal_roi = np.where(marginal_cost > 0, marginal_reduction / marginal_cost, 0)
         
         # Create larger figure
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 14),
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(22, 14),
                                          gridspec_kw={'height_ratios': [1, 1]})
         
         # ===== TOP PLOT: Cumulative ROI =====
@@ -458,14 +599,14 @@ class EvolutionDashboardGenerator:
         
         # Add large value labels
         for step, r in zip(steps, roi):
-            ax1.annotate(f'{r:,.0f}\nm³/$1M', xy=(step, r), xytext=(0, 15),
+            ax1.annotate(f'{r:,.0f}', xy=(step, r), xytext=(0, 15),
                         textcoords='offset points', ha='center', va='bottom',
                         fontsize=14, fontweight='bold', color='#0d47a1',
-                        bbox=dict(boxstyle='round,pad=0.5', facecolor='white',
-                                 alpha=0.95, edgecolor='#1976d2', linewidth=2))
+                        bbox=dict(boxstyle='round,pad=0.1', facecolor='white',
+                                 alpha=0.95, edgecolor='#1976d2', linewidth=1))
         
         # Styling
-        ax1.set_ylabel('m³ Reducidos por cada $1 Millón', fontsize=18, fontweight='bold', labelpad=15)
+        ax1.set_ylabel('Reduccion [m³/$1M] ', fontsize=18, fontweight='bold', labelpad=15)
         ax1.set_title('Retorno  de Inversion (ROI) ACUMULADO',
                       fontsize=22, fontweight='bold', pad=25)
         ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:,.0f}'))
@@ -532,7 +673,7 @@ class EvolutionDashboardGenerator:
         ax2.grid(True, linestyle='--', color='#aaaaaa', alpha=0.5, axis='y', linewidth=1.5)
         ax2.set_axisbelow(True)
         ax2.set_xticks(steps)
-        ax2.set_xticklabels([f'Paso {s}' for s in steps], fontsize=13, fontweight='bold')
+        ax2.set_xticklabels([f'p{s}' for s in steps], fontsize=13, fontweight='bold')
         
         # Find best and worst
         best_step_idx = np.argmax(marginal_roi)
