@@ -53,8 +53,8 @@ config.setup_sys_path()
 # =============================================================================
 
 NSGA_CONFIG = {
-    'n_generations': 100,
-    'pop_size': 50,
+    'n_generations': config.N_GENERATIONS,
+    'pop_size': config.POP_SIZE,
     'seed': 42,
     'checkpoint_dir': Path("optimization_results") / "nsga_ranking_checkpoints",
     'checkpoint_freq': 1,  # cada cuántas generaciones guardar
@@ -200,12 +200,19 @@ class GreedyRunner:
     Esta clase se encarga de restaurar config después de cada corrida.
     """
     
+    # Contador global de evaluaciones (clase-level)
+    _eval_counter = 0
+    
     def __init__(self, 
                  project_root: Optional[Path] = None,
                  elev_file: Optional[Path] = None):
         self.project_root = project_root or config.PROJECT_ROOT
         self.elev_file = elev_file or config.ELEV_FILE
         self._original_config = self._save_config_state()
+        
+        # Incrementar contador y generar ID para esta evaluación
+        GreedyRunner._eval_counter += 1
+        self.eval_id = f"eval_{GreedyRunner._eval_counter:05d}"
         
     def _save_config_state(self) -> Dict:
         """Guarda estado original de config para restaurar después."""
@@ -243,7 +250,8 @@ class GreedyRunner:
         try:
             runner = StormwaterOptimizationRunner(
                 project_root=self.project_root,
-                proj_to=config.PROJECT_CRS
+                proj_to=config.PROJECT_CRS,
+                eval_id=self.eval_id  # Pasar el ID de evaluación
             )
 
             result = runner.run_sequential_analysis(
@@ -812,58 +820,372 @@ class NSGARankingOptimizer:
         }
 
 
-if __name__ == "__main__":
+# =============================================================================
+# BENCHMARK DE NÚCLEOS PARA SWMM (v2 - Modificando THREADS en .inp)
+# =============================================================================
 
+class SwmmCoreBenchmark:
+    """
+    Benchmark para determinar la configuración óptima de núcleos para SWMM.
+    
+    SWMM EPA controla paralelismo mediante la keyword THREADS en el archivo .inp
+    Este benchmark modifica ese valor y mide el tiempo real de ejecución.
+    
+    Uso:
+        benchmark = SwmmCoreBenchmark()
+        benchmark.run(max_cores_percent=90, n_runs_per_config=3)
+        benchmark.plot_results()
+    """
+    
+    def __init__(self, swmm_file: Path = None, output_dir: Path = None):
+        self.swmm_file = Path(swmm_file) if swmm_file else Path(config.SWMM_FILE)
+        self.output_dir = Path(output_dir) if output_dir else Path("optimization_results") / "core_benchmark"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Detectar núcleos disponibles
+        self.total_cores = os.cpu_count()
+        print(f"[Benchmark] Total cores detectados: {self.total_cores}")
+        print(f"[Benchmark] Archivo INP: {self.swmm_file}")
+        
+        self.results = []
+        
+    def _set_threads_in_inp(self, n_threads: int) -> Path:
+        """
+        Crea una copia temporal del .inp con THREADS = n_threads.
+        Retorna el path al archivo modificado.
+        """
+        # Leer archivo original
+        with open(self.swmm_file, 'r') as f:
+            content = f.read()
+        
+        # Buscar y reemplazar línea THREADS
+        import re
+        
+        # Patrón: THREADS seguido de número (al inicio de línea o después de espacios)
+        pattern = r'^(THREADS\s+)\d+'
+        
+        if re.search(pattern, content, re.MULTILINE):
+            # Reemplazar valor existente
+            modified = re.sub(pattern, rf'\g<1>{n_threads}', content, flags=re.MULTILINE)
+        else:
+            # Si no existe, agregar al final de la sección [OPTIONS]
+            # Buscar donde termina [OPTIONS]
+            options_pattern = r'(\[OPTIONS\].*?)(?=\[|\Z)'
+            match = re.search(options_pattern, content, re.DOTALL)
+            if match:
+                # Insertar THREADS al final de [OPTIONS]
+                end_pos = match.end()
+                modified = content[:end_pos] + f"THREADS\t{n_threads}\n" + content[end_pos:]
+            else:
+                # No hay sección [OPTIONS], agregar al inicio
+                modified = f"[OPTIONS]\nTHREADS\t{n_threads}\n\n" + content
+        
+        # Guardar archivo temporal
+        temp_inp = self.output_dir / f"benchmark_{n_threads}_threads.inp"
+        with open(temp_inp, 'w') as f:
+            f.write(modified)
+        
+        return temp_inp
+    
+    def _run_swmm(self, inp_file: Path) -> float:
+        """
+        Ejecuta SWMM con el archivo .inp dado usando pyswmm.
+        Retorna tiempo en segundos.
+        """
+        import time
+        from pyswmm import Simulation
+        
+        out_file = self.output_dir / f"{inp_file.stem}.out"
+        
+        start_time = time.time()
+        
+        try:
+            with Simulation(str(inp_file)) as sim:
+                for _ in sim:
+                    pass
+                    
+        except Exception as e:
+            print(f"  [Error] SWMM simulation failed: {e}")
+            return -1
+        
+        elapsed = time.time() - start_time
+        
+        # Limpiar archivos temporales
+        if out_file.exists():
+            out_file.unlink()
+        
+        return elapsed
+        
+    def run(self, max_cores_percent: float = 90, n_runs_per_config: int = 3):
+        """
+        Ejecuta benchmark desde 1 thread hasta max_cores_percent.
+        
+        Args:
+            max_cores_percent: Porcentaje máximo de cores a usar (ej: 90)
+            n_runs_per_config: Cuántas veces repetir cada configuración para promedio
+        """
+        max_cores = int(self.total_cores * max_cores_percent / 100)
+        
+        # Configuraciones a probar: 1, 2, 4, 6, 8, 12, 16... hasta max_cores
+        configs = [1, 2, 4]
+        c = 6
+        while c <= max_cores:
+            configs.append(c)
+            c += 2
+        
+        if configs[-1] != max_cores and max_cores not in configs:
+            configs.append(max_cores)
+        
+        print(f"[Benchmark] Configuraciones a probar (THREADS): {configs}")
+        print(f"[Benchmark] Runs por configuración: {n_runs_per_config}")
+        print("=" * 80)
+        
+        for n_cores in configs:
+            print(f"\n[Benchmark] Testing THREADS = {n_cores} ...")
+            
+            # Crear archivo con THREADS modificado
+            temp_inp = self._set_threads_in_inp(n_cores)
+            
+            times = []
+            for run in range(n_runs_per_config):
+                elapsed = self._run_swmm(temp_inp)
+                if elapsed > 0:
+                    times.append(elapsed)
+                    print(f"  Run {run+1}/{n_runs_per_config}: {elapsed:.2f}s")
+                else:
+                    print(f"  Run {run+1}/{n_runs_per_config}: FALLIDO")
+            
+            if len(times) >= 2:  # Necesitamos al menos 2 runs válidos
+                avg_time = np.mean(times)
+                std_time = np.std(times)
+                speedup = self.results[0]['avg_time'] / avg_time if self.results else 1.0
+                
+                self.results.append({
+                    'n_cores': n_cores,
+                    'avg_time': avg_time,
+                    'std_time': std_time,
+                    'times': times,
+                    'speedup': speedup
+                })
+                
+                print(f"  → Promedio: {avg_time:.2f}s ± {std_time:.2f}s | Speedup: {speedup:.2f}x")
+            else:
+                print(f"  → INSUFICIENTES RUNS VÁLIDOS, saltando...")
+            
+            # Limpiar archivo temporal inp
+            if temp_inp.exists():
+                temp_inp.unlink()
+        
+        self._save_results()
+        
+    def _save_results(self):
+        """Guarda resultados en CSV."""
+        if not self.results:
+            print("[Benchmark] No hay resultados para guardar")
+            return
+            
+        df = pd.DataFrame([
+            {
+                'threads': r['n_cores'],
+                'avg_time_seconds': r['avg_time'],
+                'std_time_seconds': r['std_time'],
+                'speedup': r['speedup']
+            }
+            for r in self.results
+        ])
+        
+        csv_path = self.output_dir / "benchmark_results.csv"
+        df.to_csv(csv_path, index=False)
+        print(f"\n[Benchmark] Resultados guardados en: {csv_path}")
+        
+    def plot_results(self):
+        """Genera gráficos de análisis."""
+        if not self.results or len(self.results) < 2:
+            print("[Benchmark] No hay suficientes resultados para graficar")
+            return None, None
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('SWMM Thread Scaling Analysis', fontsize=14, fontweight='bold')
+        
+        cores = [r['n_cores'] for r in self.results]
+        times = [r['avg_time'] for r in self.results]
+        speedups = [r['speedup'] for r in self.results]
+        stds = [r['std_time'] for r in self.results]
+        
+        # 1. Tiempo vs THREADS
+        ax = axes[0, 0]
+        ax.errorbar(cores, times, yerr=stds, marker='o', capsize=5, linewidth=2, markersize=8, color='steelblue')
+        ax.set_xlabel('THREADS en INP')
+        ax.set_ylabel('Tiempo de Ejecución (s)')
+        ax.set_title('Tiempo vs THREADS')
+        ax.grid(True, alpha=0.3)
+        
+        # 2. Speedup vs THREADS
+        ax = axes[0, 1]
+        ideal = cores  # Línea ideal
+        ax.plot(cores, ideal, 'k--', label='Speedup Ideal (lineal)', alpha=0.5, linewidth=2)
+        ax.plot(cores, speedups, 'o-', linewidth=2, markersize=8, label='Speedup Real', color='coral')
+        ax.set_xlabel('THREADS en INP')
+        ax.set_ylabel('Speedup (T1/Tn)')
+        ax.set_title('Speedup vs THREADS')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 3. Eficiencia (speedup / threads)
+        ax = axes[1, 0]
+        efficiencies = [s / c for s, c in zip(speedups, cores)]
+        ax.plot(cores, efficiencies, 'o-', linewidth=2, markersize=8, color='green')
+        ax.axhline(y=0.8, color='r', linestyle='--', alpha=0.5, label='Eficiencia 80%')
+        ax.axhline(y=0.6, color='orange', linestyle='--', alpha=0.5, label='Eficiencia 60%')
+        ax.axhline(y=0.5, color='darkred', linestyle='--', alpha=0.5, label='Eficiencia 50%')
+        ax.set_xlabel('THREADS en INP')
+        ax.set_ylabel('Eficiencia')
+        ax.set_title('Eficiencia Paralela')
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        
+        # 4. Tabla de recomendaciones
+        ax = axes[1, 1]
+        ax.axis('off')
+        
+        # Encontrar punto óptimo: máximo speedup donde eficiencia > 60%
+        best_idx = -1
+        best_speedup = 0
+        for i, (s, e) in enumerate(zip(speedups, efficiencies)):
+            if e >= 0.5 and s > best_speedup:
+                best_speedup = s
+                best_idx = i
+        
+        if best_idx == -1:
+            best_idx = len(cores) // 2  # Fallback al medio
+        
+        best_cores = cores[best_idx]
+        pymoo_workers = max(1, self.total_cores - best_cores)
+        
+        table_data = [
+            ['Configuración', 'THREADS SWMM', 'Workers pymoo', 'Total', 'Speedup', 'Efic.'],
+            ['Mínima', 1, self.total_cores - 1, self.total_cores, f"{speedups[0]:.2f}x", "100%"],
+            ['Óptima', best_cores, pymoo_workers, self.total_cores, 
+             f"{speedups[best_idx]:.2f}x", f"{efficiencies[best_idx]:.0%}"],
+            ['Máxima', max(cores), self.total_cores - max(cores), self.total_cores, 
+             f"{speedups[-1]:.2f}x", f"{efficiencies[-1]:.0%}"],
+        ]
+        
+        table = ax.table(cellText=table_data, cellLoc='center', loc='center',
+                        colWidths=[0.18, 0.18, 0.18, 0.12, 0.15, 0.12])
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 2.5)
+        
+        # Colorear header y óptima
+        for i in range(6):
+            table[(0, i)].set_facecolor('#4CAF50')
+            table[(0, i)].set_text_props(weight='bold', color='white')
+        for i in range(6):
+            table[(2, i)].set_facecolor('#E8F5E9')  # Resaltar fila óptima
+        
+        ax.set_title('Recomendaciones de Configuración\n(Resaltada = Óptima)', pad=20)
+        
+        plt.tight_layout()
+        plot_path = self.output_dir / "benchmark_analysis.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[Benchmark] Gráfico guardado en: {plot_path}")
+        
+        # Resumen en consola
+        print("\n" + "=" * 80)
+        print("RESUMEN DEL BENCHMARK")
+        print("=" * 80)
+        print(f"Total cores disponibles: {self.total_cores}")
+        print(f"\nConfiguración ÓPTIMA:")
+        print(f"  THREADS en SWMM:  {best_cores}")
+        print(f"  Workers pymoo:    {pymoo_workers}")
+        print(f"  Speedup logrado:  {speedups[best_idx]:.2f}x")
+        print(f"  Eficiencia:       {efficiencies[best_idx]:.1%}")
+        print("\nPara aplicar esta configuración:")
+        print(f"  1. Editar tu archivo INP: THREADS {best_cores}")
+        print(f"  2. En NSGA_CONFIG usar: n_workers={pymoo_workers}")
+        print("=" * 80)
+        
+        return best_cores, pymoo_workers
+
+
+# =============================================================================
+# MAIN - BENCHMARK MODE
+# =============================================================================
+
+if __name__ == "__main__":
+    import sys
+    
+    # MODO BENCHMARK - Ejecutar primero para determinar configuración óptima
+    print("=" * 80)
+    print("MODO BENCHMARK - Detectando configuración óptima de núcleos")
+    print("=" * 80)
+    
+    benchmark = SwmmCoreBenchmark()
+    benchmark.run(max_cores_percent=90, n_runs_per_config=3)
+    optimal_swmm_cores, optimal_pymoo_workers = benchmark.plot_results()
+    
+    print(f"\n[Resultado] Usar {optimal_swmm_cores} cores para cada SWMM")
+    print(f"[Resultado] Esto permite {optimal_pymoo_workers} workers en paralelo para pymoo")
+    print("\nActualiza NSGA_CONFIG con estos valores y vuelve a correr.")
+    
+    sys.exit(0)
+    
+    # NOTA: Una vez tengas los resultados del benchmark, comenta las líneas anteriores
+    # y descomenta el código de optimización normal de abajo:
+    
     # ================================================================
     # CONFIGURACIÓN - AJUSTAR ESTOS VALORES
     # ================================================================
-
-    N_GENERATIONS = 100  # Número de generaciones
-    POP_SIZE = 50  # Tamaño de población
-    RESTORE_FROM = None  # Path a checkpoint para continuar, o None
-
+    #
+    # N_GENERATIONS = config.N_GENERATIONS  # Número de generaciones
+    # POP_SIZE = config.POP_SIZE  # Tamaño de población
+    # RESTORE_FROM = None  # Path a checkpoint para continuar, o None
+    #
     # Ejemplo: RESTORE_FROM = Path("optimization_results/nsga_ranking_checkpoints/checkpoint_gen_0025.pkl")
-
+    #
     # ================================================================
     # EJECUCIÓN
     # ================================================================
-
-    print("=" * 80)
-    print("NSGA-II RANKING OPTIMIZER")
-    print("=" * 80)
-    print(f"Generations: {N_GENERATIONS}")
-    print(f"Population: {POP_SIZE}")
-    print(f"Restore from: {RESTORE_FROM}")
-    print("=" * 80)
-
-    optimizer = NSGARankingOptimizer()
-
-    optimizer.run(
-        n_generations=N_GENERATIONS,
-        pop_size=POP_SIZE,
-        restore_from=RESTORE_FROM,
-    )
-
-    optimizer.visualize_results()
-
-    print("\n" + "=" * 80)
-    print("BEST SOLUTIONS SUMMARY")
-    print("=" * 80)
-
-    for pref in ['balanced', 'min_cost', 'max_flooding', 'max_health']:
-        sol = optimizer.get_best_solution(preference=pref)
-        if sol:
-            print(f"\n{pref.upper()}:")
-            print(f"  Weights:")
-            for k, v in sol['weights'].items():
-                print(f"    {k}: {v:.4f}")
-            print(f"  Performance:")
-            for k, v in sol['performance'].items():
-                if 'cost' in k:
-                    print(f"    {k}: ${v:,.0f}")
-                else:
-                    print(f"    {k}: {v:.4f}")
-
-    print("\n" + "=" * 80)
-    print("OPTIMIZATION COMPLETE")
-    print("=" * 80)
+    #
+    # print("=" * 80)
+    # print("NSGA-II RANKING OPTIMIZER")
+    # print("=" * 80)
+    # print(f"Generations: {N_GENERATIONS}")
+    # print(f"Population: {POP_SIZE}")
+    # print(f"Restore from: {RESTORE_FROM}")
+    # print("=" * 80)
+    #
+    # optimizer = NSGARankingOptimizer()
+    #
+    # optimizer.run(
+    #     n_generations=N_GENERATIONS,
+    #     pop_size=POP_SIZE,
+    #     restore_from=RESTORE_FROM,
+    # )
+    #
+    # optimizer.visualize_results()
+    #
+    # print("\n" + "=" * 80)
+    # print("BEST SOLUTIONS SUMMARY")
+    # print("=" * 80)
+    #
+    # for pref in ['balanced', 'min_cost', 'max_flooding', 'max_health']:
+    #     sol = optimizer.get_best_solution(preference=pref)
+    #     if sol:
+    #         print(f"\n{pref.upper()}:")
+    #         print(f"  Weights:")
+    #         for k, v in sol['weights'].items():
+    #             print(f"    {k}: {v:.4f}")
+    #         print(f"  Performance:")
+    #         for k, v in sol['performance'].items():
+    #             if 'cost' in k:
+    #                 print(f"    {k}: ${v:,.0f}")
+    #             else:
+    #                 print(f"    {k}: {v:.4f}")
+    #
+    # print("\n" + "=" * 80)
+    # print("OPTIMIZATION COMPLETE")
+    # print("=" * 80)

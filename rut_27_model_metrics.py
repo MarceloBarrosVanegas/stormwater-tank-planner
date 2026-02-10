@@ -410,7 +410,7 @@ class MetricExtractor:
 
         with Simulation(str(inp_path)) as sim:
             total_duration = (sim.end_time - sim.start_time).total_seconds()
-            with tqdm(total=100, desc="Running SWMM Simulation", unit="%", disable=True) as pbar:
+            with tqdm(total=100, desc="Running SWMM Simulation", unit="%", disable=False) as pbar:
                 last_pct = 0
                 for _ in sim:  # Fixed: Renamed 'step' to '_' as it's unused
                     current_pct = int(((sim.current_time - sim.start_time).total_seconds() / total_duration) * 100)

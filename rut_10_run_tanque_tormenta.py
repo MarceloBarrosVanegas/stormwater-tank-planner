@@ -47,9 +47,14 @@ class StormwaterOptimizationRunner:
     Orchestrates the stormwater tank optimization workflow.
     """
     
-    def __init__(self, project_root: Path = None, proj_to: CRS = CRS("EPSG:32717")):
+    def __init__(self, project_root: Path = None, proj_to: CRS = CRS("EPSG:32717"), eval_id: str = None):
         """
         Initialize the runner. Auto-detects project root if not provided.
+        
+        Args:
+            project_root: Path to project root
+            proj_to: Target CRS
+            eval_id: Optional evaluation ID for NSGA runs (creates subfolder)
         """
         self.project_root = Path(project_root) if project_root else Path(os.getcwd())
         print(f"Project Root: {self.project_root}")
@@ -60,6 +65,7 @@ class StormwaterOptimizationRunner:
         self.evaluator = None
         self.nodes_gdf = None
         self.predios_gdf = None
+        self.eval_id = eval_id  # ID de evaluación para crear subcarpeta
 
 
     def run_sequential_analysis(self, max_tanks: int = 10, max_iterations: int = 50,
@@ -101,8 +107,16 @@ class StormwaterOptimizationRunner:
         if self.evaluator is None:
             print(f"\n  [Setup] Initializing SWMM Evaluator...")
 
-
-            self.work_dir = Path(os.getcwd()) / "optimization_results"
+            # Base work directory
+            base_work_dir = Path(os.getcwd()) / "optimization_results"
+            
+            # Si hay eval_id, crear subcarpeta para esta evaluación
+            if self.eval_id:
+                self.work_dir = base_work_dir / "nsga_evaluations" / self.eval_id
+                print(f"  [Eval ID] {self.eval_id} -> {self.work_dir}")
+            else:
+                self.work_dir = base_work_dir
+                
             self.setup_optimization(elev_file=elev_file,)
 
             # 2. Run Optimization

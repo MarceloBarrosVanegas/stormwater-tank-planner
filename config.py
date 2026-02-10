@@ -95,9 +95,10 @@ BASE_INP_TR = 25  # Return Period (years) of the base INP file
 #   [tr1, tr2, ...]     = Probabilistic (EAD calculation)
 TR_LIST = [BASE_INP_TR]  # Change to [1,2,5,10,25,50,100] for probabilistic EAD
 VALIDATION_TR_LIST = [1,2,5,10,25,50,100]  # For NSGA final validation
-N_GENERATIONS = 300  # NSGA generations
-POP_SIZE = 100  # NSGA population
-MIN_TANKS = 3   # Minimum number of active tanks (constraint for NSGA)
+
+N_GENERATIONS = 15  # NSGA generations
+POP_SIZE = 3  # NSGA population
+
 
 
 # Rasters
@@ -183,7 +184,7 @@ TANK_MAX_VOLUME_M3 = 100000.0    # Maximum tank volume in cubic meters
 
 TANK_MIN_UTILIZATION_PCT = 20.0 # Minimum tank utilization % (warn if below this)
 TANK_VOLUME_ROUND_M3 = 100      # Round volumes to this increment for display
-MAX_TANKS = 3  # Maximum number of tanks to consider in optimization
+MAX_TANKS = 5  # Maximum number of tanks to consider in optimization
 MAX_PRUNE_RETRIES = 2  # Max retries for pruning tanks
 MAX_PREDIO_SLOPE = 30.0 # Maximum allowed predio slope in %. Predios steeper than this are discarded.
 PREDIO_MAX_OCCUPANCY_RATIO = 0.85  # Exclude predios with >85% area occupied from path search
