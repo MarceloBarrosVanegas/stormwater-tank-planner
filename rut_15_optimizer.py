@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from dataclasses import asdict
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple, Optional
-
+import pprint
 
 
 
@@ -106,14 +106,14 @@ class GreedyTankOptimizer:
                  dynamic_evaluator: Optional[object] = None,
                  stop_at_breakeven: bool = False,  # Stop when cost >= savings * multiplier
                  breakeven_multiplier: float = 1.0,  # Allow investment up to X times avoided damage
-                 flooding_cost_per_m3: float = 1250.0):  # $/m³ flooding damage
+                 ):
         
         self.evaluator = dynamic_evaluator
         self.metrics_extractor = dynamic_evaluator.metrics_extractor
         self.comparator = ScenarioComparator(self.metrics_extractor.metrics, baseline_inp_path=str(config.SWMM_FILE))
         self.stop_at_breakeven = stop_at_breakeven
         self.breakeven_multiplier = breakeven_multiplier
-        self.flooding_cost_per_m3 = flooding_cost_per_m3
+        
         
     def compare_solutions(self, active_pairs):
             """
@@ -593,8 +593,8 @@ class GreedyTankOptimizer:
             # -----------------------------------------------------------------
             # 2.6 REGISTRAR RESULTADOS DE ITERACIÓN EXITOSA
             # -----------------------------------------------------------------
-            # # Comparación visual con baseline
-            # self.compare_solutions(active_candidates)
+            # Comparación visual con baseline
+            self.compare_solutions(active_candidates)
             
             # Refrescar candidatos para siguiente iteración
             candidates = self.metrics_extractor.ranked_candidates.copy()
@@ -612,6 +612,8 @@ class GreedyTankOptimizer:
             # Iteración anterior (para cálculos marginales)
             prev = results[-1] if results else None
 
+            residual_repair_cost = self.baseline_metrics.cost['infrastructure_repair_cost'] - cost_dict['residual']['infrastructure_repair']
+            residual_flood_cost = self.baseline_metrics.cost['flood_damage_cost'] - cost_dict['residual']['flood_damage']
             # Construir diccionario de resultados
             result = {
                 # Identificación
@@ -619,7 +621,10 @@ class GreedyTankOptimizer:
                 'n_tanks': n_tanks,
                 'added_node': cand['node_id'],
                 'added_predio': cand.get('predio_id', ''),
-                
+
+                #costo social = costo de inversion - costo residual evitado
+                'cost_social_total': cost_dict['investment']['total'] - residual_repair_cost - residual_flood_cost,
+
                 # Costos de inversión (CAPEX)
                 'cost_investment_total': cost_dict['investment']['total'],
                 'cost_links': cost_dict['investment']['links'],
@@ -659,7 +664,17 @@ class GreedyTankOptimizer:
                 'cost_display': format_currency(cost_dict['investment']['total']),
                 'flooding_remaining': self.current_metrics.total_flooding_volume
             }
-            
+
+            print([' ' * 100])
+            print([' ' * 100])
+            print(['-' * 100])
+            print(['-' * 100])
+            pprint.pprint(result, width=1)
+            print(['-' * 100])
+            print(['-' * 100])
+            print([' ' * 100])
+            print([' ' * 100])
+
             # Guardar CSV de esta iteración
             df_result = pd.DataFrame([result])
             df_result.to_csv(Path(self.case_dir) / f"step_{iteration:02d}_summary.csv", index=False)
@@ -683,21 +698,21 @@ class GreedyTankOptimizer:
                 print(f"  [Stop] Max sequential iterations ({config.MAX_TANKS}) reached.")
                 volume_condition = False
                 break
-        #
-        # # =====================================================================
-        # # FASE 3: GENERAR REPORTES FINALES
-        # # =====================================================================
-        # if results:
-        #     df_results = pd.DataFrame(results)
-        #
-        #     # Dashboard visual de evolución
-        #     dash_gen = EvolutionDashboardGenerator(df_results, Path("optimization_results"))
-        #     dash_gen.generate_all()
-        #
-        #     # CSV consolidado
-        #     csv_path = Path("optimization_results") / "sequence_tracking.csv"
-        #     df_results.to_csv(csv_path, index=False)
-        #     print(f"  [Tracking] Saved CSV: {csv_path}")
+
+        # =====================================================================
+        # FASE 3: GENERAR REPORTES FINALES
+        # =====================================================================
+        if results:
+            df_results = pd.DataFrame(results)
+
+            # Dashboard visual de evolución
+            dash_gen = EvolutionDashboardGenerator(df_results, Path("optimization_results"))
+            dash_gen.generate_all()
+
+            # CSV consolidado
+            csv_path = Path("optimization_results") / "sequence_tracking.csv"
+            df_results.to_csv(csv_path, index=False)
+            print(f"  [Tracking] Saved CSV: {csv_path}")
 
 
         #optimization results
@@ -736,7 +751,7 @@ class GreedyTankOptimizer:
 
         # Del último resultado
         last = results[-1]
-        total_cost = last['cost_investment_total']
+        total_cost = last['cost_social_total']
         n_tanks = last['n_tanks']
 
         return GreedyOptimizationResult(

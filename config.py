@@ -96,8 +96,7 @@ BASE_INP_TR = 25  # Return Period (years) of the base INP file
 TR_LIST = [BASE_INP_TR]  # Change to [1,2,5,10,25,50,100] for probabilistic EAD
 VALIDATION_TR_LIST = [1,2,5,10,25,50,100]  # For NSGA final validation
 
-N_GENERATIONS = 15  # NSGA generations
-POP_SIZE = 3  # NSGA population
+
 
 
 
@@ -108,7 +107,7 @@ ELEV_FILE = ELEV_FILE_CARVED  # Use carved DEM for Itzi simulation
 
 
 # Vectors
-PREDIOS_FILE = VECTOR_DIR / "07_predios_disponibles.shp"
+PREDIOS_FILE = VECTOR_DIR / "lotes_seleccionados.gpkg"
 NETWORK_FILE = VECTOR_DIR / "06_red_principal.gpkg"
 FLOODING_NODES_FILE = FLOODING_STATS_DIR / "00_flooding_nodes.gpkg"
 PREDIOS_DAMAGED_FILE = VECTOR_DIR / "predios_proyecto.gpkg"
@@ -134,7 +133,7 @@ ITZI_OUTPUT_DIR = CODIGOS_DIR / "itzi_results"
 # Itzi config file
 ITZI_CONFIG_FILE = CODIGOS_DIR / "itzi_config.ini"
 
-# Manning friction coefficient (uniform)
+# Manning friction coefficient
 MANNING_VALUE = 0.035
 
 # Manning friction raster (variable by surface type)
@@ -150,7 +149,7 @@ REPORT_STEP_MINUTES = 5               # Report step for SWMM and Itzi
 SHOW_PREDIOS_IN_REPORTS = False  # Enable/Disable predios background in comparison maps (slow)
 
 # GREEN (NATURAL) SCENARIO PARAMETERS
-GREEN_SCENARIO_CN = 76.0              # Default Curve Number for natural state (Forest/Pasture)
+GREEN_SCENARIO_CN = 78.0              # Default Curve Number for natural state (Forest/Pasture)
 GREEN_SCENARIO_IMPERV = 15.0           # 3% residual imperviousness (rocks, clay, etc.)
 
 # =============================================================================
@@ -169,7 +168,7 @@ COST_COMPONENTS = {
 # TANK DESIGN PARAMETERS
 # =============================================================================
 CAPACITY_MAX_HD = 0.  # Maximum h/D ratio in conduits
-CAPACITY_MAX_FOR_AVOIDED_COST = 0.75
+CAPACITY_MAX_FOR_AVOIDED_COST = 0.80
 
 # 'flooding' for just avoid flooding nodes   or  'capacity' for avoiding h/D > DERIVATION_MAX_HD in all conduits
 TANK_OPT_OBJECTIVE = 'flooding'
@@ -184,7 +183,7 @@ TANK_MAX_VOLUME_M3 = 100000.0    # Maximum tank volume in cubic meters
 
 TANK_MIN_UTILIZATION_PCT = 20.0 # Minimum tank utilization % (warn if below this)
 TANK_VOLUME_ROUND_M3 = 100      # Round volumes to this increment for display
-MAX_TANKS = 5  # Maximum number of tanks to consider in optimization
+MAX_TANKS = 30  # Maximum number of tanks to consider in optimization
 MAX_PRUNE_RETRIES = 2  # Max retries for pruning tanks
 MAX_PREDIO_SLOPE = 30.0 # Maximum allowed predio slope in %. Predios steeper than this are discarded.
 PREDIO_MAX_OCCUPANCY_RATIO = 0.85  # Exclude predios with >85% area occupied from path search
@@ -239,22 +238,73 @@ DEFAULT_ROAD_PREFERENCES = {
     'secondary': 1.2, 'tertiary': 1.3, 'residential': 1.5,
     'service': 1.5, 'unclassified': 1.5,
     'footway': 5.0, 'path': 5.0, 'steps': 10.0,
-    'default': 1.5
+    'default': 1.0
 }
-
-
 
 FLOODING_RANKING_WEIGHTS = {
-    'flow_over_capacity': 0.3,
-    'flow_node_flooding': 0.3,
-    'vol_over_capacity': 0.,
-    'vol_node_flooding': 0.2,
-    'outfall_peak_flow':0.,
-    'failure_probability': 0.2,
-}
+    'flow_over_capacity': 1.0,
+    'flow_node_flooding': 0.0,
+    'vol_node_flooding': 0.0,
+    'outfall_peak_flow': 0,
+    'failure_probability': 0,
+}  # Pesos = 0 no se optimizan. Suma debe ser 1.0
 
+# =============================================================================
+# NSGA-II PARALLEL OPTIMIZATION SETTINGS
+# =============================================================================
+# CONFIGURACIÓN MANUAL - Ajusta estos valores según tu CPU
+# SWMM_THREADS: Número de threads que usará SWMM en cada simulación (recomendado: 2-4)
+# NSGA_PARALLEL_WORKERS: Número de individuos que corren en paralelo (recomendado: 4-10)
+SWMM_THREADS = 1                 # Threads para cada corrida de SWMM
+NSGA_PARALLEL_WORKERS = 6       # Número de workers paralelos para run_sequential_analysis
 
-CAPACITY_MATERIAL = {'HA': 1.0, 'PVC': 0.8, 'PEAD': 0.9}  # Relative capacity factors by material type
+# Estos son auto-calculados por CachedBenchmark (ignorados si usas config manual arriba)
+NSGA_OPTIMAL_SWMM_THREADS = None  # Optimal THREADS value for SWMM (from benchmark)
+NSGA_N_WORKERS = None             # Number of parallel workers for pymoo (auto-calculated)
+NSGA_BENCHMARK_CACHE_FILE = CODIGOS_DIR / "optimization_results" / "core_benchmark_cache.json"
+
+# =============================================================================
+# NSGA-II CONFIGURACION AUTO-CALCULADA
+# =============================================================================
+
+def calculate_nsga_config():
+    """
+    Calcula N_GENERATIONS y POP_SIZE basado en las variables activas.
+    
+    Variables = pesos activos (los que no son 0 en FLOODING_RANKING_WEIGHTS) + 1 (capacity_max_hd)
+    
+    Reglas:
+    - POP_SIZE >= 4 * n_variables (para diversidad genetica)
+    - POP_SIZE >= 12 (minimo practico)
+    - N_GENERATIONS = 100 (fijo, early stopping detendra si converge antes)
+    """
+    # Contar pesos activos (los que no son 0)
+    n_active_weights = sum(1 for v in FLOODING_RANKING_WEIGHTS.values() if abs(v) > 1e-10)
+    n_variables = n_active_weights + 1  # + capacity_max_hd
+    
+    # Calcular pop_size
+    pop_size = max(4 * n_variables, 12)  # Minimo 12, o 4x variables
+    
+    # Generaciones (early stopping lo detendra si converge antes)
+    n_generations = 50
+    
+    # Imprimir informacion SOLO en proceso principal (no en workers)
+    import multiprocessing
+    if multiprocessing.current_process().name == 'MainProcess':
+        print(f"[NSGA Config] Pesos activos: {n_active_weights}")
+        print(f"[NSGA Config] Variables totales: {n_variables} ({n_active_weights} pesos + 1 h/d)")
+        print(f"[NSGA Config] POP_SIZE auto: {pop_size}")
+        print(f"[NSGA Config] N_GENERATIONS: {n_generations}")
+        print(f"[NSGA Config] Evaluaciones max: {n_generations * pop_size}")
+    
+    return n_generations, pop_size
+
+# Calcular automaticamente
+N_GENERATIONS, POP_SIZE = calculate_nsga_config()
+
+# # Si quieres override manual, descomenta y ajusta:
+# N_GENERATIONS = 4
+# POP_SIZE = 2
 
 # =============================================================================
 # INITIALIZATION MESSAGE

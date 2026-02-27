@@ -68,14 +68,20 @@ class StormwaterOptimizationRunner:
         self.eval_id = eval_id  # ID de evaluación para crear subcarpeta
 
 
-    def run_sequential_analysis(self, max_tanks: int = 10, max_iterations: int = 50,
-                                         min_tank_vol: float = 1000.0, max_tank_vol: float = 10000.0,
+    def run_sequential_analysis(self, 
+                                         max_tanks: int = 10, 
+                                         max_iterations: int = 50,
+                                         min_tank_vol: float = 1000.0, 
+                                         max_tank_vol: float = 10000.0,
                                          stop_at_breakeven: bool = False, 
                                          breakeven_multiplier: float = 1.0,
                                          optimizer_mode: str = 'greedy',  # 'greedy' or 'nsga'
                                          elev_file: Path = None,
                                          optimization_tr_list: list = None,  # For NSGA: [25] or [1,2,5,10,25]
                                          validation_tr_list: list = None,    # For NSGA final validation
+                                         ranking_weights: dict = None,  # EXPLICITO: Pesos para ranking de nodos
+                                         capacity_max_hd: float = None,  # EXPLICITO: h/D maximo para derivacion
+                                         baseline_extractor_path: Path = None,  # EXPLICITO: Metricas baseline (no recorrer)
                                          ):
         """
         Step 3: Sequential Tank Analysis
@@ -94,6 +100,10 @@ class StormwaterOptimizationRunner:
         - max_tanks: Maximum number of active tanks
         - max_iterations: Maximum number of attempts/iterations
         - stop_at_breakeven: When construction cost >= flooding savings
+        
+        EXPLICIT Parameters:
+        - ranking_weights: Dict con pesos para ranking (ej: {'flow_node_flooding': 0.5, ...})
+        - capacity_max_hd: Valor h/D maximo para calculo de capacidad de derivacion
         """
         print(f"\n{'='*100}")
         print(f"SEQUENTIAL TANK ANALYSIS")
@@ -101,7 +111,18 @@ class StormwaterOptimizationRunner:
         print(f"  Optimizer Mode: {optimizer_mode.upper()}")
         print(f"  Max Tanks: {max_tanks} | Volume Range: {min_tank_vol} - {max_tank_vol} m³")
         print(f"  Stopping Criterion: Stop at Breakeven Enabled (Multiplier: {breakeven_multiplier})")
-
+        
+        # Aplicar parametros EXPLICITOS al config (antes de crear evaluador/optimizador)
+        if ranking_weights is not None:
+            print(f"\n  [Explicit Params] Aplicando ranking_weights:")
+            for k, v in ranking_weights.items():
+                if v > 0:
+                    print(f"    {k}: {v:.4f}")
+            config.FLOODING_RANKING_WEIGHTS = ranking_weights.copy()
+        
+        if capacity_max_hd is not None:
+            print(f"  [Explicit Params] CAPACITY_MAX_HD: {capacity_max_hd:.4f}")
+            config.CAPACITY_MAX_HD = capacity_max_hd
         
         # 1. Setup Environment
         if self.evaluator is None:
@@ -117,7 +138,12 @@ class StormwaterOptimizationRunner:
             else:
                 self.work_dir = base_work_dir
                 
-            self.setup_optimization(elev_file=elev_file,)
+            self.setup_optimization(
+                elev_file=elev_file,
+                ranking_weights=ranking_weights,
+                capacity_max_hd=capacity_max_hd,
+                baseline_extractor_path=baseline_extractor_path,
+            )
 
             # 2. Run Optimization
             greedy_opt = GreedyTankOptimizer(
@@ -228,14 +254,19 @@ class StormwaterOptimizationRunner:
 
 
     def setup_optimization(self,
-                           elev_file: Path = None,):
+                           elev_file: Path = None,
+                           ranking_weights: dict = None,
+                           capacity_max_hd: float = None,
+                           baseline_extractor_path: Path = None
+                           ):
 
         """Initialize the evaluator and optimizer components.
         
         Args:
-            use_dynamic: Use dynamic SWMM simulation (True) or simple estimation (False)
-            swmm_file: Path to SWMM .inp file
             elev_file: Path to elevation raster
+            ranking_weights: Dict con pesos explicitos para ranking
+            capacity_max_hd: Valor h/D maximo explicito
+            baseline_extractor_path: Ruta al pickle del extractor baseline (si None, se crea nuevo)
         """
         
         
@@ -248,6 +279,9 @@ class StormwaterOptimizationRunner:
             path_proy=self.project_root,
             elev_files_list=[str(elev_file)],
             proj_to=self.proj_to,
+            ranking_weights=ranking_weights,
+            capacity_max_hd=capacity_max_hd,
+            baseline_extractor_path=baseline_extractor_path,
         )
 
 
@@ -281,7 +315,7 @@ class StormwaterOptimizationRunner:
 if __name__ == "__main__":
     
     import multiprocessing
-    multiprocessing.freeze_support()  # Importante en Windows
+    multiprocessing.freeze_support()
 
 
     # set variables from config

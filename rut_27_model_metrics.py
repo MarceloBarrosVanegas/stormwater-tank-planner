@@ -57,7 +57,6 @@ Usage:
     |
     v
 [Rank Candidates]
-    - Use WeightedCandidateSelector for scoring
     - Sort by score (desc) and distance (asc)
     - Deduplicate by node ID
     - Store ranked list in entity
@@ -97,116 +96,11 @@ import config
 config.setup_sys_path()
 
 from rut_02_elevation import ElevationGetter, ElevationSource
-from rut_02_get_flodded_nodes import CandidatePair, PredioSlopeCalculator, WeightedCandidateSelector
+from rut_02_get_flodded_nodes import PredioSlopeCalculator
 from rut_06_pipe_sizing import CapacidadMaximaTuberia
 from rut_25_from_inp_to_vector import NetworkExporter
 
 
-
-
-
-
-def _instantiate_candidate_pair(task):
-    """
-    Standalone worker function to instantiate a CandidatePair.
-    Separated from the main class to avoid nested functions.
-    """
-    n = task['node']
-    p = task['predio']
-
-    # Cálculo de distancia integrado
-    d = math.dist(task['start_xy'], task['end_xy'])
-
-    return CandidatePair(
-        node_id=n['NodeID'],
-        predio_id=p['id'],
-        node_volume_flood=n['total_volume'],
-        node_max_flow=n['total_flow'],
-        node_max_depth=n['NodeDepth'],
-        node_z_invert=n['InvertElevation'],
-        node_z_surface=float(task['node_surface_z']),
-        node_x=float(task['start_xy'][0]),
-        node_y=float(task['start_xy'][1]),
-        node_geometry=n['geometry'],
-        node_probability_failure=n['failure_probability'],
-        node_flow_over_capacity=n['flow_over_capacity'],
-        node_flooding_flow=n['flow_node_flooding'],
-        node_volume_over_capacity=n['vol_over_capacity'],
-        node_volume_flooding=n['vol_node_flooding'],
-        node_distance_to_predio=d,
-        node_elevation_gap_to_predio=float(task['gap']),
-        derivation_link="",
-        derivation_link_geometry=None,
-        derivation_target_node_geometry=None,
-        predio_area_m2=round(p['geometry'].area, 0),
-        predio_geometry=p['geometry'],
-        predio_x_centroid=float(task['end_xy'][0]),
-        predio_y_centroid=float(task['end_xy'][1]),
-        predio_ground_z=float(p['z']),
-        tank_volume_simulation=0.0,
-        tank_max_depth=0.0,
-        
-        cost_tank=0.0,
-        cost_land=0.0,
-        is_tank=True,
-        target_id=""
-    )
-
-
-@dataclass
-class CandidatePair:
-    """
-    Represents a candidate assignment of a node to a predio.
-    Shared data structure for ranking and dynamic evaluation.
-    """
-    # --- Identificadores y Metadatos ---
-    node_id: str  # Nombre/ID del nodo (ej. J-123)
-    predio_id: str  # Nombre/ID del predio (ej. P-456)
-
-    # --- Datos del Nodo de derivacion ---
-    node_volume_flood: float = 0.0  # Volumen de inundación en el nodo (m3)
-    node_max_flow: float = 0.0  # Caudal pico de inundación (m3/s)
-    node_max_depth: float = 0.0  # H_max del nodo original
-    node_z_invert: float = 0.0  # Elevación batea del nodo (m)
-    node_z_surface: float = 0.0  # Elevación superficie del nodo (m)
-    node_x: float = 0.0  # Coordenada X del nodo (m)
-    node_y: float = 0.0  # Coordenada Y del nodo (m)
-    node_probability_failure: float = 0.0
-    node_flow_over_capacity: float = 0.0  # Caudal sobre capacidad de tubería (m3/s)
-    node_flooding_flow: float = 0.0  # Caudal de inundación del nodo (m3/s)
-    node_volume_over_capacity: float = 0.0  # Volumen sobre capacidad de tubería (m3)
-    node_volume_flooding: float = 0.0  # Volumen de inundación del nodo (m3)
-    node_geometry: Optional[Point] = None  # Point con las coordenadas del nodo
-    node_distance_to_predio: float = 0.0  # Distancia euclidiana al predio (m)
-    node_elevation_gap_to_predio: float = 0.0  # Desnivel entre nodo y predio (m)
-
-    # --- Tuberia ---
-    derivation_link: str = ""  # ID del tramo que más aporta a la inundación
-    derivation_link_geometry: Optional[LineString] = None
-    derivation_target_node_geometry: Optional[Point] = None
-
-    # --- Datos del Predio  ---
-    predio_area_m2: float = 0.0
-    predio_geometry: Optional[Polygon] = None
-    predio_x_centroid: float = 0.0
-    predio_y_centroid: float = 0.0
-    predio_ground_z: float = 0.0  # Elevación del terreno
-
-    # ---  Tanque  ---
-    tank_volume_simulation: float = 0.0  # Volumen capturado en simulación post-ejecución
-    tank_max_depth: float = 0.0  # Profundidad de diseño (por defecto en config)
-
-    # --- Datos de Tubería (de rut_03 diseño) ---
-    diameter: str = 'N/A'  # Diámetro de tubería diseñada (ej. "1.2" o "1.5x1.2")
-    pipeline_length: float = 0.0  # Longitud total de tubería (m)
-
-    # --- Costos Estimados (Para rut_17 Dashboard) ---
-    cost_tank: float = 0.0
-    cost_land: float = 0.0
-
-    # --- Contexto del Árbol (Tree Routing) ---
-    is_tank: bool = True  # ¿Se conecta a un tanque o es solo una tubería?
-    target_id: str = ""  # ID del nodo/tanque al que finalmente descarga
 
 
 @dataclass
@@ -238,9 +132,8 @@ class SystemMetrics:
     surcharged_links_count: int = 0
     overloaded_links_length: float = 0.0
     system_mean_utilization: float = 0.0
-    
-
-
+    network_health_score: float = 0.0  # 0-1, mayor es mejor (calculado de swmm_gdf)
+   
 
 class MetricExtractor:
     """
@@ -248,9 +141,16 @@ class MetricExtractor:
     Functions as an entity class with data stored in attributes.
     """
 
-    def __init__(self, project_root: Path = None, predios_path=None):
+    def __init__(self, project_root: Path = None, predios_path=None,
+                 ranking_weights: dict = None, capacity_max_hd: float = None,
+                 baseline_metrics: SystemMetrics = None):
         self.project_root = Path(project_root) if project_root else Path(os.getcwd())
         print(f"Project Root: {self.project_root}")
+        
+        # Parametros EXPLICITOS (opcionales) - NO modificar config aqui
+        self.explicit_ranking_weights = ranking_weights
+        self.explicit_capacity_max_hd = capacity_max_hd
+        self.cached_baseline_metrics = baseline_metrics  # Cachear baseline
 
         # Default configuration
         self.graph_cache = None
@@ -410,7 +310,7 @@ class MetricExtractor:
 
         with Simulation(str(inp_path)) as sim:
             total_duration = (sim.end_time - sim.start_time).total_seconds()
-            with tqdm(total=100, desc="Running SWMM Simulation", unit="%", disable=False) as pbar:
+            with tqdm(total=100, desc="Running SWMM Simulation", unit="%", disable=True) as pbar:
                 last_pct = 0
                 for _ in sim:  # Fixed: Renamed 'step' to '_' as it's unused
                     current_pct = int(((sim.current_time - sim.start_time).total_seconds() / total_duration) * 100)
@@ -442,7 +342,7 @@ class MetricExtractor:
             S=np.where(swmm_gdf['Slope'] < 0, 0.01, swmm_gdf['Slope']),
             Rug=swmm_gdf['Roughness'].to_numpy().astype(float),
             Seccion=swmm_gdf['Seccion'].to_numpy().astype(str),
-            h_D_objetivo=config.CAPACITY_MAX_HD
+            h_D_objetivo=self.explicit_capacity_max_hd if self.explicit_capacity_max_hd is not None else config.CAPACITY_MAX_HD
         )
 
         q_at_capacity_series = pd.Series(np.round(q_at_capacity / 1000, 3), index=swmm_gdf.index)
@@ -590,10 +490,23 @@ class MetricExtractor:
                 
                 # System mean utilization (using mean of ratios)
                 metrics.system_mean_utilization = swmm_gdf[swmm_gdf['Capacity'] > 0]['utilization'].mean() * 100 # In percentage
+                
+                # Network health: capacity ponderada por caudal (1.0 = mejor, 0.0 = peor)
+                valid = swmm_gdf[swmm_gdf['Capacity'] > 0].copy()
+                if not valid.empty and 'MaxFlow' in valid.columns:
+                    total_flow = valid['MaxFlow'].sum()
+                    if total_flow > 0:
+                        weighted_util = (valid['Capacity'] * valid['MaxFlow']).sum() / total_flow
+                        metrics.network_health_score = 1.0 - weighted_util  # Mayor es mejor
+                    else:
+                        metrics.network_health_score = 0.0
+                else:
+                    metrics.network_health_score = 0.0
             else:
                  metrics.surcharged_links_count = 0
                  metrics.overloaded_links_length = 0.0
                  metrics.system_mean_utilization = 0.0
+                 metrics.network_health_score = 0.0
 
             inletnodes_series = swmm_gdf['InletNode'].astype(str).str.strip().str.upper()
 
@@ -902,7 +815,11 @@ class MetricExtractor:
         Uses config.FLOODING_RANKING_WEIGHTS keys as the metric names (no hardcodes).
         Normalizes each metric to 0-1 (min-max) before weighting.
         """
-        self.weights = config.FLOODING_RANKING_WEIGHTS
+        # Usar pesos explicitos si estan disponibles, sino usar config
+        if self.explicit_ranking_weights is not None:
+            self.weights = self.explicit_ranking_weights
+        else:
+            self.weights = config.FLOODING_RANKING_WEIGHTS
 
         if gdf.empty:
             gdf = gdf.copy()
@@ -954,69 +871,21 @@ class MetricExtractor:
         df.drop(columns=norm_cols, inplace=True)
         return df.sort_values("score", ascending=False)
 
-
-    @staticmethod
-    def get_candidate_pairs(
-                            nodes_gdf: gpd.GeoDataFrame,
-                            predios_gdf: gpd.GeoDataFrame,
-                            max_workers: int = None
-                            ) -> List[CandidatePair]:
-        """
-        Versión Multinúcleo (Separada): Prepara los datos vectorialmente y
-        reparte la creación de objetos en el pool de hilos usando una función externa.
-        """
-        print(f"[Task] Comparando {len(nodes_gdf)} nodos vs {len(predios_gdf)} predios...")
-
-        # 1. Preparación Vectorizada (Filtrado instantáneo)
-        node_invert = nodes_gdf['InvertElevation'].values
-        node_surface_z = node_invert + nodes_gdf['NodeDepth'].values
-        node_x = nodes_gdf.geometry.x.values
-        node_y = nodes_gdf.geometry.y.values
-
-        predio_z = predios_gdf['z'].values
-        predio_x = predios_gdf.geometry.centroid.x.values
-        predio_y = predios_gdf.geometry.centroid.y.values
-
-        mask = predio_z[np.newaxis, :] <= node_invert[:, np.newaxis]
-        i_indices, j_indices = np.where(mask)
-        total_tasks = len(i_indices)
-
-        if total_tasks == 0:
-            return []
-
-        # Convertimos a diccionarios para el pool
-        nodes_list = nodes_gdf.iloc[i_indices].to_dict('records')
-        predios_list = predios_gdf.iloc[j_indices].to_dict('records')
-
-        # Preparar lista de tareas para el executor
-        tasks = []
-        for idx in range(total_tasks):
-            tasks.append({
-                'node': nodes_list[idx],
-                'predio': predios_list[idx],
-                'j': int(j_indices[idx]),
-                'node_surface_z': node_surface_z[i_indices[idx]],
-                'start_xy': (node_x[i_indices[idx]], node_y[i_indices[idx]]),
-                'end_xy': (predio_x[j_indices[idx]], predio_y[j_indices[idx]]),
-                'gap': node_invert[i_indices[idx]] - predio_z[j_indices[idx]]
-            })
-
-        # 2. Ejecución Paralela usando la función externa
-        workers = max_workers or int(os.cpu_count() / 2.0)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            # Usamos map con la función standalone _instantiate_candidate_pair
-            valid_pairs = list(tqdm(executor.map(_instantiate_candidate_pair, tasks),
-                                    total=total_tasks, desc="Cargando candidatos"))
-
-        return valid_pairs
-
-    def run(self, inp_file_path: str = None, last_designed_gdf= None):
+    def run(self, inp_file_path: str = None, last_designed_gdf= None, use_cached_baseline: bool = False):
         """
         Single run method: Extracts flooding metrics, maps spatial risk, and ranks candidates.
         Populates entity attributes instead of returning values.
+        
+        Args:
+            use_cached_baseline: Si True y hay baseline cacheado, usarlo sin correr simulacion
         """
-        # Extract flooding metrics
-        metrics = self.extract(inp_file_path, {}, last_designed_gdf=last_designed_gdf)
+        # Usar baseline cacheado si esta disponible y se solicita
+        if use_cached_baseline and self.cached_baseline_metrics is not None:
+            print("[MetricExtractor] Usando baseline cacheado (sin simulacion)")
+            metrics = self.cached_baseline_metrics
+        else:
+            # Extract flooding metrics (correr simulacion)
+            metrics = self.extract(inp_file_path, {}, last_designed_gdf=last_designed_gdf)
         self.swmm_gdf = metrics.swmm_gdf
         self.nodes_gdf = metrics.flooded_nodes_gdf
 
@@ -1027,18 +896,6 @@ class MetricExtractor:
         if self.nodes_gdf is None or self.predios_gdf is None:
             sys.exit("Error: Data not loaded.")
 
-        # # Identify Valid Candidate Pairs
-        # n_nodes = len(self.nodes_gdf)
-        # n_predios = len(self.predios_gdf)
-        # print(f"Comparing {n_nodes} nodes against {n_predios} predios...")
-        # valid_pairs = self.get_candidate_pairs(self.nodes_gdf, self.predios_gdf)
-        #
-        # n_valid = len(valid_pairs)
-        # if n_valid == 0:
-        #     sys.exit("  [Error] No valid candidate pairs found based on elevation criteria.")
-
-        # Use WeightedCandidateSelector for consistent scoring
-        # selector = WeightedCandidateSelector(self.nodes_gdf, self.predios_gdf)
         df = self.calculate_scores(self.nodes_gdf)
 
         # Sort by Score (Desc) and then Distance (Asc) as tie-breaker
@@ -1053,7 +910,12 @@ class MetricExtractor:
         print("=" * 100)
 
         # columnas a imprimir = keys del weights que existan en df
-        cols = [k for k in config.FLOODING_RANKING_WEIGHTS.keys() if k in df.columns]
+        # Usar pesos explicitos si estan disponibles, sino usar config
+        if self.explicit_ranking_weights is not None:
+            self.weights = self.explicit_ranking_weights
+        else:
+            self.weights = config.FLOODING_RANKING_WEIGHTS
+        cols = [k for k in self.weights.keys() if k in df.columns]
 
         # opcional: incluir node_id al inicio si existe
         if "node_id" in df.columns:

@@ -16,7 +16,10 @@ import os
 import sys
 import json
 import pickle
+import csv
 import warnings
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any, Callable
@@ -62,21 +65,586 @@ NSGA_CONFIG = {
     'max_tanks': config.MAX_TANKS,
     'max_iterations': config.MAX_ITERATIONS,
     'capacity_max_hd_bounds': (0.0, 0.95),
+    # Early Stopping Configuration
+    'early_stopping': {
+        'enabled': True,
+        'patience': 10,  # generaciones sin mejora antes de parar
+        'min_delta': 0.001,  # mejora mínima significativa (1%)
+        'metric': 'hypervolume',  # 'hypervolume', 'best_score', o 'igd'
+        'window_size': 5,  # ventana móvil para suavizar
+    },
+    # Scoring Configuration
+    'scoring': {
+        'benefit_weights': {
+            'flooding_vol_reduction': 0.35,
+            'flooding_flow_reduction': 0.25,
+            'outfall_flow_reduction': 0.20,
+            'network_health': 0.20,
+        },
+        'cost_weight': 0.3,  # peso del costo en el score agregado
+    }
 }
 
-WEIGHT_KEYS = [
-    'flow_over_capacity',
-    'flow_node_flooding',
-    'vol_over_capacity', 
-    'vol_node_flooding',
-    'outfall_peak_flow',
-    'failure_probability'
-]
+# =============================================================================
+# DETECCIÓN AUTOMÁTICA DE PESOS ACTIVOS
+# =============================================================================
+
+def get_active_weights() -> List[str]:
+    """
+    Detecta automáticamente qué pesos en FLOODING_RANKING_WEIGHTS son != 0.
+    Solo esos pesos serán optimizados por NSGA-II.
+    Los pesos = 0 se mantienen fijos.
+    
+    Returns:
+        Lista de keys con valor != 0 en config.FLOODING_RANKING_WEIGHTS
+    """
+    import config
+    active = []
+    for key, value in config.FLOODING_RANKING_WEIGHTS.items():
+        if abs(value) > 1e-10 or key in ['flow_over_capacity', 'flow_node_flooding', 
+                                          'vol_node_flooding', 'outfall_peak_flow', 
+                                          'failure_probability']:
+            # Solo incluir si el valor inicial no es exactamente 0
+            # o si es uno de los pesos conocidos
+            if abs(value) > 1e-10:
+                active.append(key)
+    
+    # Si no hay ninguno activo, usar todos por defecto
+    if not active:
+        active = ['flow_over_capacity', 'flow_node_flooding', 'vol_node_flooding',
+                  'outfall_peak_flow', 'failure_probability']
+    
+    return active
+
+# Lista dinámica de pesos activos (se actualiza al importar)
+WEIGHT_KEYS = get_active_weights()
+ALL_WEIGHT_KEYS = ['flow_over_capacity', 'flow_node_flooding', 'vol_node_flooding',
+                   'outfall_peak_flow', 'failure_probability']  # 5 pesos posibles (vol_over_capacity eliminado)
 
 
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
+
+@dataclass 
+class SolutionRecord:
+    """
+    Registro completo de una solución evaluada.
+    Se guarda en el CSV de evolución.
+    """
+    # Identificación
+    generation: int
+    individual_id: int
+    timestamp: str
+    eval_id: str
+    
+    # Variables de decisión (6 variables: 5 pesos + capacity_max_hd)
+    weight_flow_over_capacity: float
+    weight_flow_node_flooding: float
+    weight_vol_node_flooding: float
+    weight_outfall_peak_flow: float
+    weight_failure_probability: float
+    capacity_max_hd: float
+    
+    # Objetivos (5 objetivos - convertidos a positivos para legibilidad)
+    flooding_vol_reduction_pct: float
+    flooding_flow_reduction_pct: float
+    outfall_flow_reduction_pct: float
+    network_health: float
+    total_cost: float
+    
+    # Scores calculados
+    score_weighted: float          # Score ponderado por usuario
+    score_benefit_cost: float      # Beneficio/Costo
+    score_dominance: float         # Nivel de dominancia
+    rank: int                      # Ranking en población
+    crowding_distance: float       # Distancia de crowding NSGA-II
+    is_pareto: bool                # Está en el frente de Pareto?
+    
+    # Métricas de evolución (diferencias)
+    delta_vs_prev_gen: float       # Diferencia vs mejor de gen anterior
+    delta_vs_best: float           # Diferencia vs mejor global
+    delta_vs_baseline: float       # Diferencia vs baseline (si aplica)
+    
+    # Métricas de diversidad
+    population_std: float          # Desviación estándar de objetivos en población
+    hypervolume: float             # Hypervolume del frente (solo se guarda 1x por gen)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'generation': self.generation,
+            'individual_id': self.individual_id,
+            'timestamp': self.timestamp,
+            'eval_id': self.eval_id,
+            'weight_flow_over_capacity': self.weight_flow_over_capacity,
+            'weight_flow_node_flooding': self.weight_flow_node_flooding,
+            'weight_vol_over_capacity': self.weight_vol_over_capacity,
+            'weight_vol_node_flooding': self.weight_vol_node_flooding,
+            'weight_outfall_peak_flow': self.weight_outfall_peak_flow,
+            'weight_failure_probability': self.weight_failure_probability,
+            'capacity_max_hd': self.capacity_max_hd,
+            'flooding_vol_reduction_pct': self.flooding_vol_reduction_pct,
+            'flooding_flow_reduction_pct': self.flooding_flow_reduction_pct,
+            'outfall_flow_reduction_pct': self.outfall_flow_reduction_pct,
+            'network_health': self.network_health,
+            'total_cost': self.total_cost,
+            'score_weighted': self.score_weighted,
+            'score_benefit_cost': self.score_benefit_cost,
+            'score_dominance': self.score_dominance,
+            'rank': self.rank,
+            'crowding_distance': self.crowding_distance,
+            'is_pareto': self.is_pareto,
+            'delta_vs_prev_gen': self.delta_vs_prev_gen,
+            'delta_vs_best': self.delta_vs_best,
+            'delta_vs_baseline': self.delta_vs_baseline,
+            'population_std': self.population_std,
+            'hypervolume': self.hypervolume,
+        }
+    
+    @staticmethod
+    def get_csv_header() -> List[str]:
+        return [
+            'generation', 'individual_id', 'timestamp', 'eval_id',
+            'weight_flow_over_capacity', 'weight_flow_node_flooding', 'weight_vol_node_flooding',
+            'weight_outfall_peak_flow', 'weight_failure_probability',
+            'capacity_max_hd', 'flooding_vol_reduction_pct', 'flooding_flow_reduction_pct',
+            'outfall_flow_reduction_pct', 'network_health', 'total_cost',
+            'score_weighted', 'score_benefit_cost', 'score_dominance', 'rank',
+            'crowding_distance', 'is_pareto', 'delta_vs_prev_gen', 'delta_vs_best',
+            'delta_vs_baseline', 'population_std', 'hypervolume'
+        ]
+
+
+@dataclass
+class GenerationSummary:
+    """Resumen de una generación para el JSON de evolución."""
+    generation: int
+    timestamp: str
+    n_evaluations: int
+    
+    # Mejor solución de esta generación
+    best_score: float
+    best_individual_id: int
+    best_flooding_reduction: float
+    best_cost: float
+    
+    # Estadísticas de población
+    mean_score: float
+    std_score: float
+    min_cost: float
+    max_cost: float
+    mean_cost: float
+    
+    # Métricas de convergencia
+    hypervolume: float
+    hypervolume_delta: float  # Cambio vs generación anterior
+    diversity_index: float    # Índice de diversidad poblacional
+    
+    # Early stopping
+    generations_without_improvement: int
+    should_stop: bool
+
+
+class OptimizationLogger:
+    """
+    Logger completo para la optimización NSGA-II.
+    Guarda cada solución evaluada y resúmenes por generación.
+    """
+    
+    def __init__(self, output_dir: Path, base_metrics_extractor: Optional[SystemMetrics] = None):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.baseline_metrics = base_metrics_extractor.metrics
+        
+        # Archivos de salida
+        self.detailed_csv = self.output_dir / "optimization_log_detailed.csv"
+        self.summary_json = self.output_dir / "optimization_summary.json"
+        
+        # Estado
+        self.records: List[SolutionRecord] = []
+        self.generation_summaries: List[GenerationSummary] = []
+        self.best_score_global = -float('inf')
+        self.best_solution_global = None
+        self.generation_best_scores: Dict[int, float] = {}
+        self.reference_point = np.array([0, 0, 0, 0, 1e10])  # Para hypervolume
+        
+        # Crear CSV con header
+        self._init_csv()
+    
+    def _init_csv(self):
+        """Inicializa el CSV con el header (solo si no existe o está vacío)."""
+        # Verificar si el archivo ya existe y tiene contenido
+        if self.detailed_csv.exists() and self.detailed_csv.stat().st_size > 100:
+            print(f"[Logger] CSV already exists with data, appending new generations...")
+            return
+        
+        with open(self.detailed_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(SolutionRecord.get_csv_header())
+    
+    def calculate_hypervolume(self, F: np.ndarray) -> float:
+        """
+        Calcula el hypervolume del frente de Pareto.
+        F: matriz de objetivos (ya convertidos a positivos para maximización)
+        """
+        try:
+            from pymoo.indicators.hv import Hypervolume
+            
+            # pymoo minimiza, así que negamos los objetivos de maximización
+            F_minimize = F.copy()
+            F_minimize[:, :4] = -F_minimize[:, :4]  # Negar los 4 primeros (maximización)
+            
+            # Punto de referencia: peor valor posible en cada objetivo
+            ref_point = np.array([0, 0, 0, 0, 1e10])  # [max_flood, max_flow, max_outfall, max_health, max_cost]
+            
+            hv = Hypervolume(ref_point=ref_point)
+            return hv.do(F_minimize)
+        except Exception as e:
+            print(f"[Logger] Warning: Could not calculate hypervolume: {e}")
+            return 0.0
+    
+    def calculate_scores(self, objectives: np.ndarray, weights_norm: np.ndarray) -> Dict[str, float]:
+        """
+        Calcula múltiples scores para una solución.
+        objectives: [flooding_vol, flooding_flow, outfall_flow, health, cost]
+        """
+        flooding_vol, flooding_flow, outfall_flow, health, cost = objectives
+        
+        # 1. Score ponderado (configurable por usuario)
+        cfg = NSGA_CONFIG['scoring']
+        w = cfg['benefit_weights']
+        benefit = (
+            flooding_vol * w['flooding_vol_reduction'] +
+            flooding_flow * w['flooding_flow_reduction'] +
+            outfall_flow * w['outfall_flow_reduction'] +
+            health * w['network_health']
+        )
+        cost_normalized = cost / 1e6  # Normalizar costo a millones
+        score_weighted = benefit - cfg['cost_weight'] * cost_normalized
+        
+        # 2. Score Beneficio/Costo
+        if cost > 0:
+            total_benefit = flooding_vol + flooding_flow + outfall_flow + health
+            score_bc = total_benefit / (cost / 1e6)  # Beneficio por millón de dólares
+        else:
+            score_bc = 0.0
+        
+        return {
+            'score_weighted': score_weighted,
+            'score_benefit_cost': score_bc,
+        }
+    
+    def log_generation(self, 
+                       generation: int,
+                       X: np.ndarray,  # Variables de decisión
+                       F: np.ndarray,  # Objetivos (negativos para maximización)
+                       algorithm,
+                       should_stop: bool = False,
+                       generations_without_improvement: int = 0,
+                       active_weights: List[str] = None) -> GenerationSummary:
+        """
+        Loguea una generación completa.
+        X: [n_individuals, n_var] - pesos activos + h_d
+        F: [n_individuals, 5] - objetivos (negativos para maximización)
+        active_weights: Lista de pesos que están siendo optimizados
+        """
+        timestamp = datetime.now().isoformat()
+        n_individuals = X.shape[0]
+        
+        # Detectar pesos activos si no se proporcionan
+        if active_weights is None:
+            active_weights = get_active_weights()
+        n_active = len(active_weights)
+        
+        # Convertir F a positivos para legibilidad
+        F_pos = F.copy()
+        F_pos[:, :4] = -F_pos[:, :4]  # Negar los 4 primeros (maximización)
+        F_pos[:, 4] = F_pos[:, 4]      # Costo ya es minimización
+        
+        # Calcular hypervolume
+        hypervolume = self.calculate_hypervolume(F_pos)
+        hypervolume_delta = 0.0
+        if self.generation_summaries:
+            hypervolume_delta = hypervolume - self.generation_summaries[-1].hypervolume
+        
+        # Calcular diversidad poblacional (std promedio de objetivos)
+        diversity = np.mean(np.std(F_pos, axis=0))
+        
+        # Encontrar rangos y crowding distance del algoritmo
+        pop = algorithm.pop
+        ranks = pop.get("rank") if pop.has("rank") else np.zeros(n_individuals)
+        crowding = pop.get("crowding") if pop.has("crowding") else np.zeros(n_individuals)
+        
+        # Mejor solución de esta generación (por score ponderado)
+        scores = []
+        for i in range(n_individuals):
+            scores_dict = self.calculate_scores(F_pos[i], X[i])
+            scores.append(scores_dict['score_weighted'])
+        scores = np.array(scores)
+        
+        best_idx = np.argmax(scores)
+        best_score = scores[best_idx]
+        
+        # Actualizar mejor global
+        if best_score > self.best_score_global:
+            self.best_score_global = best_score
+            self.best_solution_global = {
+                'generation': generation,
+                'individual_id': best_idx,
+                'objectives': F_pos[best_idx].tolist(),
+                'weights': X[best_idx].tolist(),
+                'score': best_score,
+            }
+        
+        self.generation_best_scores[generation] = best_score
+        
+        # Calcular delta vs generación anterior
+        delta_vs_prev = 0.0
+        if generation > 1 and (generation - 1) in self.generation_best_scores:
+            delta_vs_prev = best_score - self.generation_best_scores[generation - 1]
+        
+        # Guardar cada solución
+        with open(self.detailed_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            
+            for i in range(n_individuals):
+                scores_dict = self.calculate_scores(F_pos[i], X[i])
+                
+                # Normalizar pesos activos para guardar
+                weights_raw = X[i, :n_active]
+                weights_sum = np.sum(weights_raw)
+                if weights_sum < 1e-10:
+                    weights_norm = np.ones(n_active) / n_active
+                else:
+                    weights_norm = weights_raw / weights_sum
+                
+                # Construir diccionario de todos los pesos (activos + inactivos=0)
+                weight_values = {key: 0.0 for key in ALL_WEIGHT_KEYS}
+                for idx, key in enumerate(active_weights):
+                    weight_values[key] = weights_norm[idx]
+                
+                # Diferencias
+                delta_vs_best = scores[i] - self.best_score_global if self.best_score_global != -float('inf') else 0.0
+                
+                record = SolutionRecord(
+                    generation=generation,
+                    individual_id=i,
+                    timestamp=timestamp,
+                    eval_id=f"gen{generation:04d}_ind{i:03d}",
+                    weight_flow_over_capacity=weight_values['flow_over_capacity'],
+                    weight_flow_node_flooding=weight_values['flow_node_flooding'],
+                    weight_vol_node_flooding=weight_values['vol_node_flooding'],
+                    weight_outfall_peak_flow=weight_values['outfall_peak_flow'],
+                    weight_failure_probability=weight_values['failure_probability'],
+                    capacity_max_hd=np.clip(X[i, n_active], 0, 0.95),
+                    flooding_vol_reduction_pct=F_pos[i, 0],
+                    flooding_flow_reduction_pct=F_pos[i, 1],
+                    outfall_flow_reduction_pct=F_pos[i, 2],
+                    network_health=F_pos[i, 3],
+                    total_cost=F_pos[i, 4],
+                    score_weighted=scores_dict['score_weighted'],
+                    score_benefit_cost=scores_dict['score_benefit_cost'],
+                    score_dominance=-int(ranks[i]) if ranks is not None else 0,  # Negativo para que mayor sea mejor
+                    rank=int(ranks[i]) if ranks is not None else 0,
+                    crowding_distance=float(crowding[i]) if crowding is not None else 0.0,
+                    is_pareto=(ranks[i] == 0) if ranks is not None else False,
+                    delta_vs_prev_gen=delta_vs_prev if i == best_idx else 0.0,
+                    delta_vs_best=delta_vs_best,
+                    delta_vs_baseline=0.0,  # Se puede calcular si se pasa baseline
+                    population_std=diversity,
+                    hypervolume=hypervolume if i == 0 else 0.0,  # Solo guardar 1x por gen
+                )
+                
+                writer.writerow([
+                    record.generation, record.individual_id, record.timestamp, record.eval_id,
+                    record.weight_flow_over_capacity, record.weight_flow_node_flooding,
+                    record.weight_vol_node_flooding,
+                    record.weight_outfall_peak_flow, record.weight_failure_probability,
+                    record.capacity_max_hd, record.flooding_vol_reduction_pct,
+                    record.flooding_flow_reduction_pct, record.outfall_flow_reduction_pct,
+                    record.network_health, record.total_cost, record.score_weighted,
+                    record.score_benefit_cost, record.score_dominance, record.rank,
+                    record.crowding_distance, record.is_pareto, record.delta_vs_prev_gen,
+                    record.delta_vs_best, record.delta_vs_baseline, record.population_std,
+                    record.hypervolume
+                ])
+                
+                self.records.append(record)
+        
+        # Crear resumen de generación
+        summary = GenerationSummary(
+            generation=generation,
+            timestamp=timestamp,
+            n_evaluations=n_individuals,
+            best_score=best_score,
+            best_individual_id=best_idx,
+            best_flooding_reduction=F_pos[best_idx, 0],
+            best_cost=F_pos[best_idx, 4],
+            mean_score=np.mean(scores),
+            std_score=np.std(scores),
+            min_cost=np.min(F_pos[:, 4]),
+            max_cost=np.max(F_pos[:, 4]),
+            mean_cost=np.mean(F_pos[:, 4]),
+            hypervolume=hypervolume,
+            hypervolume_delta=hypervolume_delta,
+            diversity_index=diversity,
+            generations_without_improvement=generations_without_improvement,
+            should_stop=should_stop,
+        )
+        
+        self.generation_summaries.append(summary)
+        
+        # Guardar JSON actualizado
+        self._save_summary_json()
+        
+        return summary
+    
+    def _save_summary_json(self):
+        """Guarda el resumen en JSON."""
+        data = {
+            'metadata': {
+                'total_generations': len(self.generation_summaries),
+                'total_evaluations': len(self.records),
+                'best_score_global': self.best_score_global,
+                'best_solution': self.best_solution_global,
+            },
+            'generations': [
+                {
+                    'generation': s.generation,
+                    'timestamp': s.timestamp,
+                    'n_evaluations': s.n_evaluations,
+                    'best_score': s.best_score,
+                    'best_individual_id': s.best_individual_id,
+                    'best_flooding_reduction': s.best_flooding_reduction,
+                    'best_cost': s.best_cost,
+                    'mean_score': s.mean_score,
+                    'std_score': s.std_score,
+                    'min_cost': s.min_cost,
+                    'max_cost': s.max_cost,
+                    'mean_cost': s.mean_cost,
+                    'hypervolume': s.hypervolume,
+                    'hypervolume_delta': s.hypervolume_delta,
+                    'diversity_index': s.diversity_index,
+                    'generations_without_improvement': s.generations_without_improvement,
+                    'should_stop': s.should_stop,
+                }
+                for s in self.generation_summaries
+            ]
+        }
+        
+        with open(self.summary_json, 'w') as f:
+            json.dump(data, f, indent=2, default=str)
+    
+    def print_generation_summary(self, summary: GenerationSummary):
+        """Imprime un resumen formateado de la generación."""
+        print(f"\n{'='*80}")
+        print(f"GENERATION {summary.generation} SUMMARY")
+        print(f"{'='*80}")
+        print(f"  Best Score:        {summary.best_score:.4f} (Ind #{summary.best_individual_id})")
+        print(f"  Mean ± Std:        {summary.mean_score:.4f} ± {summary.std_score:.4f}")
+        print(f"  Flooding Reduc:    {summary.best_flooding_reduction:.2%}")
+        print(f"  Cost Range:        ${summary.min_cost:,.0f} - ${summary.max_cost:,.0f}")
+        print(f"  Hypervolume:       {summary.hypervolume:.4e} (Δ {summary.hypervolume_delta:+.4e})")
+        print(f"  Diversity:         {summary.diversity_index:.4f}")
+        if summary.generations_without_improvement > 0:
+            print(f"  ⚠ No Improvement:  {summary.generations_without_improvement} generations")
+        if summary.should_stop:
+            print(f"  ⛔ STOPPING: Early stopping triggered!")
+        print(f"{'='*80}")
+
+
+class EarlyStoppingMonitor:
+    """
+    Monitorea la evolución y detecta estancamiento.
+    Soporta múltiples criterios: hypervolume, best_score, diversity.
+    """
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.cfg = config
+        self.enabled = config.get('enabled', True)
+        self.patience = config.get('patience', 10)
+        self.min_delta = config.get('min_delta', 0.001)
+        self.metric = config.get('metric', 'hypervolume')
+        self.window_size = config.get('window_size', 5)
+        
+        # Estado
+        self.best_value = -float('inf')
+        self.generations_without_improvement = 0
+        self.history: List[float] = []
+        self.should_stop = False
+        self.stop_reason = None
+        
+        print(f"[EarlyStopping] Configured: metric={self.metric}, patience={self.patience}, "
+              f"min_delta={self.min_delta}")
+    
+    def update(self, generation: int, summary: GenerationSummary) -> bool:
+        """
+        Actualiza el monitoreo con datos de la nueva generación.
+        Retorna True si se debe detener.
+        """
+        if not self.enabled:
+            return False
+        
+        # Obtener métrica actual
+        if self.metric == 'hypervolume':
+            current = summary.hypervolume
+        elif self.metric == 'best_score':
+            current = summary.best_score
+        elif self.metric == 'diversity':
+            current = summary.diversity_index
+        else:
+            current = summary.hypervolume
+        
+        self.history.append(current)
+        
+        # Verificar mejora
+        improvement = current - self.best_value
+        
+        if improvement > self.min_delta:
+            # Hubo mejora significativa
+            self.best_value = current
+            self.generations_without_improvement = 0
+            print(f"[EarlyStopping] ✓ Improvement: {improvement:+.4e} (new best: {current:.4e})")
+        else:
+            # No hubo mejora significativa
+            self.generations_without_improvement += 1
+            print(f"[EarlyStopping] ⚠ No improvement: {self.generations_without_improvement}/{self.patience}")
+        
+        # Verificar condiciones de parada
+        if self.generations_without_improvement >= self.patience:
+            self.should_stop = True
+            self.stop_reason = f"No improvement for {self.patience} generations"
+            print(f"[EarlyStopping] ⛔ STOPPING: {self.stop_reason}")
+            return True
+        
+        # Verificar convergencia por ventana móvil (std pequeña)
+        if len(self.history) >= self.window_size:
+            window = self.history[-self.window_size:]
+            window_std = np.std(window)
+            if window_std < self.min_delta * 0.1:  # Criterio más estricto
+                self.should_stop = True
+                self.stop_reason = f"Converged (window std={window_std:.4e})"
+                print(f"[EarlyStopping] ⛔ STOPPING: {self.stop_reason}")
+                return True
+        
+        return False
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Retorna estado actual del monitoreo."""
+        return {
+            'enabled': self.enabled,
+            'best_value': self.best_value,
+            'generations_without_improvement': self.generations_without_improvement,
+            'patience': self.patience,
+            'should_stop': self.should_stop,
+            'stop_reason': self.stop_reason,
+            'metric': self.metric,
+        }
+
+
+# Añadir import csv al inicio del archivo si no está
+import csv
+
 
 @dataclass
 class SolutionResult:
@@ -133,61 +701,209 @@ class SolutionResult:
         ])
 
 
-@dataclass
 class RankingWeights:
-    """Contenedor para los pesos de ranking."""
-    flow_over_capacity: float = 0.0
-    flow_node_flooding: float = 0.0
-    vol_over_capacity: float = 0.0
-    vol_node_flooding: float = 0.0
-    outfall_peak_flow: float = 0.0
-    failure_probability: float = 0.0
-    capacity_max_hd: float = 0.0  # independiente, no suma con los demás
+    """
+    Contenedor DINÁMICO para los pesos de ranking.
+    
+    Detecta automáticamente qué pesos están activos en config.FLOODING_RANKING_WEIGHTS
+    y solo optimiza esos. Los pesos = 0 se mantienen fijos.
+    
+    Variables siempre incluidas:
+    - Los pesos con valor != 0 en FLOODING_RANKING_WEIGHTS
+    - capacity_max_hd (siempre optimizable)
+    """
+    
+    def __init__(self, **kwargs):
+        """
+        Inicializa pesos. Puede recibir:
+        - Pesos individuales: RankingWeights(flow_over_capacity=0.5, ...)
+        - O nada: RankingWeights() (usa valores de config)
+        """
+        self.active_weights = get_active_weights()  # Detectar dinámicamente
+        self.n_active = len(self.active_weights)
+        
+        # Inicializar todos los pesos posibles
+        self.weights = {key: 0.0 for key in ALL_WEIGHT_KEYS}
+        self.weights['capacity_max_hd'] = kwargs.get('capacity_max_hd', 0.0)
+        
+        # Actualizar con valores pasados o de config
+        for key in self.active_weights:
+            if key in kwargs:
+                self.weights[key] = kwargs[key]
+            elif hasattr(config, 'FLOODING_RANKING_WEIGHTS') and key in config.FLOODING_RANKING_WEIGHTS:
+                self.weights[key] = config.FLOODING_RANKING_WEIGHTS[key]
+        
+        # Valores fijos (no optimizables) - SIEMPRE 0
+        for key in ALL_WEIGHT_KEYS:
+            if key not in self.active_weights:
+                self.weights[key] = 0.0  # Fijar en 0, ignorar config original
+    
+    def __getattr__(self, name: str) -> float:
+        """Permite acceder como objeto.atributo"""
+        if name in self.weights:
+            return self.weights[name]
+        raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
+    
+    def __setattr__(self, name: str, value: float):
+        """Permite asignar como objeto.atributo = valor"""
+        if name in ['active_weights', 'n_active', 'weights']:
+            super().__setattr__(name, value)
+        elif hasattr(self, 'weights') and name in self.weights:
+            self.weights[name] = value
+        else:
+            super().__setattr__(name, value)
+    
+    @property
+    def capacity_max_hd(self) -> float:
+        return self.weights.get('capacity_max_hd', 0.0)
+    
+    @capacity_max_hd.setter
+    def capacity_max_hd(self, value: float):
+        self.weights['capacity_max_hd'] = value
     
     def to_array(self) -> np.ndarray:
-        """Convierte a array [w1, w2, w3, w4, w5, w6, h_d]."""
-        return np.array([
-            self.flow_over_capacity,
-            self.flow_node_flooding,
-            self.vol_over_capacity,
-            self.vol_node_flooding,
-            self.outfall_peak_flow,
-            self.failure_probability,
-            self.capacity_max_hd,
-        ])
+        """Convierte a array [w1, w2, ..., wn, capacity_max_hd]."""
+        # Solo los pesos activos + capacity_max_hd
+        active_values = [self.weights[k] for k in self.active_weights]
+        return np.array(active_values + [self.capacity_max_hd])
     
     @classmethod
-    def from_array(cls, x: np.ndarray) -> "RankingWeights":
-        """Crea desde array de NSGA."""
-        # Normalizar pesos (primeros 6) a suma=1
-        weights_raw = x[:6]
+    def from_array(cls, x: np.ndarray, active_weights: List[str] = None) -> "RankingWeights":
+        """
+        Crea desde array de NSGA.
+        
+        Args:
+            x: Array con [w1, w2, ..., wn, capacity_max_hd]
+            active_weights: Lista de keys activos (si None, usa get_active_weights())
+        """
+        if active_weights is None:
+            active_weights = get_active_weights()
+        
+        n_active = len(active_weights)
+        
+        # Normalizar pesos activos a suma=1
+        weights_raw = x[:n_active]
         weights_sum = np.sum(weights_raw)
         if weights_sum < 1e-10:
-            weights = np.ones(6) / 6
+            weights_norm = np.ones(n_active) / n_active
         else:
-            weights = weights_raw / weights_sum
-            
-        return cls(
-            flow_over_capacity=weights[0],
-            flow_node_flooding=weights[1],
-            vol_over_capacity=weights[2],
-            vol_node_flooding=weights[3],
-            outfall_peak_flow=weights[4],
-            failure_probability=weights[5],
-            capacity_max_hd=np.clip(x[6], 0, 0.95),
-        )
+            weights_norm = weights_raw / weights_sum
+        
+        # Crear diccionario de pesos activos
+        kwargs = {active_weights[i]: weights_norm[i] for i in range(n_active)}
+        kwargs['capacity_max_hd'] = np.clip(x[n_active], 0, 0.95)
+        
+        return cls(**kwargs)
     
     def apply_to_config(self):
         """Aplica estos pesos a config.py global."""
-        config.FLOODING_RANKING_WEIGHTS = {
-            'flow_over_capacity': self.flow_over_capacity,
-            'flow_node_flooding': self.flow_node_flooding,
-            'vol_over_capacity': self.vol_over_capacity,
-            'vol_node_flooding': self.vol_node_flooding,
-            'outfall_peak_flow': self.outfall_peak_flow,
-            'failure_probability': self.failure_probability,
-        }
+        # Construir diccionario completo (activos + fijos)
+        full_weights = {}
+        for key in ALL_WEIGHT_KEYS:
+            full_weights[key] = self.weights.get(key, 0.0)
+        
+        config.FLOODING_RANKING_WEIGHTS = full_weights
         config.CAPACITY_MAX_HD = self.capacity_max_hd
+    
+    def to_dict(self) -> Dict[str, float]:
+        """Convierte a diccionario para serialización."""
+        return {
+            'weights': {k: self.weights[k] for k in ALL_WEIGHT_KEYS},
+            'capacity_max_hd': self.capacity_max_hd,
+            'active_weights': self.active_weights,
+        }
+
+
+# =============================================================================
+# FUNCIÓN DE EVALUACIÓN PARA PARALELISMO
+# =============================================================================
+
+def _evaluate_individual_worker(args) -> np.ndarray:
+    """
+    Función standalone para evaluar un individuo en un proceso worker.
+    DINÁMICA: Detecta automáticamente qué pesos están activos.
+    
+    Args:
+        args: Tuple con (x_array, project_root, elev_file, 
+                         max_tanks, max_iterations, eval_id, active_weights, baseline_extractor_path)
+    
+    Returns:
+        Array de objetivos [f0, f1, f2, f3, f4]
+    """
+    x, project_root_str, elev_file_str, max_tanks, max_iterations, eval_id, active_weights, baseline_extractor_path = args
+    
+    try:
+        # Importar dentro del worker
+        import config
+        config.setup_sys_path()
+        
+        from rut_10_run_tanque_tormenta import StormwaterOptimizationRunner
+        
+        n_active = len(active_weights)
+        
+        # Crear pesos desde el array (n_active pesos + capacity_max_hd)
+        weights_raw = x[:n_active]
+        weights_sum = np.sum(weights_raw)
+        if weights_sum < 1e-10:
+            weights_norm = np.ones(n_active) / n_active
+        else:
+            weights_norm = weights_raw / weights_sum
+        
+        # Construir diccionario de pesos (activos + fijos en CERO)
+        # Los activos toman el valor normalizado del NSGA-II
+        # Los NO activos SIEMPRE son 0 (ignorar config.py original)
+        full_weights = {}
+        for key in ALL_WEIGHT_KEYS:
+            if key in active_weights:
+                idx = active_weights.index(key)
+                full_weights[key] = weights_norm[idx]
+            else:
+                full_weights[key] = 0.0  # FIJAR EN 0 - no usar config original
+        
+        config.FLOODING_RANKING_WEIGHTS = full_weights
+        config.CAPACITY_MAX_HD = np.clip(x[n_active], 0, 0.95)
+        
+        # Ejecutar evaluación
+        runner = StormwaterOptimizationRunner(
+            project_root=Path(project_root_str),
+            proj_to=config.PROJECT_CRS,
+            eval_id=eval_id
+        )
+        
+        # Preparar parametros EXPLICITOS para pasar al runner
+        explicit_weights = full_weights.copy()
+        explicit_capacity_hd = float(config.CAPACITY_MAX_HD)
+        
+        result = runner.run_sequential_analysis(
+            max_tanks=max_tanks,
+            max_iterations=max_iterations,
+            min_tank_vol=config.TANK_MIN_VOLUME_M3,
+            max_tank_vol=config.TANK_MAX_VOLUME_M3,
+            stop_at_breakeven=True,
+            breakeven_multiplier=50.0,
+            elev_file=Path(elev_file_str) if elev_file_str else None,
+            optimizer_mode='greedy',
+            optimization_tr_list=config.TR_LIST,
+            validation_tr_list=config.VALIDATION_TR_LIST,
+            ranking_weights=explicit_weights,  # EXPLICITO
+            capacity_max_hd=explicit_capacity_hd,  # EXPLICITO
+            baseline_extractor_path=baseline_extractor_path,  # EXPLICITO: Ruta al extractor
+        )
+        
+        # Devolver objetivos (negativos para maximización)
+        return np.array([
+            -result.flooding_vol_reduction_pct,
+            -result.flooding_peak_flow_reduction_pct,
+            -result.outfall_peak_flow_reduction_pct,
+            -result.network_health,
+            result.total_cost,
+        ])
+            
+    except Exception as e:
+        import traceback
+        print(f"[Worker Error] {eval_id}: {e}")
+        traceback.print_exc()
+        return np.array([0, 0, 0, 0, 1e10])  # Valores malos en caso de error
 
 
 # =============================================================================
@@ -274,115 +990,247 @@ class GreedyRunner:
 
 class RankingOptimizationProblem(Problem):
     """
-    Definición del problema para pymoo.
-    Variables: 7 (6 pesos normalizados + capacity_max_hd)
+    Definición del problema para pymoo con evaluación paralela.
+    DINÁMICO: Detecta automáticamente qué pesos están activos en config.
+    
+    Variables: n_active (pesos != 0) + 1 (capacity_max_hd)
     Objetivos: 5 (4 maximizaciones negadas + 1 minimización)
+    
+    Paralelismo: Usa ProcessPoolExecutor para evaluar múltiples individuos
+    en paralelo según config.NSGA_PARALLEL_WORKERS.
     """
     
     def __init__(self,
-                 baseline_metrics: SystemMetrics,
+                 baseline_extractor_path: Path,  # Ruta al pickle del extractor
                  runner_factory: Callable[[], GreedyRunner],
                  max_tanks: int = 30,
-                 max_iterations: int = 100):
+                 max_iterations: int = 100,
+                 n_workers: int = None):
         
-        self.baseline_metrics = baseline_metrics
+        self.baseline_extractor_path = baseline_extractor_path
         self.runner_factory = runner_factory
         self.max_tanks = max_tanks
         self.max_iterations = max_iterations
+        self.n_workers = n_workers or config.NSGA_PARALLEL_WORKERS
+        self.project_root = config.PROJECT_ROOT
+        self.elev_file = config.ELEV_FILE
+        
+        # Detectar pesos activos dinámicamente
+        self.active_weights = get_active_weights()
+        self.n_active = len(self.active_weights)
+        self.n_var = self.n_active + 1  # pesos activos + capacity_max_hd
+        
+        print(f"[RankingOptimizationProblem] Pesos activos ({self.n_active}): {self.active_weights}")
+        print(f"[RankingOptimizationProblem] Variables totales: {self.n_var}")
         
         # Contadores para logging
         self.eval_count = 0
         self.history: List[Tuple[RankingWeights, SolutionResult]] = []
         
-        # Bounds: 6 pesos [0,1], 1 h/d [0, 0.95]
-        xl = np.array([0.0] * 6 + [NSGA_CONFIG['capacity_max_hd_bounds'][0]])
-        xu = np.array([1.0] * 6 + [NSGA_CONFIG['capacity_max_hd_bounds'][1]])
+        # Bounds: n_active pesos [0,1] + 1 h/d [0, 0.95]
+        xl = np.array([0.0] * self.n_active + [NSGA_CONFIG['capacity_max_hd_bounds'][0]])
+        xu = np.array([1.0] * self.n_active + [NSGA_CONFIG['capacity_max_hd_bounds'][1]])
         
+        # elementwise=False porque procesamos batch completo con ProcessPool
         super().__init__(
-            n_var=7,
+            n_var=self.n_var,  # Dinámico: n_active pesos + capacity_max_hd
             n_obj=5,
-            n_constr=0,  # La normalización maneja la restricción de suma=1
+            n_constr=0,
             xl=xl,
             xu=xu,
-            elementwise=True,
+            elementwise=False,
         )
     
-    def _evaluate(self, x: np.ndarray, out: Dict, *args, **kwargs):
-        """Evaluación llamada por pymoo."""
-        self.eval_count += 1
+    def _evaluate(self, X: np.ndarray, out: Dict, *args, **kwargs):
+        """
+        Evaluación batch llamada por pymoo.
+        X: Matriz de tamaño (n_individuals, n_var)
+        """
+        n_individuals = X.shape[0]
+        F = np.zeros((n_individuals, 5))
+        
+        # Obtener número de generación actual (actualizado por el callback)
+        gen = getattr(self, '_current_gen', 0)
+        if gen == 0 and hasattr(self, '_current_gen_override'):
+            gen = self._current_gen_override
         
         print(f"\n{'='*80}")
-        print(f"NSGA EVALUATION #{self.eval_count}")
+        print(f"NSGA PARALLEL EVALUATION: Gen {gen}, {n_individuals} individuals, {self.n_workers} workers")
         print(f"{'='*80}")
         
-        # Convertir array a pesos
-        weights = RankingWeights.from_array(x)
-        weights.apply_to_config()
-
-        # PRINT PARÁMETROS AQUÍ
-        print(f"\nParameters for this evaluation:")
-        print(f"  Weights: {weights}")
-        print(f"  Max tanks: {self.max_tanks}")
-        print(f"  Max iterations: {self.max_iterations}")
-        print(f"  Config.CAPACITY_MAX_HD: {config.CAPACITY_MAX_HD}")
-        print(f"  Config.FLOODING_RANKING_WEIGHTS: {config.FLOODING_RANKING_WEIGHTS}")
-        print(f"{'=' * 80}\n")
+        # Preparar argumentos para workers (incluyendo active_weights)
+        args_list = [
+            (
+                X[i], 
+                str(self.project_root),
+                str(self.elev_file) if self.elev_file else None,
+                self.max_tanks,
+                self.max_iterations,
+                f"eval_gen{gen:03d}_ind{i:03d}",
+                self.active_weights,  # Pasar para que el worker sepa qué pesos usar
+                str(self.baseline_extractor_path)  # Ruta al extractor completo
+            )
+            for i in range(n_individuals)
+        ]
         
-        # Crear runner y ejecutar
-        runner = self.runner_factory()
-        result = runner.run_single_evaluation(
-            weights=weights,
-            max_tanks=self.max_tanks,
-            max_iterations=self.max_iterations,
-        )
-        print(result)
+        # Ejecutar en paralelo o secuencial
+        if self.n_workers > 1 and n_individuals > 1:
+            print(f"[Parallel] Starting {self.n_workers} workers...")
+            
+            # Usar spawn para evitar problemas en Windows
+            ctx = multiprocessing.get_context('spawn')
+            
+            with ProcessPoolExecutor(max_workers=self.n_workers, mp_context=ctx) as executor:
+                results = list(executor.map(_evaluate_individual_worker, args_list))
+            
+            for i, result in enumerate(results):
+                F[i] = result
+                self.eval_count += 1
+                print(f"  ✓ Individual {i+1}/{n_individuals} completed")
+        else:
+            # Modo secuencial
+            print(f"[Sequential] Running {n_individuals} evaluations...")
+            for i, args in enumerate(args_list):
+                self.eval_count += 1
+                print(f"\n--- Individual {i+1}/{n_individuals} (Eval #{self.eval_count}) ---")
+                F[i] = _evaluate_individual_worker(args)
+                print(f"  ✓ Completed")
         
-        # Guardar en historial
-        self.history.append((weights, result))
-        
-        # Mostrar resultados
-        print(f"\nResults:")
-        print(f"  Flooding vol reduction: {result.flooding_vol_reduction_pct:.1%}")
-        print(f"  Flooding flow reduction: {result.flooding_peak_flow_reduction_pct:.1%}")
-        print(f"  Outfall flow reduction: {result.outfall_peak_flow_reduction_pct:.1%}")
-        print(f"  Network health: {result.network_health:.3f}")
-        print(f"  Total cost: ${result.total_cost:,.0f}")
+        print(f"\n{'='*80}")
+        print(f"BATCH COMPLETE: {n_individuals} evaluations")
         print(f"{'='*80}\n")
         
-        # Output para pymoo
-        out["F"] = result.get_objectives_array()
+        out["F"] = F
 
 
 class NSGACheckpoint(Callback):
-    """Guarda progreso cada N generaciones."""
+    """
+    Callback mejorado con logging detallado y early stopping.
+    Guarda checkpoints, loguea todas las soluciones, y detecta estancamiento.
+    """
     
-    def __init__(self, checkpoint_dir: Path, frequency: int = 1):
+    def __init__(self, 
+                 checkpoint_dir: Path, 
+                 frequency: int = 1,
+                 logger: Optional[OptimizationLogger] = None,
+                 early_stopping: Optional[EarlyStoppingMonitor] = None,
+                 problem: Optional[RankingOptimizationProblem] = None):
         super().__init__()
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.frequency = frequency
         self.history: List[Dict] = []
+        
+        # Logger y early stopping
+        self.logger = logger
+        self.early_stopping = early_stopping or EarlyStoppingMonitor(NSGA_CONFIG['early_stopping'])
+        
+        # Referencia al problema para actualizar la generación
+        self.problem = problem
+        
+        # Control de terminación
+        self.has_stopped = False
+        self.stop_generation = None
+        self._last_logged_gen = 0  # Track para evitar duplicados en CSV
     
     def notify(self, algorithm):
         gen = algorithm.n_gen
         
-        # Guardar historial
+        # Actualizar la generación en el problema para que los workers la usen
+        if self.problem is not None:
+            self.problem._current_gen = gen
+            self.problem._current_gen_override = gen
+        
+        # Obtener datos de la población
+        X = algorithm.pop.get("X").copy()
+        F = algorithm.pop.get("F").copy()
+        
+        # Guardar historial básico
         self.history.append({
             'generation': gen,
-            'population': algorithm.pop.get("X").copy(),
-            'objectives': algorithm.pop.get("F").copy(),
+            'population': X,
+            'objectives': F,
         })
         
-        # Guardar checkpoint
+        # Loguear generación con el logger detallado (solo si no hemos logueado esta gen)
+        if self.logger is not None and gen > self._last_logged_gen:
+            self._last_logged_gen = gen
+            should_stop = self.has_stopped
+            
+            # Obtener pesos activos del problema si está disponible
+            active_weights = None
+            if self.problem is not None:
+                active_weights = getattr(self.problem, 'active_weights', None)
+            
+            summary = self.logger.log_generation(
+                generation=gen,
+                X=X,
+                F=F,
+                algorithm=algorithm,
+                should_stop=should_stop,
+                generations_without_improvement=getattr(self.early_stopping, 'generations_without_improvement', 0),
+                active_weights=active_weights
+            )
+            
+            # Actualizar early stopping con el summary
+            if self.early_stopping is not None:
+                stop_triggered = self.early_stopping.update(gen, summary)
+                
+                if stop_triggered and not self.has_stopped:
+                    self.has_stopped = True
+                    self.stop_generation = gen
+                    summary.should_stop = True
+                    print(f"\n{'='*80}")
+                    print(f"EARLY STOPPING TRIGGERED AT GENERATION {gen}")
+                    print(f"{'='*80}\n")
+                    
+                    # Guardar checkpoint final
+                    self._save_checkpoint(algorithm, gen, final=True)
+                    
+                    # Terminar el algoritmo
+                    algorithm.termination.force_termination = True
+                    return
+                
+                # Re-loguear si cambió el estado
+                if summary.generations_without_improvement != self.early_stopping.generations_without_improvement:
+                    summary.generations_without_improvement = self.early_stopping.generations_without_improvement
+            
+            # Imprimir resumen
+            self.logger.print_generation_summary(summary)
+        
+        # Guardar checkpoint periódico
         if gen % self.frequency == 0:
-            path = self.checkpoint_dir / f"checkpoint_gen_{gen:04d}.pkl"
-            with open(path, 'wb') as f:
-                pickle.dump({
-                    'algorithm': algorithm,
-                    'history': self.history,
-                    'config': NSGA_CONFIG,
-                }, f)
-            print(f"[Checkpoint] Saved generation {gen} to {path}")
+            self._save_checkpoint(algorithm, gen)
+    
+    def _save_checkpoint(self, algorithm, gen: int, final: bool = False):
+        """Guarda un checkpoint del algoritmo."""
+        suffix = "_FINAL" if final else ""
+        path = self.checkpoint_dir / f"checkpoint_gen_{gen:04d}{suffix}.pkl"
+        
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'algorithm': algorithm,
+                'history': self.history,
+                'config': NSGA_CONFIG,
+                'early_stopping': self.early_stopping.get_status() if self.early_stopping else None,
+                'stopped_early': final,
+            }, f)
+        
+        print(f"[Checkpoint] Saved generation {gen} to {path}")
+    
+    def get_convergence_info(self) -> Dict[str, Any]:
+        """Retorna información de convergencia."""
+        if self.early_stopping is None:
+            return {}
+        
+        status = self.early_stopping.get_status()
+        return {
+            'stopped_early': self.has_stopped,
+            'stop_generation': self.stop_generation,
+            'stop_reason': status.get('stop_reason'),
+            'best_value': status.get('best_value'),
+            'generations_without_improvement': status.get('generations_without_improvement'),
+        }
 
 
 class NSGARankingOptimizer:
@@ -406,19 +1254,20 @@ class NSGARankingOptimizer:
         self.results_dir = results_dir if results_dir is not None else NSGA_CONFIG['results_dir']
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
-        self.baseline_metrics: Optional[SystemMetrics] = None
+        self.base_metrics_extractor: Optional[SystemMetrics] = None
         self.problem: Optional[RankingOptimizationProblem] = None
         self.algorithm: Optional[NSGA2] = None
         self.result = None
         
-        # Factory para crear runners
-        self._runner_factory = lambda: GreedyRunner(
+    def _create_runner(self):
+        """Factory method para crear GreedyRunner instances."""
+        return GreedyRunner(
             project_root=self.project_root,
             elev_file=self.elev_file,
         )
     
-    def _run_baseline(self) -> SystemMetrics:
-        """Corre baseline sin tanques."""
+    def _run_baseline(self) -> 'MetricExtractor':
+        """Corre baseline sin tanques y guarda el extractor completo."""
         print(f"\n{'='*80}")
         print("RUNNING BASELINE SIMULATION")
         print(f"{'='*80}")
@@ -436,19 +1285,33 @@ class NSGARankingOptimizer:
         print(f"  Flooded nodes: {metrics.flooded_nodes_count}")
         print(f"{'='*80}\n")
         
-        return metrics
+        # Guardar extractor completo para workers
+        import pickle
+        baseline_extractor_path = Path(config.CODIGOS_DIR) / "optimization_results" / "baseline_extractor.pkl"
+        baseline_extractor_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(baseline_extractor_path, 'wb') as f:
+            pickle.dump(extractor, f)
+        print(f"[Baseline Extractor] Guardado en: {baseline_extractor_path}")
+        
+        return extractor
     
     def setup(self):
         """Inicializa baseline y problema."""
         print("[NSGARankingOptimizer] Initializing...")
+        print(f"\n[Parallel Config]")
+        print(f"  NSGA PARALLEL WORKERS: {config.NSGA_PARALLEL_WORKERS}\n")
         
-        self.baseline_metrics = self._run_baseline()
+        self.base_metrics_extractor = self._run_baseline()
+        
+        # Guardar ruta del pickle para los workers
+        self.baseline_extractor_path = Path(config.CODIGOS_DIR) / "optimization_results" / "baseline_extractor.pkl"
         
         self.problem = RankingOptimizationProblem(
-            baseline_metrics=self.baseline_metrics,
-            runner_factory=self._runner_factory,
+            baseline_extractor_path=self.baseline_extractor_path,
+            runner_factory=self._create_runner,
             max_tanks=NSGA_CONFIG['max_tanks'],
             max_iterations=NSGA_CONFIG['max_iterations'],
+            n_workers=config.NSGA_PARALLEL_WORKERS,
         )
         
         self.algorithm = NSGA2(
@@ -465,14 +1328,18 @@ class NSGARankingOptimizer:
     def run(self, 
            n_generations: Optional[int] = None,
            pop_size: Optional[int] = None,
-           restore_from: Optional[Path] = None):
+           restore_from: Optional[Path] = None,
+           enable_logging: bool = True,
+           enable_early_stopping: bool = True):
         """
-        Corre la optimización NSGA-II.
+        Corre la optimización NSGA-II con logging y early stopping.
         
         Args:
             n_generations: Si no None, override de NSGA_CONFIG
             pop_size: Si no None, override de NSGA_CONFIG
             restore_from: Path a checkpoint para continuar
+            enable_logging: Guardar log detallado de todas las soluciones
+            enable_early_stopping: Detener si no hay mejora
         """
         if self.problem is None:
             self.setup()
@@ -486,12 +1353,37 @@ class NSGARankingOptimizer:
         
         print(f"\n{'='*80}")
         print("STARTING NSGA-II OPTIMIZATION")
+        print(f"{'='*80}")
+        print(f"Generations: {n_gen}")
+        print(f"Population: {pop}")
+        print(f"Logging: {'enabled' if enable_logging else 'disabled'}")
+        print(f"Early Stopping: {'enabled' if enable_early_stopping else 'disabled'}")
         print(f"{'='*80}\n")
         
-        # Checkpoint callback
+        # Crear logger si está habilitado
+        logger = None
+        if enable_logging:
+            log_dir = self.results_dir / "logs"
+            logger = OptimizationLogger(
+                output_dir=log_dir,
+                base_metrics_extractor=self.base_metrics_extractor
+            )
+            print(f"[Logger] Detailed logs will be saved to: {log_dir}")
+            print(f"  - CSV: {logger.detailed_csv}")
+            print(f"  - JSON: {logger.summary_json}")
+        
+        # Crear early stopping monitor
+        early_stopping = None
+        if enable_early_stopping:
+            early_stopping = EarlyStoppingMonitor(NSGA_CONFIG['early_stopping'])
+        
+        # Checkpoint callback integrado
         checkpoint = NSGACheckpoint(
-            NSGA_CONFIG['checkpoint_dir'],
-            NSGA_CONFIG['checkpoint_freq']
+            checkpoint_dir=NSGA_CONFIG['checkpoint_dir'],
+            frequency=NSGA_CONFIG['checkpoint_freq'],
+            logger=logger,
+            early_stopping=early_stopping,
+            problem=self.problem,  # Pasar referencia al problema para actualizar generación
         )
         
         # Restaurar si se especifica
@@ -511,11 +1403,37 @@ class NSGARankingOptimizer:
             verbose=True,
         )
         
+        # Obtener información de convergencia
+        convergence_info = checkpoint.get_convergence_info()
+        
         print(f"\n{'='*80}")
-        print("OPTIMIZATION COMPLETE")
+        if convergence_info.get('stopped_early'):
+            print("OPTIMIZATION STOPPED EARLY (Early Stopping)")
+            print(f"Stop Reason: {convergence_info.get('stop_reason')}")
+            print(f"Stopped at generation: {convergence_info.get('stop_generation')}")
+        else:
+            print("OPTIMIZATION COMPLETE (All generations)")
         print(f"{'='*80}\n")
         
         self._save_final_results()
+        
+        # Imprimir instrucciones para análisis
+        if enable_logging and logger:
+            print(f"\n{'='*80}")
+            print("ANALYSIS INSTRUCTIONS")
+            print(f"{'='*80}")
+            print(f"\nPara analizar los resultados:")
+            print(f"  1. Ver log detallado: {logger.detailed_csv}")
+            print(f"  2. Ver resumen JSON: {logger.summary_json}")
+            print(f"\n  En Python puedes cargar el CSV:")
+            print(f"     import pandas as pd")
+            print(f"     df = pd.read_csv('{logger.detailed_csv}')")
+            print(f"     df_sorted = df.sort_values('score_weighted', ascending=False)")
+            print(f"     print(df_sorted.head(10))")
+            print(f"\n  O filtrar por generación:")
+            print(f"     gen_best = df.loc[df.groupby('generation')['score_weighted'].idxmax()]")
+            print(f"     print(gen_best[['generation', 'score_weighted', 'total_cost']])")
+            print(f"{'='*80}")
     
     def _save_final_results(self):
         """Guarda todos los resultados."""
@@ -535,11 +1453,12 @@ class NSGARankingOptimizer:
                 'total_cost'
             ])
             
-            # Agregar variables de decisión
+            # Agregar variables de decisión (dinámico según pesos activos)
             X = self.result.X
+            n_active = len(WEIGHT_KEYS)
             for i, key in enumerate(WEIGHT_KEYS):
-                pareto_df[f'weight_{key}'] = X[:, i] / X[:, :6].sum(axis=1)  # normalizado
-            pareto_df['capacity_max_hd'] = X[:, 6]
+                pareto_df[f'weight_{key}'] = X[:, i] / X[:, :n_active].sum(axis=1)  # normalizado
+            pareto_df['capacity_max_hd'] = X[:, n_active]
             
             path = self.results_dir / f"pareto_front_{timestamp}.csv"
             pareto_df.to_csv(path, index=False)
@@ -577,7 +1496,6 @@ class NSGARankingOptimizer:
                     'weights': {
                         'flow_over_capacity': weights.flow_over_capacity,
                         'flow_node_flooding': weights.flow_node_flooding,
-                        'vol_over_capacity': weights.vol_over_capacity,
                         'vol_node_flooding': weights.vol_node_flooding,
                         'outfall_peak_flow': weights.outfall_peak_flow,
                         'failure_probability': weights.failure_probability,
@@ -605,7 +1523,7 @@ class NSGARankingOptimizer:
             print("[Visualize] No results to visualize")
             return
         
-        save_dir = Path(save_dir) or self.results_dir
+        save_dir = Path(save_dir) if save_dir is not None else self.results_dir
         save_dir.mkdir(parents=True, exist_ok=True)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -697,10 +1615,17 @@ class NSGARankingOptimizer:
             return
             
         X = self.result.X
-        # Normalizar pesos
-        weights_norm = X[:, :6] / X[:, :6].sum(axis=1, keepdims=True)
+        n_active = len(WEIGHT_KEYS)
         
-        fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+        # Normalizar pesos (dinámico según pesos activos)
+        weights_norm = X[:, :n_active] / X[:, :n_active].sum(axis=1, keepdims=True)
+        
+        # Calcular layout de subplots según número de variables
+        n_total = n_active + 1  # pesos + capacity_max_hd
+        n_cols = 3
+        n_rows = (n_total + n_cols - 1) // n_cols
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
         axes = axes.flatten()
         
         # Pesos
@@ -712,14 +1637,15 @@ class NSGARankingOptimizer:
             ax.set_ylabel('Frequency')
         
         # Capacity max h/d
-        ax = axes[6]
-        ax.hist(X[:, 6], bins=20, color='seagreen', alpha=0.7)
+        ax = axes[n_active]
+        ax.hist(X[:, n_active], bins=20, color='seagreen', alpha=0.7)
         ax.set_title('Capacity Max H/D', fontsize=10)
         ax.set_xlabel('Value')
         ax.set_ylabel('Frequency')
         
-        # Ocultar último eje
-        axes[7].axis('off')
+        # Ocultar ejes sobrantes
+        for i in range(n_active + 1, len(axes)):
+            axes[i].axis('off')
         
         plt.tight_layout()
         path = save_dir / f"variable_distribution_{timestamp}.png"
@@ -804,7 +1730,6 @@ class NSGARankingOptimizer:
             'weights': {
                 'flow_over_capacity': weights.flow_over_capacity,
                 'flow_node_flooding': weights.flow_node_flooding,
-                'vol_over_capacity': weights.vol_over_capacity,
                 'vol_node_flooding': weights.vol_node_flooding,
                 'outfall_peak_flow': weights.outfall_peak_flow,
                 'failure_probability': weights.failure_probability,
@@ -1110,82 +2035,84 @@ class SwmmCoreBenchmark:
         
         return best_cores, pymoo_workers
 
-
 # =============================================================================
 # MAIN - BENCHMARK MODE
 # =============================================================================
 
 if __name__ == "__main__":
+    # CRÍTICO para Windows: freeze_support evita que procesos workers reejecuten el main
+    multiprocessing.freeze_support()
+    
     import sys
     
-    # MODO BENCHMARK - Ejecutar primero para determinar configuración óptima
-    print("=" * 80)
-    print("MODO BENCHMARK - Detectando configuración óptima de núcleos")
-    print("=" * 80)
-    
-    benchmark = SwmmCoreBenchmark()
-    benchmark.run(max_cores_percent=90, n_runs_per_config=3)
-    optimal_swmm_cores, optimal_pymoo_workers = benchmark.plot_results()
-    
-    print(f"\n[Resultado] Usar {optimal_swmm_cores} cores para cada SWMM")
-    print(f"[Resultado] Esto permite {optimal_pymoo_workers} workers en paralelo para pymoo")
-    print("\nActualiza NSGA_CONFIG con estos valores y vuelve a correr.")
-    
-    sys.exit(0)
+    # # MODO BENCHMARK - Ejecutar primero para determinar configuración óptima
+    # print("=" * 80)
+    # print("MODO BENCHMARK - Detectando configuración óptima de núcleos")
+    # print("=" * 80)
+    #
+    # benchmark = SwmmCoreBenchmark()
+    # benchmark.run(max_cores_percent=90, n_runs_per_config=3)
+    # optimal_swmm_cores, optimal_pymoo_workers = benchmark.plot_results()
+    #
+    # print(f"\n[Resultado] Usar {optimal_swmm_cores} cores para cada SWMM")
+    # print(f"[Resultado] Esto permite {optimal_pymoo_workers} workers en paralelo para pymoo")
+    # print("\nActualiza NSGA_CONFIG con estos valores y vuelve a correr.")
+    #
+    # sys.exit(0)
     
     # NOTA: Una vez tengas los resultados del benchmark, comenta las líneas anteriores
     # y descomenta el código de optimización normal de abajo:
-    
+    #
     # ================================================================
     # CONFIGURACIÓN - AJUSTAR ESTOS VALORES
     # ================================================================
-    #
-    # N_GENERATIONS = config.N_GENERATIONS  # Número de generaciones
-    # POP_SIZE = config.POP_SIZE  # Tamaño de población
-    # RESTORE_FROM = None  # Path a checkpoint para continuar, o None
-    #
+
+    N_GENERATIONS = config.N_GENERATIONS  # Número de generaciones
+    POP_SIZE = config.POP_SIZE  # Tamaño de población
+    RESTORE_FROM = None  # Path a checkpoint para continuar, o None
+
     # Ejemplo: RESTORE_FROM = Path("optimization_results/nsga_ranking_checkpoints/checkpoint_gen_0025.pkl")
-    #
+
     # ================================================================
     # EJECUCIÓN
     # ================================================================
-    #
-    # print("=" * 80)
-    # print("NSGA-II RANKING OPTIMIZER")
-    # print("=" * 80)
-    # print(f"Generations: {N_GENERATIONS}")
-    # print(f"Population: {POP_SIZE}")
-    # print(f"Restore from: {RESTORE_FROM}")
-    # print("=" * 80)
-    #
-    # optimizer = NSGARankingOptimizer()
-    #
-    # optimizer.run(
-    #     n_generations=N_GENERATIONS,
-    #     pop_size=POP_SIZE,
-    #     restore_from=RESTORE_FROM,
-    # )
-    #
-    # optimizer.visualize_results()
-    #
-    # print("\n" + "=" * 80)
-    # print("BEST SOLUTIONS SUMMARY")
-    # print("=" * 80)
-    #
-    # for pref in ['balanced', 'min_cost', 'max_flooding', 'max_health']:
-    #     sol = optimizer.get_best_solution(preference=pref)
-    #     if sol:
-    #         print(f"\n{pref.upper()}:")
-    #         print(f"  Weights:")
-    #         for k, v in sol['weights'].items():
-    #             print(f"    {k}: {v:.4f}")
-    #         print(f"  Performance:")
-    #         for k, v in sol['performance'].items():
-    #             if 'cost' in k:
-    #                 print(f"    {k}: ${v:,.0f}")
-    #             else:
-    #                 print(f"    {k}: {v:.4f}")
-    #
-    # print("\n" + "=" * 80)
-    # print("OPTIMIZATION COMPLETE")
-    # print("=" * 80)
+
+    print("=" * 80)
+    print("NSGA-II RANKING OPTIMIZER")
+    print("=" * 80)
+    print(f"Generations: {N_GENERATIONS}")
+    print(f"Population: {POP_SIZE}")
+    print(f"Restore from: {RESTORE_FROM}")
+    print("=" * 80)
+
+    optimizer = NSGARankingOptimizer()
+
+    optimizer.run(
+        n_generations=N_GENERATIONS,
+        pop_size=POP_SIZE,
+        restore_from=RESTORE_FROM,
+    )
+
+    optimizer.visualize_results()
+
+    print("\n" + "=" * 80)
+    print("BEST SOLUTIONS SUMMARY")
+    print("=" * 80)
+
+    for pref in ['balanced', 'min_cost', 'max_flooding', 'max_health']:
+        sol = optimizer.get_best_solution(preference=pref)
+        if sol:
+            print(f"\n{pref.upper()}:")
+            print(f"  Weights:")
+            for k, v in sol['weights'].items():
+                print(f"    {k}: {v:.4f}")
+            print(f"  Performance:")
+            for k, v in sol['performance'].items():
+                if 'cost' in k:
+                    print(f"    {k}: ${v:,.0f}")
+                else:
+                    print(f"    {k}: {v:.4f}")
+
+    print("\n" + "=" * 80)
+    print("OPTIMIZATION COMPLETE")
+    print("=" * 80)

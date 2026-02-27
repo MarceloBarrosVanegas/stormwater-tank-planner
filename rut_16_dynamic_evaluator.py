@@ -28,20 +28,18 @@ import osmnx as ox
 import functools
 import numpy as np
 import json
+import pickle
 
 import config
 config.setup_sys_path()
 
 from rut_00_path_finder import PathFinder
 from rut_02_elevation import ElevationGetter, ElevationSource
-from rut_03_run_sewer_design import SewerPipeline
-from rut_06_pipe_sizing import SeccionLlena, SeccionParcialmenteLlena, CapacidadMaximaTuberia
 from rut_02_get_flodded_nodes import CandidatePair
+from rut_03_run_sewer_design import SewerPipeline
+from rut_06_pipe_sizing import SeccionLlena
 from rut_13_cost_functions import CostCalculator
 from rut_14_swmm_modifier import SWMMModifier
-# from rut_17_comparison_reporter import ScenarioComparator
-# from rut_18_itzi_flood_model import run_itzi_for_case
-# from rut_19_flood_damage_climada import calculate_flood_damage_climada
 from rut_20_avoided_costs import AvoidedCostRunner
 from rut_21_construction_cost import SewerConstructionCost
 from rut_27_model_metrics import MetricExtractor, SystemMetrics
@@ -106,22 +104,31 @@ class DynamicSolutionEvaluator:
                  elev_files_list: List[str],
                  proj_to: str,
                  work_dir: str = None,
+                 ranking_weights: dict = None,  # EXPLICITO: Pesos para ranking
+                 capacity_max_hd: float = None,  # EXPLICITO: h/D maximo
+                 baseline_extractor_path: Path = None,  # EXPLICITO: Ruta al pickle del extractor
                  ):
 
-
-        
         self.path_proy = Path(path_proy)
         self.elev_files_list = elev_files_list or []
         self.proj_to = proj_to
         self.inp_file = config.SWMM_FILE
         self.predio_capacity = {}
+        
+        # Parametros EXPLICITOS (opcionales) - NO modificar config aqui
+        self.ranking_weights = ranking_weights
+        self.capacity_max_hd = capacity_max_hd
+        self.baseline_extractor_path = baseline_extractor_path
 
         # 1. Setup Directories
         self._setup_work_dir(work_dir)
+
+        # Crear nuevo extractor
         self.metrics_extractor = MetricExtractor(
                                 project_root=config.PROJECT_ROOT,
-                                predios_path=config.PREDIOS_FILE)
-
+                                predios_path=config.PREDIOS_FILE,
+                                ranking_weights=ranking_weights,
+                                capacity_max_hd=capacity_max_hd)
 
         # 2. Configuration & Weights
         self.path_weights = config.DEFAULT_PATH_WEIGHTS
@@ -161,43 +168,46 @@ class DynamicSolutionEvaluator:
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
     def _init_baseline(self):
+        
+        if self.baseline_extractor_path and Path(self.baseline_extractor_path).exists():
+            with open(self.baseline_extractor_path, 'rb') as f:
+                self.metrics_extractor = pickle.load(f)
+        else:
             print(f"  Running Baseline Simulation (Initial State)...")
             self.metrics_extractor.run(config.SWMM_FILE)
-            self.baseline_metrics = self.metrics_extractor.metrics
-            print(f"  Baseline Flooding: {self.baseline_metrics.total_flooding_volume:,.2f} m3")
+        self.baseline_metrics = self.metrics_extractor.metrics
 
+        # Run Economic Baseline
+        baseline_dir = self.work_dir / "00_Baseline"
+        baseline_dir.mkdir(parents=True, exist_ok=True)
 
-            # Run Economic Baseline
-            baseline_dir = self.work_dir / "00_Baseline"
-            baseline_dir.mkdir(parents=True, exist_ok=True)
+        TR_LIST = config.TR_LIST if config.TR_LIST else [config.BASE_INP_TR]
+        if len(TR_LIST) == 0: TR_LIST = [config.BASE_INP_TR]
 
-            TR_LIST = config.TR_LIST if config.TR_LIST else [config.BASE_INP_TR]
-            if len(TR_LIST) == 0: TR_LIST = [config.BASE_INP_TR]
+        self.is_probabilistic_mode = len(TR_LIST) > 1
+        if self.is_probabilistic_mode:
+            print(f"  [Baseline] Probabilistic mode - TRs: {TR_LIST}")
+        else:
+            print(f"  [Baseline] Deterministic mode - TR: {TR_LIST[0]}")
 
-            self.is_probabilistic_mode = len(TR_LIST) > 1
+        runner = AvoidedCostRunner(
+            output_base=str(baseline_dir),
+            base_precios_path=str(config.BASE_PRECIOS),
+            base_inp_path=str(config.SWMM_FILE),
+            flood_metrics = self.baseline_metrics
+        )
+
+        damage_baseline = runner.run(tr_list=TR_LIST)
+        results = damage_baseline.get('results', [])
+
+        if results:
             if self.is_probabilistic_mode:
-                print(f"  [Baseline] Probabilistic mode - TRs: {TR_LIST}")
+                cost_results = self._calculate_probabilistic_baseline(results)
             else:
-                print(f"  [Baseline] Deterministic mode - TR: {TR_LIST[0]}")
-
-            runner = AvoidedCostRunner(
-                output_base=str(baseline_dir),
-                base_precios_path=str(config.BASE_PRECIOS),
-                base_inp_path=str(config.SWMM_FILE),
-                flood_metrics = self.baseline_metrics
-            )
-
-            damage_baseline = runner.run(tr_list=TR_LIST)
-            results = damage_baseline.get('results', [])
-
-            if results:
-                if self.is_probabilistic_mode:
-                    cost_results = self._calculate_probabilistic_baseline(results)
-                else:
-                    cost_results = self._calculate_deterministic_baseline(results[0])
-                    
-            self.baseline_metrics.cost = cost_results['total_cost']
-            
+                cost_results = self._calculate_deterministic_baseline(results[0])
+                
+        self.baseline_metrics.cost = cost_results
+        
     def _init_path_finder(self):
         # Calculate combined bounds
         combined_geoms = pd.concat([self.metrics_extractor.nodes_gdf, self.metrics_extractor.predios_gdf])
@@ -1312,13 +1322,6 @@ class DynamicSolutionEvaluator:
 
         # Generate paths for new pairs only
         new_path_gdfs, target_node_metadata, pairs = self._generate_paths(new_active_pairs)
-
-        # # Update active_pairs with generated path data
-        # pairs_map = {p['node_id']: p for p in pairs}
-        # for active in active_pairs:
-        #     n_id = active.get('node_id')
-        #     if n_id in pairs_map:
-        #         active.update(pairs_map[n_id])
 
         if not target_node_metadata:
             return None, None
