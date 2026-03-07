@@ -152,21 +152,19 @@ class GreedyTankOptimizer:
     
             for i, pair in enumerate(active_pairs):
                 nid = str(pair['node_id'])
-                tank_id = f"tank_{pair['predio_id']}"
                 
                 # Fetch current metrics from the simulation results
                 base_f = self.baseline_metrics.node_data.get(nid, {}).get('flooding_volume', 0.0)
                 curr_f = self.current_metrics.node_data.get(nid, {}).get('flooding_volume', 0.0)
                 
-                stored_vol, stored_depth = 0.0, 0.0
-                if tank_id in self.current_metrics.tank_data:
-                    stored_vol = self.current_metrics.tank_data[tank_id]['max_stored_volume']
-                    stored_depth = self.current_metrics.tank_data[tank_id]['max_depth']
+                # Only tank pairs have volume and depth data
+                if pair.get('is_tank', False):
+                    stored_vol = pair['tank_volume_simulation']
+                    stored_depth = pair['tank_max_depth']
+                else:
+                    stored_vol = 0.0
+                    stored_depth = 0.0
     
-                # Update solution metadata for downstream reporting
-                pair['tank_volume_simulation'] = stored_vol
-                pair['tank_max_depth'] = stored_depth
-                
                 print(f"  {nid:<12} {base_f:<15.1f} {curr_f:<15.1f} {stored_vol:<12.1f} {stored_depth:<10.2f}")
     
             # --- 3. GENERATE VISUAL REPORTS (Dashboard & Hydrographs) ---
@@ -211,15 +209,24 @@ class GreedyTankOptimizer:
             )
 
     def _remove_case_directory(self):
-        """Remove a case directory if it exists."""
+        """Remove a case directory if it exists, preserving hydrological_impact files."""
         case_dir = self.evaluator.case_dir
         
         if case_dir and Path(case_dir).exists():
-            shutil.rmtree(case_dir)
-            print(f"  [Cleanup] Removed directory: {case_dir}")
-
-
-
+            case_path = Path(case_dir)
+            # Preservar archivos/carpetas que contengan 'hydrological_impact'
+            for item in case_path.iterdir():
+                if 'hydrological_impact' in item.name.lower():
+                    print(f"  [Cleanup] Preserving hydrological file: {item.name}")
+                    continue
+                try:
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+                except Exception as e:
+                    print(f"  [Cleanup Warning] Could not remove {item}: {e}")
+            print(f"  [Cleanup] Cleaned directory: {case_dir}")
 
     def max_ramal_por_tanque(self, cumulative_paths):
         """
@@ -377,7 +384,6 @@ class GreedyTankOptimizer:
                 respuesta[node_id] = max_ramal
     
         return respuesta, max_by_tank, sink_by_ramal
-    
 
     def run_sequential(self) -> GreedyOptimizationResult:
         """
@@ -416,6 +422,51 @@ class GreedyTankOptimizer:
         print(f"{'='*60}")
         print(f"  Tank Depth: {config.TANK_DEPTH_M}m | Volume: {config.TANK_MIN_VOLUME_M3}-{config.TANK_MAX_VOLUME_M3} m³")
         print(f"  Max Prune Retries: {config.MAX_PRUNE_RETRIES}")
+
+        # =====================================================================
+        # FASE 1.5: REGISTRAR BASELINE (SIN INTERVENCIÓN)
+        # =====================================================================
+        print(f"\n  [Baseline] Registrando estado inicial sin intervención...")
+        baseline_result = {
+            'step': 0,
+            'n_tanks': 0,
+            'added_node': 'BASELINE',
+            'added_predio': None,
+            'cost_social_total': 0,
+            'cost_investment_total': 0,
+            'cost_links': 0,
+            'cost_tanks': 0,
+            'cost_land': 0,
+            'cost_residual_total': self.baseline_metrics.cost['flood_damage_cost'] + self.baseline_metrics.cost['infrastructure_repair_cost'],
+            'cost_residual_flood': self.baseline_metrics.cost['flood_damage_cost'],
+            'cost_residual_infra': self.baseline_metrics.cost['infrastructure_repair_cost'],
+            'current_tank_cost': 0,
+            'current_tank_land': 0,
+            'current_tank_volume': 0,
+            'current_tank_max_depth_m': 0,
+            'current_tank_design_depth_m': 0,
+            'current_tank_utilization_pct': 0,
+            'flooding_volume': self.baseline_metrics.total_flooding_volume,
+            'flooding_reduction': 0,
+            'marginal_reduction': 0,
+            'outfall_peak_flow': self.baseline_metrics.total_max_outfall_flow,
+            'flooded_nodes_count': self.baseline_metrics.flooded_nodes_count,
+            'efficiency_m3_per_dollar': 0,
+            'cost_per_m3_reduced': 0,
+            'surcharged_links_count': self.baseline_metrics.surcharged_links_count,
+            'overloaded_links_length': self.baseline_metrics.overloaded_links_length,
+            'derivation_links_length': 0.0,  # Longitud de tuberías de derivación (desde GPKG)
+            'flooding_flow': self.baseline_metrics.total_max_flooding_flow,  # Caudal de inundación
+            'system_mean_utilization': self.baseline_metrics.system_mean_utilization,
+            'system_utilization_median': getattr(self.baseline_metrics, 'system_utilization_median', 0.0),
+            'system_utilization_mode': getattr(self.baseline_metrics, 'system_utilization_mode', 0.0),
+            'total_tank_volume': 0,
+            'cost_display': '$0',
+            'flooding_remaining': self.baseline_metrics.total_flooding_volume,
+            '_marginal_cost': 0
+        }
+        results.append(baseline_result)
+        print(f"  [Baseline] Flooding: {self.baseline_metrics.total_flooding_volume:,.0f} m³ | Outfall: {self.baseline_metrics.total_max_outfall_flow:.2f} m³/s")
 
         # =====================================================================
         # FASE 2: BUCLE PRINCIPAL DE SELECCIÓN ITERATIVA
@@ -614,6 +665,30 @@ class GreedyTankOptimizer:
 
             residual_repair_cost = self.baseline_metrics.cost['infrastructure_repair_cost'] - cost_dict['residual']['infrastructure_repair']
             residual_flood_cost = self.baseline_metrics.cost['flood_damage_cost'] - cost_dict['residual']['flood_damage']
+            
+            # Buscar datos del tanque en active_candidates (actualizado por _run_cost_simulation)
+            current_pair = None
+            if cand.get('is_tank'):
+                for p in active_candidates:
+                    if p.get('node_id') == cand['node_id']:
+                        current_pair = p
+                        break
+            
+            if current_pair:
+                tank_cost = current_pair.get('cost_tank', 0)
+                tank_land = current_pair.get('cost_land', 0)
+                tank_volume = current_pair.get('tank_volume_simulation', 0)
+                tank_depth = current_pair.get('tank_max_depth', 0)
+                tank_design = current_pair.get('tank_design_depth', 0)
+                tank_util = current_pair.get('tank_utilization_pct', 0)
+            else:
+                tank_cost = 0
+                tank_land = 0
+                tank_volume = 0
+                tank_depth = 0
+                tank_design = 0
+                tank_util = 0
+            
             # Construir diccionario de resultados
             result = {
                 # Identificación
@@ -637,9 +712,12 @@ class GreedyTankOptimizer:
                 'cost_residual_infra': cost_dict['residual']['infrastructure_repair'],
                 
                 # Datos del tanque actual
-                'current_tank_cost': cand.get('cost_tank', 0) if cand.get('is_tank') else 0,
-                'current_tank_land': cand.get('cost_land', 0) if cand.get('is_tank') else 0,
-                'current_tank_volume': cand.get('tank_volume_simulation', 0) if cand.get('is_tank') else 0,
+                'current_tank_cost': tank_cost,
+                'current_tank_land': tank_land,
+                'current_tank_volume': tank_volume,
+                'current_tank_max_depth_m': tank_depth,
+                'current_tank_design_depth_m': tank_design,
+                'current_tank_utilization_pct': tank_util,
                 
                 # Desempeño hidráulico
                 'flooding_volume': self.current_metrics.total_flooding_volume,
@@ -655,7 +733,11 @@ class GreedyTankOptimizer:
                 # Salud de la red
                 'surcharged_links_count': self.current_metrics.surcharged_links_count,
                 'overloaded_links_length': self.current_metrics.overloaded_links_length,
+                'derivation_links_length': self.evaluator.last_designed_gdf.geometry.length.sum() if self.evaluator.last_designed_gdf is not None else 0.0,
+                'flooding_flow': self.current_metrics.total_max_flooding_flow,
                 'system_mean_utilization': self.current_metrics.system_mean_utilization,
+                'system_utilization_median': getattr(self.current_metrics, 'system_utilization_median', 0.0),
+                'system_utilization_mode': getattr(self.current_metrics, 'system_utilization_mode', 0.0),
                 
                 # Infraestructura
                 'total_tank_volume': total_tank_volume,
@@ -705,6 +787,12 @@ class GreedyTankOptimizer:
         if results:
             df_results = pd.DataFrame(results)
 
+            # Map the final volume from active_candidates to df_results. 
+            # This ensures the dashboard displays the final resized volume of the tank,
+            # which matches what the reporter outputs later for the final simulation.
+            final_vols = {str(p['node_id']): p.get('tank_volume_simulation', 0) for p in active_candidates if p.get('is_tank')}
+            df_results['final_tank_volume'] = df_results['added_node'].astype(str).map(final_vols).fillna(df_results['current_tank_volume'])
+
             # Dashboard visual de evolución
             dash_gen = EvolutionDashboardGenerator(df_results, Path("optimization_results"))
             dash_gen.generate_all()
@@ -714,7 +802,8 @@ class GreedyTankOptimizer:
             df_results.to_csv(csv_path, index=False)
             print(f"  [Tracking] Saved CSV: {csv_path}")
 
-
+            # Exportar todos los predios con sus atributos
+            self._export_selected_predios_gpkg(active_candidates, self.evaluator.predio_tracking)
         #optimization results
         # Calcular métricas vs baseline
         baseline = self.baseline_metrics
@@ -768,7 +857,6 @@ class GreedyTankOptimizer:
             results_df=pd.DataFrame(results),
         )
 
-
     def _export_spatial_snapshot(self, iteration: int, swmm_gdf: gpd.GeoDataFrame):
         """
         Exports the current network state to a layer in a GPKG.
@@ -810,9 +898,6 @@ class GreedyTankOptimizer:
             predio_capacity[str(predio_idx)] = {'total_area': area_m2, 'used_area': 0.0, 'n_tanks': 0}
         
         return predio_capacity
-
-
-
 
     def _generate_summary_report(self, active_candidates: list, economic_history: list, predio_capacity: dict):
         """Generate a text file with optimization summary results."""
@@ -924,16 +1009,24 @@ class GreedyTankOptimizer:
             predio_tanks[pid].append(ac)
         
         # Filter predios GDF to only selected ones
-        if hasattr(self, 'predios_gdf') and self.predios_gdf is not None:
-            selected = self.predios_gdf[self.predios_gdf.index.isin(used_predios)].copy()
+        if hasattr(self, 'metrics_extractor') and hasattr(self.metrics_extractor, 'predios_gdf') and self.metrics_extractor.predios_gdf is not None:
+            # We want all predios in the output, marking the selected ones
+            selected = self.metrics_extractor.predios_gdf.copy()
+            selected['is_selected'] = selected.index.isin(used_predios)
         else:
             print("  [GPKG] No predios_gdf available for export")
             return
-        
+    
         # Add tank data columns
         selected['n_tanks'] = selected.index.map(lambda x: len(predio_tanks.get(x, [])))
         selected['total_design_vol'] = selected.index.map(
-            lambda x: sum(t['total_volume'] for t in predio_tanks.get(x, []))
+            lambda x: sum(t.get('total_volume', 0) for t in predio_tanks.get(x, []))
+        )
+        selected['total_tank_cost'] = selected.index.map(
+            lambda x: sum(t.get('cost_tank', 0) for t in predio_tanks.get(x, []))
+        )
+        selected['total_land_cost'] = selected.index.map(
+            lambda x: sum(t.get('cost_land', 0) for t in predio_tanks.get(x, []))
         )
         
         # Add utilization data if available

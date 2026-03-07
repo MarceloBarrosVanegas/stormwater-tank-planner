@@ -1444,20 +1444,29 @@ class DynamicSolutionEvaluator:
                 predio_id = pair['predio_id']
                 tank_id = f"tank_{predio_id}"
                 
-                if tank_id in self.current_metrics.tank_data:
-                    tank_data = self.current_metrics.tank_data[tank_id]
-                    tank_volume = tank_data['total_volume']
-                    tank_depth = tank_data['max_depth']
-                    
-                    # Store in pair for reporting
-                    pair['tank_volume_simulation'] = tank_volume
-                    pair['tank_max_depth'] = tank_depth
-                    pair['cost_tank'] = CostCalculator.calculate_tank_cost(tank_volume)
-                    pair['cost_land'] = (tank_volume / config.TANK_DEPTH_M) * config.LAND_COST_PER_M2
-                    
-                    # Accumulate totals
-                    cost_tanks += pair['cost_tank']
-                    cost_land += pair['cost_land']
+                if tank_id not in self.current_metrics.tank_data:
+                    raise KeyError(f"Tank {tank_id} not found in tank_data. Available: {list(self.current_metrics.tank_data.keys())}")
+                
+                tank_data = self.current_metrics.tank_data[tank_id]
+                # Use max_stored_volume (actual stored volume) instead of total_volume (inflow)
+                tank_volume = tank_data.get('max_stored_volume', tank_data['total_volume'])
+                tank_depth = tank_data['max_depth']
+                design_depth = config.TANK_DEPTH_M  # Design depth from config
+                
+                # Calculate utilization percentage
+                utilization_pct = (tank_depth / design_depth * 100) if design_depth > 0 else 0
+                
+                # Store in pair for reporting
+                pair['tank_volume_simulation'] = tank_volume
+                pair['tank_max_depth'] = tank_depth
+                pair['tank_design_depth'] = design_depth
+                pair['tank_utilization_pct'] = utilization_pct
+                pair['cost_tank'] = CostCalculator.calculate_tank_cost(tank_volume)
+                pair['cost_land'] = (tank_volume / config.TANK_DEPTH_M) * config.LAND_COST_PER_M2
+                
+                # Accumulate totals
+                cost_tanks += pair['cost_tank']
+                cost_land += pair['cost_land']
         
         # =====================================================================
         # STEP 4: CALCULATE RESIDUAL COSTS (DAMAGES WITH SOLUTION IN PLACE)

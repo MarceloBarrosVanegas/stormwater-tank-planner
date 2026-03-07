@@ -242,8 +242,8 @@ DEFAULT_ROAD_PREFERENCES = {
 }
 
 FLOODING_RANKING_WEIGHTS = {
-    'flow_over_capacity': 1.0,
-    'flow_node_flooding': 0.0,
+    'flow_over_capacity': 0.5,
+    'flow_node_flooding': 0.5,
     'vol_node_flooding': 0.0,
     'outfall_peak_flow': 0,
     'failure_probability': 0,

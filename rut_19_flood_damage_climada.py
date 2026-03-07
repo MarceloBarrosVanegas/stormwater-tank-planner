@@ -1255,9 +1255,6 @@ class FloodDamagePlotter:
         print(f"   {path.name}")
         return path
 
-        print(f"   {path.name}")
-        return path
-
     def plot_flood_depth_map(self):
         """Map of flood depth raster with properties overlay."""
         import rasterio

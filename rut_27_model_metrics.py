@@ -131,7 +131,10 @@ class SystemMetrics:
     # NETWORK HEALTH
     surcharged_links_count: int = 0
     overloaded_links_length: float = 0.0
+    derivation_links_length: float = 0.0  # Longitud de links de derivación (conexión a tanques)
     system_mean_utilization: float = 0.0
+    system_utilization_median: float = 0.0
+    system_utilization_mode: float = 0.0
     network_health_score: float = 0.0  # 0-1, mayor es mejor (calculado de swmm_gdf)
    
 
@@ -468,28 +471,36 @@ class MetricExtractor:
             # =====================================================================
             # 4.1 NETWORK HEALTH METRICS
             # =====================================================================
-            # Filter valid pipes (capacity > 0) to avoid division by zero
+            # Usar directamente Capacity (h/D) del SWMM - NO recalcular
+            # Capacity ya contiene la relacion altura/diametro (h/D) como decimal
             valid_pipes = swmm_gdf[swmm_gdf['Capacity'] > 0].copy()
             if not valid_pipes.empty:
-                # Calculate utilization
-                valid_pipes['utilization'] = valid_pipes['MaxFlow'] / valid_pipes['Capacity']
+                # Utilization = Capacity (h/D) directo del SWMM
+                swmm_gdf['utilization'] = swmm_gdf['Capacity']
                 
-                # Surcharged status
-                valid_pipes['Surcharged'] = valid_pipes['utilization'] >= 1.0
+                # Surcharged: h/D >= 1.0 (flujo a presion)
+                swmm_gdf['Surcharged'] = swmm_gdf['Capacity'] >= 1.0
                 
-                # Update the main GDF with these new columns
-                swmm_gdf = swmm_gdf.join(valid_pipes[['utilization', 'Surcharged']], rsuffix='_calc')
-                # Fill NaNs for non-valid pipes (e.g. dummy links)
+                # Fill NaNs for non-valid pipes
                 swmm_gdf['utilization'] = swmm_gdf['utilization'].fillna(0.0)
                 swmm_gdf['Surcharged'] = swmm_gdf['Surcharged'].fillna(False)
 
-                # Surcharged links (over 100% capacity)
+                # Surcharged links (h/D >= 1.0)
                 surcharged_links = swmm_gdf[swmm_gdf['Surcharged'] == True]
                 metrics.surcharged_links_count = len(surcharged_links)
                 metrics.overloaded_links_length = surcharged_links['Length'].sum()
                 
-                # System mean utilization (using mean of ratios)
-                metrics.system_mean_utilization = swmm_gdf[swmm_gdf['Capacity'] > 0]['utilization'].mean() * 100 # In percentage
+                # System utilization statistics (mean, median, mode) - usando h/D directo
+                valid_util = swmm_gdf[swmm_gdf['Capacity'] > 0]['Capacity']
+                metrics.system_mean_utilization = valid_util.mean() * 100
+                metrics.system_utilization_median = valid_util.median() * 100
+                # Calculate mode (most frequent utilization bin)
+                try:
+                    from scipy import stats
+                    mode_result = stats.mode(valid_util, keepdims=True)
+                    metrics.system_utilization_mode = mode_result.mode[0] * 100 if len(mode_result.mode) > 0 else valid_util.median() * 100
+                except:
+                    metrics.system_utilization_mode = valid_util.median() * 100
                 
                 # Network health: capacity ponderada por caudal (1.0 = mejor, 0.0 = peor)
                 valid = swmm_gdf[swmm_gdf['Capacity'] > 0].copy()
@@ -506,6 +517,8 @@ class MetricExtractor:
                  metrics.surcharged_links_count = 0
                  metrics.overloaded_links_length = 0.0
                  metrics.system_mean_utilization = 0.0
+                 metrics.system_utilization_median = 0.0
+                 metrics.system_utilization_mode = 0.0
                  metrics.network_health_score = 0.0
 
             inletnodes_series = swmm_gdf['InletNode'].astype(str).str.strip().str.upper()

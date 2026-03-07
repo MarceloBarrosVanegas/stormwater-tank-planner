@@ -35,6 +35,10 @@ class HydrologicalImpactAssessment:
         self.output_dir = Path(output_dir) / "hydrological_impact"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Directorio para figuras (02_figure_results)
+        self.figures_dir = Path(output_dir) / "02_figure_results"
+        self.figures_dir.mkdir(parents=True, exist_ok=True)
+        
         self.green_inp = self.output_dir / "model_green_baseline.inp"
         self.results = {} # scenario -> DataFrame of outfall results
         self.hydrographs = {} # scenario -> {time: [], total_q: []}
@@ -237,9 +241,9 @@ class HydrologicalImpactAssessment:
         ax_hydro.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig(self.cas_dir/ "06_hydrological_comparison.png", dpi=150)
+        plt.savefig(self.figures_dir / "06_hydrological_comparison.png", dpi=150)
         plt.close()
-        print(f"  [HydroImpact] Summary plots saved to: {self.output_dir / 'hydrological_comparison_summary.png'}")
+        print(f"  [HydroImpact] Summary plots saved to: {self.figures_dir / '06_hydrological_comparison.png'}")
 
     def _generate_spatial_impact_map(self):
         """Plots outfalls on a map with marker size proportional to peak flow."""
@@ -291,9 +295,9 @@ class HydrologicalImpactAssessment:
                                 fontweight='bold', bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', pad=1))
 
             plt.tight_layout()
-            plt.savefig(self.output_dir / "hydrological_spatial_impact.png", dpi=150)
+            plt.savefig(self.figures_dir / "06_hydrological_spatial_impact.png", dpi=150)
             plt.close()
-            print(f"  [HydroImpact] Spatial impact map saved to: {self.output_dir / 'hydrological_spatial_impact.png'}")
+            print(f"  [HydroImpact] Spatial impact map saved to: {self.figures_dir / '06_hydrological_spatial_impact.png'}")
             
         except Exception as e:
             print(f"  [Warning] Failed to generate spatial impact map: {e}")
