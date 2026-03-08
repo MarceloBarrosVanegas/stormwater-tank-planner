@@ -1144,7 +1144,7 @@ class EvolutionDashboardGenerator:
             ax.scatter(x[0], y[0], s=250, c='darkblue', edgecolors='white', linewidth=2.5, zorder=5, marker='o')
             val_0 = format_val(y[0], unit)
             ax.annotate(f'p0: {val_0}', (x[0], y[0]), textcoords="offset points", 
-                       xytext=(-30, 25), ha='center', fontsize=12, color='darkblue', fontweight='bold',
+                       xytext=(-30, 25), ha='center', fontsize=14, color='darkblue', fontweight='bold',
                        arrowprops=dict(arrowstyle='->', color='darkblue', alpha=0.7, lw=1.5),
                        bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', alpha=0.95, edgecolor='darkblue', linewidth=1.5))
             
@@ -1161,14 +1161,14 @@ class EvolutionDashboardGenerator:
                     offset_x = 25 if i % 2 == 0 else -25
                     offset_y = 22 if i < 2 else -22
                     ax.annotate(f'p{int(steps[idx])}:\n{val}', (x[idx], y[idx]), textcoords="offset points", 
-                               xytext=(offset_x, offset_y), ha='center', fontsize=11, color=color, fontweight='bold',
+                               xytext=(offset_x, offset_y), ha='center', fontsize=13, color=color, fontweight='bold',
                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9, edgecolor=color, linewidth=1.5))
             
             # Punto final (último) - grande con valor numérico
             ax.scatter(x[-1], y[-1], s=250, c='darkgreen', edgecolors='white', linewidth=2.5, zorder=5, marker='o')
             val_f = format_val(y[-1], unit)
             ax.annotate(f'p{int(steps[-1])}: {val_f}', (x[-1], y[-1]), textcoords="offset points", 
-                       xytext=(35, -25), ha='center', fontsize=12, color='darkgreen', fontweight='bold',
+                       xytext=(35, -25), ha='center', fontsize=13, color='darkgreen', fontweight='bold',
                        arrowprops=dict(arrowstyle='->', color='darkgreen', alpha=0.7, lw=1.5),
                        bbox=dict(boxstyle='round,pad=0.4', facecolor='lightgreen', alpha=0.95, edgecolor='darkgreen', linewidth=1.5))
             
@@ -1176,7 +1176,7 @@ class EvolutionDashboardGenerator:
             median_y = np.median(y)
             ax.axhline(y=median_y, color='blue', linestyle=':', alpha=0.5, linewidth=1.5)
             ax.text(x.max()*0.98, median_y, f'Med: {median_y:.0f}', 
-                   ha='right', va='bottom', fontsize=10, color='blue', alpha=0.7)
+                   ha='right', va='bottom', fontsize=13, color='blue', alpha=0.7)
             
             # Eje Y secundario con porcentaje de cambio
             ax2 = ax.twinx()
@@ -1186,7 +1186,7 @@ class EvolutionDashboardGenerator:
             pct_min = ((y_min - baseline_val) / baseline_val) * 100
             pct_max = ((y_max - baseline_val) / baseline_val) * 100
             ax2.set_ylim(pct_min, pct_max)
-            ax2.set_ylabel('% Cambio', fontsize=11, color='gray', alpha=0.8)
+            ax2.set_ylabel('% Cambio', fontsize=13, color='gray', alpha=0.8)
             ax2.tick_params(axis='y', labelcolor='gray', labelsize=10)
             
             # Configuracion del subplot principal
