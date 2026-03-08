@@ -63,7 +63,7 @@ class EvolutionDashboardGenerator:
         self.plot_system_utilization_by_tank()
         self.plot_flooding_flow_by_tank()
         self.plot_cost_reduction_evolution()
-        self.plot_roi_curve()
+        self.plot_individual_roi_curves()
         self.plot_pareto_curves()
         self.plot_system_evolution()
 
@@ -149,7 +149,7 @@ class EvolutionDashboardGenerator:
             else:
                 cpm_normalized = pd.Series([0.5] * len(cost_per_m3))
 
-            
+
             # Create figure with table left, two charts stacked on right - FORMATO A4
             fig = plt.figure(figsize=(24, 14))  # Más ancho para mejor legibilidad
             
@@ -574,6 +574,7 @@ class EvolutionDashboardGenerator:
         ax_bar.set_xticks(x_pos)
         ax_bar.set_xticklabels([])  # Sin etiquetas en X (comparte con evo)
         ax_bar.set_xlabel('')
+        ax_bar.set_xlim(0.5, len(tank_groups) + 0.5)  # Alineado con evo
         ax_bar.set_ylabel('Reducción Caudal Outfall (m³/s)', fontsize=15, fontweight='bold')
         ax_bar.set_title(f'Efecto en Caudal Outfall por Tanque ({len(tank_groups)} Tanques)',
                      fontsize=16, fontweight='bold', pad=35)
@@ -638,330 +639,424 @@ class EvolutionDashboardGenerator:
         print(f"  [Dashboard] Saved: {save_path}")
 
     def plot_cost_reduction_evolution(self):
+        """
+        Evolución de Inversión vs Reducción — multiplot resumen 3x2
+        + gráficos individuales por variable.
+        """
         if len(self.df) < 1:
             return
-    
-        fig, ax1 = plt.subplots(figsize=(14, 10))  # Más grande para legibilidad
-    
+
         steps = self.df["step"].values
         cost_total = self.df["cost_investment_total"].values
-        reduction_total = self.df["flooding_reduction"].values
-        flooding_remaining = self.df["flooding_volume"].values if "flooding_volume" in self.df.columns else None
-    
-        # Bars (cost)
-        colors = plt.cm.Blues(np.linspace(0.4, 0.8, len(steps)))
-        ax1.bar(
-            steps,
-            cost_total,
-            color=colors,
-            edgecolor="#2c5aa0",
-            linewidth=2,
-            label="Inversion Acumulada",
-            alpha=0.6,
-        )
-    
-        ax1.set_ylabel("Inversion Acumulada ($)", fontsize=11, fontweight="bold", color="#1a4d8f", labelpad=5)
-        ax1.tick_params(axis="y", labelcolor="#1a4d8f")
-        ax1.yaxis.set_major_formatter(FuncFormatter(self.format_currency_smart))
-    
-        # Right axis line (reduction)
-        ax2 = ax1.twinx()
-        ax2.plot(
-            steps,
-            reduction_total,
-            "o-",
-            color="#2e7d32",
-            linewidth=2.0,
-            markersize=10,
-            markeredgecolor="#1b5e20",
-            markeredgewidth=1,
-            label="Reduccion Acumulada",
-            alpha=1.0,
-        )
-    
-        ax2.set_ylabel(
-            "Reduccion de Inundacion (m3)",
-            fontsize=11,
-            fontweight="bold",
-            color="#2e7d32",
-            labelpad=20,
-        )
-        ax2.tick_params(axis="y", labelcolor="#2e7d32", pad=10)
-        ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"{x:,.0f}"))
-    
-        # Optional third axis (residual) with more outward spacing
-        if flooding_remaining is not None:
-            ax3 = ax1.twinx()
-            ax3.spines["right"].set_position(("outward", 95))
-            ax3.plot(
-                steps,
-                flooding_remaining,
-                "s--",
-                color="#c62828",
-                linewidth=1.0,
-                markersize=5,
-                markeredgecolor="#8e0000",
-                markeredgewidth=1.0,
-                label="Inundacion Residual",
-                alpha=0.9,
-            )
-            ax3.set_ylabel("Inundacion Residual (m3)", fontsize=11, color="#c62828", fontweight="bold", labelpad=26)
-            ax3.tick_params(axis="y", labelcolor="#c62828", pad=10)
-            ax3.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f"{x:,.0f}"))
-    
-        # --- reduction labels at TOP (outside) - solo cada 3 pasos ---
-        for i, (step, red) in enumerate(zip(steps, reduction_total)):
-            if i % 3 == 0 or i == len(steps) - 1:  # Mostrar cada 3 pasos + último
-                y_offset_pts = 45
-                ax2.annotate(
-                    f"{red:,.0f}",
-                    xy=(step, 1.0),
-                    xycoords=("data", "axes fraction"),
-                    xytext=(0, y_offset_pts),
-                    textcoords="offset points",
-                    ha="center",
-                    va="center",
-                    fontsize=10,
-                    fontweight="bold",
-                    color="#2e7d32",
-                    rotation=0,  # Sin rotación para mejor lectura
-                    clip_on=False,
-                    annotation_clip=False,
-                    zorder=20,
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='none')
+        colors_bars = plt.cm.Blues(np.linspace(0.3, 0.55, len(steps)))
+
+        # Variable definitions with units
+        var_defs = [
+            ('flooding_volume', 'Vol. Inundación', '#c62828', 'o', 'm³'),
+            ('flooding_flow', 'Caudal Inundación', '#e65100', 's', 'm³/s'),
+            ('outfall_peak_flow', 'Pico Outfall', '#1565c0', 'D', 'm³/s'),
+            ('flooded_nodes_count', 'Nodos Inundados', '#00838f', 'p', 'nodos'),
+            ('surcharged_links_count', 'Links Sobrecargados', '#2e7d32', 'v', 'links'),
+            ('system_mean_utilization', 'Utilización Red', '#6a1b9a', '^', '%'),
+        ]
+
+        # Filter valid variables and pre-compute
+        valid_vars = []
+        for col, label, color, marker, unit_label in var_defs:
+            if col in self.df.columns:
+                vals = self.df[col].values.astype(float)
+                if vals[0] > 0:
+                    pct = ((vals[0] - vals) / vals[0]) * 100
+                    valid_vars.append((col, label, color, marker, unit_label, pct, vals))
+
+        if not valid_vars:
+            return
+
+        # ── Helper: draw one variable on a given axes pair ──
+        def _draw_variable(ax_bar, ax_line, col, label, color, marker,
+                          unit_label, pct, raw_vals, show_all_values=False):
+            """Draw bars + line + annotations for one variable."""
+            # Investment bars
+            ax_bar.bar(steps, cost_total, color=colors_bars,
+                      edgecolor="#7bafd4", linewidth=0.5, alpha=0.25)
+            ax_bar.set_ylabel("Inversión Acumulada (USD)", fontsize=13 if show_all_values else 11,
+                            color="#1a4d8f", fontweight="bold")
+            ax_bar.tick_params(axis="y", labelcolor="#1a4d8f", labelsize=12 if show_all_values else 10)
+            ax_bar.yaxis.set_major_formatter(FuncFormatter(self.format_currency_smart))
+
+            # % reduction line
+            ax_line.plot(steps, pct, f'{marker}-', color=color,
+                        linewidth=2.5, markersize=10 if show_all_values else 8,
+                        markeredgecolor='white', markeredgewidth=1.0, alpha=0.95)
+            ax_line.set_ylim(-5, 105)
+            ax_line.set_ylabel("Reducción (%)", fontsize=13 if show_all_values else 11,
+                             color=color, fontweight="bold")
+            ax_line.tick_params(axis="y", labelcolor=color, labelsize=12 if show_all_values else 10)
+            ax_line.grid(False)  # disable twinx default grid
+
+            # (no horizontal reference lines)
+
+            # Format raw value (number only — units are in the title)
+            if 'volume' in col:
+                fmt_v = lambda v: f"{v:,.0f}"
+            elif 'flow' in col:
+                fmt_v = lambda v: f"{v:,.2f}"
+            elif 'count' in col or 'nodes' in col or 'links' in col:
+                fmt_v = lambda v: f"{int(v)}"
+            elif 'utilization' in col:
+                fmt_v = lambda v: f"{v:.1f}"
+            else:
+                fmt_v = lambda v: f"{v:,.1f}"
+
+            # ALL values shown in both modes
+            val_indices = list(range(len(steps)))
+            pct_step = 2 if show_all_values else 3
+
+            # Raw values at top of plot — rotated 45°, black, single row
+            for i in val_indices:
+                ax_line.annotate(
+                    fmt_v(raw_vals[i]),
+                    xy=(steps[i], 1.0), xycoords=("data", "axes fraction"),
+                    xytext=(0, 8), textcoords="offset points",
+                    ha="left", va="bottom",
+                    fontsize=10 if show_all_values else 8.5,
+                    fontweight="bold", color="#333333",
+                    rotation=45,
+                    clip_on=False, annotation_clip=False,
                 )
-    
-        # --- custom 2-line x labels (step + $M in blue) ---
-        ax1.set_xlabel("Paso de Optimizacion (Tanque Agregado)", fontsize=12, fontweight="bold", labelpad=100)
-        ax1.set_xticks(steps)
-        ax1.set_xticklabels([])
-        ax1.tick_params(axis="x", length=0)
-    
-        trans = mtransforms.blended_transform_factory(ax1.transData, ax1.transAxes)
-        for s, c in zip(steps, cost_total):
-            ax1.annotate(
-                f"{s}",
-                xy=(s, 0.03),
-                xycoords=trans,
-                xytext=(0, -26),
-                textcoords="offset points",
-                ha="center",
-                va="top",
-                fontsize=11,
-                fontweight="bold",
-                color="black",
-                clip_on=False,
-            )
-            ax1.annotate(
-                f"{c/1_000_000:,.1f} M",
-                xy=(s, 0.0),
-                xycoords=trans,
-                xytext=(0, -48),
-                textcoords="offset points",
-                ha="center",
-                va="top",
-                fontsize=10,
-                fontweight="bold",
-                color="#1976d2",
-                clip_on=False,
-                rotation=30,  # Menos rotación
-                rotation_mode="anchor",
-            )
-    
-        # Grid
-        ax1.grid(True, linestyle="--", color="#cccccc", alpha=0.4, axis="y", linewidth=1)
-        ax1.set_axisbelow(True)
-    
-        # Figure titles (top)
-        main_title = "Evolucion de Inversion vs Reduccion de Inundacion"
-        sub_title = "Analisis Costo-Beneficio por Paso"
-    
-        # More room top/bottom so outside labels do not get cut
-        plt.subplots_adjust(bottom=0.10, top=0.85)
-        # fig.text(0.5, 0.965, main_title, ha="center", va="top", fontsize=18, fontweight="bold")
-        # fig.text(0.5, 0.935, sub_title, ha="center", va="top", fontsize=14, fontweight="bold")
-    
-        # Legend (kept, but move a bit lower due to bigger bottom area)
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        if flooding_remaining is not None:
-            lines3, labels3 = ax3.get_legend_handles_labels()
-            ax1.legend(
-                lines1 + lines2 + lines3,
-                labels1 + labels2 + labels3,
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.16),
-                ncol=3,
-                fontsize=10,
-                framealpha=0.95,
-                edgecolor="black",
-                fancybox=True,
-            )
-        else:
-            ax1.legend(
-                lines1 + lines2,
-                labels1 + labels2,
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.16),
-                ncol=2,
-                fontsize=14,
-                framealpha=0.9,
-            )
-    
+
+            # % reduction near data points
+            pct_indices = [i for i in range(len(steps))
+                          if i == 0 or i == len(steps)-1 or i % pct_step == 0]
+            for i in pct_indices:
+                ax_line.annotate(
+                    f"{pct[i]:.1f}%",
+                    xy=(steps[i], pct[i]),
+                    xytext=(0, 12), textcoords="offset points",
+                    ha="center", va="bottom",
+                    fontsize=11 if show_all_values else 9,
+                    fontweight="bold", color=color,
+                    bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                             alpha=0.85, edgecolor=color, linewidth=0.4),
+                )
+
+            ax_bar.grid(True, linestyle=":", color="#dddddd", alpha=0.5, axis="y", linewidth=0.5)
+            ax_bar.grid(True, linestyle=":", color="#dddddd", alpha=0.4, axis="x", linewidth=0.5)
+            ax_bar.set_axisbelow(True)
+
+        # ══════════════════════════════════════════════════════════
+        # PART 1: Summary multiplot 3×2
+        # ══════════════════════════════════════════════════════════
+        n_vars = len(valid_vars)
+        ncols = 2
+        nrows = (n_vars + 1) // 2
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(15, 15), sharex=True)
+        if nrows == 1:
+            axes = axes.reshape(1, -1)
+
+        fig.suptitle("Evolución de la Inversión vs Reducción de Indicadores Hidráulicos",
+                    fontsize=18, fontweight="bold", y=0.98)
+
+        for vi, (col, label, color, marker, unit_label, pct, raw_vals) in enumerate(valid_vars):
+            row, col_idx = divmod(vi, ncols)
+            ax_bar = axes[row, col_idx]
+            ax_line = ax_bar.twinx()
+
+            # Title: includes unit so individual values don't need it
+            ax_bar.set_title(f"{label} [{unit_label}]  →  {pct[-1]:.1f}%",
+                           fontsize=14, fontweight="bold", color=color, pad=40)
+
+            _draw_variable(ax_bar, ax_line, col, label, color, marker,
+                          unit_label, pct, raw_vals, show_all_values=False)
+
+        # X-axis labels on bottom row
+        for col_idx in range(ncols):
+            ax_bottom = axes[-1, col_idx]
+            ax_bottom.set_xticks(steps)
+            ax_bottom.set_xticklabels(steps, fontsize=13, fontweight="bold")
+            ax_bottom.set_xlabel("Paso de Optimización", fontsize=13, fontweight="bold")
+
+        if n_vars % 2 == 1:
+            axes[-1, -1].set_visible(False)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96], h_pad=3, w_pad=2)
+
         save_path = self._get_next_figure_path("cost_reduction_evolution")
         fig.savefig(save_path, bbox_inches="tight", dpi=150)
         plt.close(fig)
         print(f"  [Dashboard] Saved: {save_path}")
-    
-    
+
+        # Removed 'PART 2: Individual full-page graphs' block as per user request to drop graphs 05 to 11.
+
     def plot_roi_curve(self):
         """
-        ROI curve showing flood reduction obtained per $1M invested.
-        Shows when investment returns start to diminish.
+        ROI curve — formato original con múltiples variables.
+        Top: ROI acumulado (% reducción / $M) por variable.
+        Bottom: ROI marginal (barras agrupadas) por variable por paso.
+        Usa % reducción para normalizar entre variables con unidades distintas.
         """
         if len(self.df) < 1:
             return
-        
-        # Get cumulative data
+
         steps = self.df['step'].values
         cost_total = self.df['cost_investment_total'].values
-        reduction_total = self.df['flooding_reduction'].values
-        
-        # Calculate ROI: m³ reduced per $1M invested
         cost_in_millions = cost_total / 1_000_000
-        roi = reduction_total / cost_in_millions
-        roi = np.where(cost_in_millions > 0, roi, 0)
-        
-        # Calculate marginal ROI (change between steps)
-        marginal_cost = np.diff(cost_total, prepend=0) / 1_000_000
-        marginal_reduction = np.diff(reduction_total, prepend=0)
-        marginal_roi = np.where(marginal_cost > 0, marginal_reduction / marginal_cost, 0)
-        
-        # Create figure - FORMATO A4
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11.69, 11.69),
+
+        # Marginal cost per step
+        marginal_cost_M = np.diff(cost_total, prepend=0) / 1_000_000
+
+        # Variables to plot — use % reduction so all are comparable
+        var_defs = [
+            ('flooding_volume', 'Vol. Inundación', '#c62828', 'o'),
+            ('flooding_flow', 'Caudal Inundación', '#e65100', 's'),
+            ('outfall_peak_flow', 'Pico Outfall', '#1565c0', 'D'),
+            ('flooded_nodes_count', 'Nodos Inundados', '#00838f', 'p'),
+            ('surcharged_links_count', 'Links Sobrecargados', '#2e7d32', 'v'),
+            ('system_mean_utilization', 'Utilización Red', '#6a1b9a', '^'),
+        ]
+
+        variables = []
+        for col, label, color, marker in var_defs:
+            if col in self.df.columns:
+                vals = self.df[col].values.astype(float)
+                baseline = vals[0]
+                if baseline > 0:
+                    # % reduction from baseline
+                    pct_reduction = ((baseline - vals) / baseline) * 100
+                    # Cumulative ROI: % reduced / $M invested
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        cum_roi = np.where(cost_in_millions > 0, pct_reduction / cost_in_millions, 0)
+                    # Marginal ROI: marginal % / marginal $M
+                    marginal_pct = np.diff(pct_reduction, prepend=0)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        marg_roi = np.where(marginal_cost_M > 0, marginal_pct / marginal_cost_M, 0)
+                    variables.append({
+                        'col': col, 'label': label, 'color': color, 'marker': marker,
+                        'cum_roi': cum_roi, 'marg_roi': marg_roi,
+                    })
+
+        if not variables:
+            return
+
+        # Create figure — same as original: 2 subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12),
                                          gridspec_kw={'height_ratios': [1, 1]})
-        
-        # ===== TOP PLOT: Cumulative ROI =====
-        # Optimal point (definir antes de usar)
-        best_roi_idx = np.argmax(roi)
-        
-        line = ax1.plot(steps, roi, 'o-', color='#1976d2', linewidth=5,
-                        markersize=18, markeredgecolor='#0d47a1', markeredgewidth=3,
-                        label='ROI Acumulado')
-        
-        # Fill under curve
-        ax1.fill_between(steps, 0, roi, alpha=0.25, color='#64b5f6')
-        
-        # Add value labels solo para inicio, mejor, y fin
-        key_points = [0, best_roi_idx, len(steps)-1]
+
+        # ===== TOP: Cumulative ROI (lines) =====
+        for vi, v in enumerate(variables):
+            ax1.plot(steps, v['cum_roi'], f"{v['marker']}-", color=v['color'],
+                    linewidth=2.5 if vi == 0 else 2.0,
+                    markersize=10 if vi == 0 else 7,
+                    markeredgecolor='white', markeredgewidth=1,
+                    label=v['label'], alpha=0.9)
+
+        # Fill under main variable only
+        if variables:
+            ax1.fill_between(steps, 0, variables[0]['cum_roi'],
+                           alpha=0.15, color=variables[0]['color'])
+
+        # Labels for main variable — key points only (first, best, last)
+        main_roi = variables[0]['cum_roi']
+        best_roi_idx = np.argmax(main_roi)
+        key_points = list(set([0, best_roi_idx, len(steps)-1]))
         for idx in key_points:
-            step, r = steps[idx], roi[idx]
-            ax1.annotate(f'{r:,.0f}', xy=(step, r), xytext=(0, 20),
-                        textcoords='offset points', ha='center', va='bottom',
-                        fontsize=11, fontweight='bold', color='#0d47a1',
-                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
-                                 alpha=0.95, edgecolor='#1976d2', linewidth=1.5))
-        
-        # Styling
-        ax1.set_ylabel('Reduccion [m³/$1M] ', fontsize=11, fontweight='bold', labelpad=10)
-        ax1.set_title('Retorno de Inversion (ROI) ACUMULADO',
-                      fontsize=13, fontweight='bold', pad=15)
-        ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:,.0f}'))
+            if main_roi[idx] > 0:
+                ax1.annotate(f'{main_roi[idx]:.2f}', xy=(steps[idx], main_roi[idx]),
+                            xytext=(0, 20), textcoords='offset points',
+                            ha='center', va='bottom',
+                            fontsize=10, fontweight='bold', color=variables[0]['color'],
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                                     alpha=0.95, edgecolor=variables[0]['color'], linewidth=1.5))
+
+        # Optimal point marker for main variable
+        ax1.axvline(x=steps[best_roi_idx], color='#2e7d32', linestyle=':',
+                   linewidth=2.5, alpha=0.6, label=f'Mejor ROI: Paso {steps[best_roi_idx]}')
+        ax1.scatter(steps[best_roi_idx], main_roi[best_roi_idx], s=300, color='#4caf50',
+                   edgecolor='#1b5e20', linewidth=3, zorder=10, marker='*')
+
+        ax1.set_ylabel('% Reducción / $1M invertido', fontsize=11, fontweight='bold', labelpad=10)
+        ax1.set_title('Retorno de Inversión (ROI) Acumulado — Multi-Variable',
+                     fontsize=13, fontweight='bold', pad=15)
+        ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:.1f}'))
         ax1.tick_params(axis='both', labelsize=10)
-        ax1.grid(True, linestyle='--', color='#aaaaaa', alpha=0.5, linewidth=1.5)
+        ax1.grid(True, linestyle='--', color='#aaaaaa', alpha=0.5, linewidth=1)
         ax1.set_axisbelow(True)
         ax1.set_xticks(steps)
         ax1.set_xticklabels([])  # Hide x labels on top plot
-        
-        # Optimal point marker
-        ax1.axvline(x=steps[best_roi_idx], color='#2e7d32', linestyle=':',
-                    linewidth=3.5, alpha=0.8, label=f'Mejor ROI: Paso {steps[best_roi_idx]}')
-        ax1.scatter(steps[best_roi_idx], roi[best_roi_idx], s=500, color='#4caf50',
-                    edgecolor='#1b5e20', linewidth=4, zorder=10, marker='*')
-        
-        # # Large summary box
-        # summary1 = (
-        #     f"ROI INICIAL:  {roi[0]:,.0f} m³/$1M\n"
-        #     f"ROI FINAL:    {roi[-1]:,.0f} m³/$1M\n"
-        #     f"ROI MÁXIMO:   {roi[best_roi_idx]:,.0f} m³/$1M\n"
-        #     f"DEGRADACIÓN:  {((roi[0] - roi[-1]) / roi[0] * 100):.0f}%"
-        # )
-        #
-        # ax1.text(0.02, 0.97, summary1, transform=ax1.transAxes, fontsize=15,
-        #         verticalalignment='top', horizontalalignment='left',
-        #         bbox=dict(boxstyle='round,pad=0.8', facecolor='#e3f2fd',
-        #                  alpha=0.95, edgecolor='#1976d2', linewidth=3),
-        #         fontfamily='monospace', fontweight='bold')
-        
-        ax1.legend(loc='upper right', fontsize=10, framealpha=0.95,
-                   edgecolor='black', fancybox=True)
-        
-        # Set y-axis limits with padding
-        y_max = roi.max() * 1.15
+        ax1.legend(loc='upper right', fontsize=9, framealpha=0.95,
+                  edgecolor='black', fancybox=True, ncol=2)
+        y_max = max(v['cum_roi'].max() for v in variables) * 1.15
         ax1.set_ylim(0, y_max)
-        
-        # ===== BOTTOM PLOT: Marginal ROI =====
-        colors = ['#2e7d32' if mr >= np.median(marginal_roi[marginal_roi > 0]) else '#d32f2f'
-                  for mr in marginal_roi]
-        
-        bars = ax2.bar(steps, marginal_roi, color=colors, alpha=0.85,
-                       edgecolor='black', linewidth=2.5, width=0.7)
-        
-        # Value labels on bars - solo los más importantes (>5000)
-        for bar, mr in zip(bars, marginal_roi):
-            if mr > 5000:  # Solo mostrar valores grandes
-                ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + marginal_roi.max()*0.02,
-                        f'{mr:,.0f}', ha='center', va='bottom',
-                        fontsize=10, fontweight='bold', color='black',
-                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
-        
-        # Average line
-        avg_marginal_roi = np.mean(marginal_roi[marginal_roi > 0])
-        ax2.axhline(y=avg_marginal_roi, color='#ff9800', linestyle='--', linewidth=3.5,
-                    label=f'Promedio: {avg_marginal_roi:,.0f} m³/$1M', alpha=0.9)
-        
-        # Styling
-        ax2.set_xlabel('Número de Paso (Tanque)', fontsize=11, fontweight='bold', labelpad=10)
-        ax2.set_ylabel('ROI de Este Paso\n(m³/$1M)', fontsize=11, fontweight='bold', labelpad=10)
-        ax2.set_title('ROI Marginal',
-                      fontsize=13, fontweight='bold', pad=15)
-        ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:,.0f}'))
+
+        # ===== BOTTOM: Marginal ROI (grouped bars) =====
+        n_vars = len(variables)
+        bar_width = 0.7 / n_vars
+        x = np.arange(len(steps))
+
+        for vi, v in enumerate(variables):
+            offset = (vi - n_vars/2 + 0.5) * bar_width
+            ax2.bar(x + offset, v['marg_roi'], bar_width * 0.9,
+                   color=v['color'], alpha=0.75, label=v['label'],
+                   edgecolor='white', linewidth=0.5)
+
+        # Average line for main variable
+        main_marg = variables[0]['marg_roi']
+        avg_main = np.mean(main_marg[main_marg > 0]) if np.any(main_marg > 0) else 0
+        ax2.axhline(y=avg_main, color=variables[0]['color'], linestyle='--',
+                   linewidth=2.5, label=f'Promedio {variables[0]["label"]}: {avg_main:.1f}',
+                   alpha=0.7)
+
+        ax2.set_xlabel('Paso de Optimización (Tanque)', fontsize=11, fontweight='bold', labelpad=10)
+        ax2.set_ylabel('ROI Marginal\n(% red./$1M)', fontsize=11, fontweight='bold', labelpad=10)
+        ax2.set_title('ROI Marginal por Paso — Multi-Variable',
+                     fontsize=13, fontweight='bold', pad=15)
+        ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: f'{x:.1f}'))
         ax2.tick_params(axis='both', labelsize=10)
         ax2.grid(True, linestyle='--', color='#aaaaaa', alpha=0.5, axis='y', linewidth=1)
         ax2.set_axisbelow(True)
-        ax2.set_xticks(steps)
+        ax2.set_xticks(x)
         ax2.set_xticklabels([f'p{s}' for s in steps], fontsize=9, fontweight='bold')
-        
-        # Find best and worst
-        best_step_idx = np.argmax(marginal_roi)
-        worst_step_idx = np.argmin(marginal_roi[marginal_roi > 0]) if np.any(marginal_roi > 0) else 0
-        
-        # summary2 = (
-        #     f"MEJOR:  Paso {steps[best_step_idx]}\n"
-        #     f"  → {marginal_roi[best_step_idx]:,.0f} m³/$1M\n\n"
-        #     f"PEOR:   Paso {steps[worst_step_idx]}\n"
-        #     f"  → {marginal_roi[worst_step_idx]:,.0f} m³/$1M"
-        # )
-        #
-        # ax2.text(0.98, 0.97, summary2, transform=ax2.transAxes, fontsize=15,
-        #         verticalalignment='top', horizontalalignment='right',
-        #         bbox=dict(boxstyle='round,pad=0.8', facecolor='#fffacd',
-        #                  alpha=0.95, edgecolor='#daa520', linewidth=3),
-        #         fontfamily='monospace', fontweight='bold')
-        
-        ax2.legend(loc='upper left', fontsize=10, framealpha=0.95,
-                   edgecolor='black', fancybox=True)
-        
-        # Set y-axis limits with padding
-        y_max2 = marginal_roi.max() * 1.15
-        ax2.set_ylim(0, y_max2)
-        
+        ax2.legend(loc='upper right', fontsize=9, framealpha=0.95,
+                  edgecolor='black', fancybox=True, ncol=2)
+
         plt.tight_layout()
-        
+
         save_path = self._get_next_figure_path("roi_curve")
-        fig.savefig(save_path, bbox_inches='tight', dpi=120)
+        fig.savefig(save_path, bbox_inches='tight', dpi=150)
         plt.close(fig)
         print(f"  [Dashboard] Saved: {save_path}")
+
+    def plot_individual_roi_curves(self):
+        """
+        Generates individual ROI curves for each hydraulic indicator.
+        Format: Top = Cumulative ROI, Bottom = Marginal ROI.
+        """
+        if len(self.df) < 1:
+            return
+
+        steps = self.df['step'].values
+        cost_total = self.df['cost_investment_total'].values
+        cost_in_millions = cost_total / 1_000_000
+        marginal_cost_M = np.diff(cost_total, prepend=0) / 1_000_000
+
+        var_defs = [
+            ('flooding_volume', 'Volumen de Inundacion', 'm³'),
+            ('flooding_flow', 'Caudal de Inundacion', 'm³/s'),
+            ('outfall_peak_flow', 'Caudal Pico Outfall', 'm³/s'),
+            ('flooded_nodes_count', 'Nodos Inundados', 'nodos'),
+            ('surcharged_links_count', 'Links Sobrecargados', 'links'),
+            ('system_mean_utilization', 'Utilizacion de Red', '%'),
+        ]
+
+        for col, label, unit in var_defs:
+            if col not in self.df.columns:
+                continue
+                
+            vals = self.df[col].values.astype(float)
+            baseline = vals[0]
+            if baseline <= 0:
+                continue
+                
+            # Reduction in native units
+            reduction = baseline - vals
+            
+            # Cumulative ROI: native units reduced / $1M invested
+            with np.errstate(divide='ignore', invalid='ignore'):
+                cum_roi = np.where(cost_in_millions > 0, reduction / cost_in_millions, 0)
+                
+            # Marginal ROI: marginal reduction / marginal $1M
+            marginal_reduction = np.diff(reduction, prepend=0)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                marg_roi = np.where(marginal_cost_M > 0, marginal_reduction / marginal_cost_M, 0)
+            
+            # Formatter logic depending on magnitude
+            if np.max(cum_roi) >= 1000:
+                fmt_fn = lambda x: f'{x:,.0f}'
+            elif np.max(cum_roi) >= 10:
+                fmt_fn = lambda x: f'{x:,.1f}'
+            else:
+                fmt_fn = lambda x: f'{x:,.2f}'
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 10), gridspec_kw={'height_ratios': [1, 1]})
+            
+            # 1. TOP PLOT
+            best_roi_idx = np.argmax(cum_roi)
+            
+            ax1.plot(steps, cum_roi, 'o-', color='#1976d2', linewidth=4,
+                            markersize=14, markeredgecolor='#0d47a1', markeredgewidth=2,
+                            label='ROI Acumulado')
+            ax1.fill_between(steps, 0, cum_roi, alpha=0.25, color='#64b5f6')
+            
+            # Value labels on top plot
+            for i, (step, r) in enumerate(zip(steps, cum_roi)):
+                if r > 0.001:
+                    ax1.annotate(fmt_fn(r), xy=(step, r), xytext=(0, 16),
+                                textcoords='offset points', ha='center', va='bottom',
+                                fontsize=14, fontweight='bold', color='#0d47a1',
+                                rotation=90,
+                                bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                                         alpha=0.9, edgecolor='#1976d2', linewidth=1))
+
+            ax1.axvline(x=steps[best_roi_idx], color='#2e7d32', linestyle=':',
+                        linewidth=3, alpha=0.8, label=f'Mejor ROI: Paso {steps[best_roi_idx]}')
+            ax1.scatter(steps[best_roi_idx], cum_roi[best_roi_idx], s=400, color='#4caf50',
+                        edgecolor='#1b5e20', linewidth=3, zorder=10, marker='*')
+                        
+            ax1.set_ylabel(f'Reduccion [{unit}/$1M]', fontsize=16, fontweight='bold', labelpad=10)
+            ax1.set_title(f'Retorno de Inversion (ROI) ACUMULADO : {label}',
+                          fontsize=18, fontweight='bold', pad=15)
+            ax1.yaxis.set_major_formatter(FuncFormatter(lambda x, p: fmt_fn(x)))
+            ax1.tick_params(axis='both', labelsize=14)
+            ax1.grid(True, linestyle='--', color='#aaaaaa', alpha=0.5, linewidth=1.5)
+            ax1.set_axisbelow(True)
+            ax1.set_xticks(steps)
+            ax1.set_xticklabels([])
+            
+            ax1.legend(loc='upper right', fontsize=14, framealpha=0.95, edgecolor='black', fancybox=True)
+            ax1.set_ylim(0, np.max(cum_roi) * 1.25)
+            
+            # 2. BOTTOM PLOT
+            valid_marg = marg_roi[marg_roi > 0]
+            avg_marg = np.mean(valid_marg) if len(valid_marg) > 0 else 0
+            median_marg = np.median(valid_marg) if len(valid_marg) > 0 else 0
+            
+            colors = ['#2e7d32' if mr >= median_marg else '#d32f2f' for mr in marg_roi]
+            bars = ax2.bar(steps, marg_roi, color=colors, alpha=0.85,
+                           edgecolor='black', linewidth=1.5, width=0.7)
+                           
+            ax2.axhline(y=avg_marg, color='#ff9800', linestyle='--', linewidth=3,
+                        label=f'Promedio: {fmt_fn(avg_marg)}', alpha=0.9)
+                        
+            for bar, mr in zip(bars, marg_roi):
+                if mr > 0.001:
+                    ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + np.max(marg_roi)*0.02,
+                            fmt_fn(mr), ha='center', va='bottom',
+                            fontsize=12, fontweight='bold', color='black',
+                            rotation=90,
+                            bbox=dict(boxstyle='round,pad=0.1', facecolor='white', alpha=0.8))
+
+            ax2.set_xlabel('Numero de Paso (Tanque)', fontsize=16, fontweight='bold', labelpad=10)
+            ax2.set_ylabel(f'ROI de Este Paso\n[{unit}/$1M]', fontsize=16, fontweight='bold', labelpad=10)
+            ax2.set_title(f'ROI Marginal : {label}', fontsize=18, fontweight='bold', pad=15)
+            ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, p: fmt_fn(x)))
+            ax2.tick_params(axis='both', labelsize=14)
+            ax2.grid(True, linestyle='--', color='#aaaaaa', alpha=0.5, axis='y', linewidth=1)
+            ax2.set_axisbelow(True)
+            ax2.set_xticks(steps)
+            ax2.set_xticklabels([f'p{s}' for s in steps], fontsize=13, fontweight='bold')
+            ax2.legend(loc='upper right', fontsize=14, framealpha=0.95, edgecolor='black', fancybox=True)
+            
+            max_marg = np.max(marg_roi) if np.max(marg_roi) > 0 else 1
+            ax2.set_ylim(0, max_marg * 1.25)
+            
+            plt.tight_layout()
+            
+            safe_name = col.replace('_', '-')
+            save_path = self._get_next_figure_path(f"roi_curve_{safe_name}")
+            fig.savefig(save_path, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+            print(f"  [Dashboard] Saved: {save_path}")
 
     def plot_pareto_curves(self):
         """
@@ -979,24 +1074,25 @@ class EvolutionDashboardGenerator:
             ('outfall_peak_flow', 'Caudal Pico en Outfall', 'm³/s', True),
             ('surcharged_links_count', 'Links Sobre-cargados', 'links', True),
             ('flooding_flow', 'Caudal de Inundacion', 'm³/s', True),
+            ('system_mean_utilization', 'Utilizacion Red', '%', True),
         ]
         
         # Calcular eficiencia marginal para colorear puntos
         self.df['_marginal_eff'] = self.df['marginal_reduction'] / (self.df['_marginal_cost'] / 1e6 + 1e-10)
         median_eff = self.df['_marginal_eff'].median()
         
-        # Crear figura con subplots 2x3
+        # Crear figura con subplots 3x2
         n_vars = len(variables)
-        n_rows = 2
-        n_cols = 3
+        n_rows = 3
+        n_cols = 2
         
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 14))  # Más grande para mejor legibilidad
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 20))  # Vertical (14 de ancho, 24 de alto)
         axes = axes.flatten()
         
         # Titulo general
         fig.suptitle('Curvas Pareto: Inversion vs Indicadores Hidraulicos\n' + 
                     'Color = eficiencia marginal (Verde = sobre mediana | Rojo = bajo)',
-                    fontsize=12, fontweight='bold', y=0.98)
+                    fontsize=16, fontweight='bold', y=0.98)
         
         for idx, (col, title, unit, inverse) in enumerate(variables):
             if col not in self.df.columns:
@@ -1045,10 +1141,10 @@ class EvolutionDashboardGenerator:
                     return f'{val:.2f}'
             
             # Punto 0 (inicio) - grande con valor numérico
-            ax.scatter(x[0], y[0], s=200, c='darkblue', edgecolors='white', linewidth=2.5, zorder=5, marker='o')
+            ax.scatter(x[0], y[0], s=250, c='darkblue', edgecolors='white', linewidth=2.5, zorder=5, marker='o')
             val_0 = format_val(y[0], unit)
             ax.annotate(f'p0: {val_0}', (x[0], y[0]), textcoords="offset points", 
-                       xytext=(-25, 20), ha='center', fontsize=10, color='darkblue', fontweight='bold',
+                       xytext=(-30, 25), ha='center', fontsize=12, color='darkblue', fontweight='bold',
                        arrowprops=dict(arrowstyle='->', color='darkblue', alpha=0.7, lw=1.5),
                        bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', alpha=0.95, edgecolor='darkblue', linewidth=1.5))
             
@@ -1059,28 +1155,28 @@ class EvolutionDashboardGenerator:
                 idx = find_nearest_idx(step_num)
                 if idx is not None and idx != 0 and idx != len(steps)-1:
                     color = colors_intermediate[i % len(colors_intermediate)]
-                    ax.scatter(x[idx], y[idx], s=120, c=color, edgecolors='white', linewidth=2, zorder=4)
+                    ax.scatter(x[idx], y[idx], s=150, c=color, edgecolors='white', linewidth=2, zorder=4)
                     val = format_val(y[idx], unit)
                     # Offset alternado para evitar solapamiento
-                    offset_x = 22 if i % 2 == 0 else -22
-                    offset_y = 18 if i < 2 else -18
+                    offset_x = 25 if i % 2 == 0 else -25
+                    offset_y = 22 if i < 2 else -22
                     ax.annotate(f'p{int(steps[idx])}:\n{val}', (x[idx], y[idx]), textcoords="offset points", 
-                               xytext=(offset_x, offset_y), ha='center', fontsize=9, color=color, fontweight='bold',
+                               xytext=(offset_x, offset_y), ha='center', fontsize=11, color=color, fontweight='bold',
                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.9, edgecolor=color, linewidth=1.5))
             
             # Punto final (último) - grande con valor numérico
-            ax.scatter(x[-1], y[-1], s=200, c='darkgreen', edgecolors='white', linewidth=2.5, zorder=5, marker='o')
+            ax.scatter(x[-1], y[-1], s=250, c='darkgreen', edgecolors='white', linewidth=2.5, zorder=5, marker='o')
             val_f = format_val(y[-1], unit)
             ax.annotate(f'p{int(steps[-1])}: {val_f}', (x[-1], y[-1]), textcoords="offset points", 
-                       xytext=(30, -20), ha='center', fontsize=10, color='darkgreen', fontweight='bold',
+                       xytext=(35, -25), ha='center', fontsize=12, color='darkgreen', fontweight='bold',
                        arrowprops=dict(arrowstyle='->', color='darkgreen', alpha=0.7, lw=1.5),
                        bbox=dict(boxstyle='round,pad=0.4', facecolor='lightgreen', alpha=0.95, edgecolor='darkgreen', linewidth=1.5))
             
             # Linea de mediana del valor
             median_y = np.median(y)
-            ax.axhline(y=median_y, color='blue', linestyle=':', alpha=0.5, linewidth=1)
+            ax.axhline(y=median_y, color='blue', linestyle=':', alpha=0.5, linewidth=1.5)
             ax.text(x.max()*0.98, median_y, f'Med: {median_y:.0f}', 
-                   ha='right', va='bottom', fontsize=7, color='blue', alpha=0.7)
+                   ha='right', va='bottom', fontsize=10, color='blue', alpha=0.7)
             
             # Eje Y secundario con porcentaje de cambio
             ax2 = ax.twinx()
@@ -1090,13 +1186,14 @@ class EvolutionDashboardGenerator:
             pct_min = ((y_min - baseline_val) / baseline_val) * 100
             pct_max = ((y_max - baseline_val) / baseline_val) * 100
             ax2.set_ylim(pct_min, pct_max)
-            ax2.set_ylabel('% Cambio', fontsize=8, color='gray', alpha=0.7)
-            ax2.tick_params(axis='y', labelcolor='gray', labelsize=7)
+            ax2.set_ylabel('% Cambio', fontsize=11, color='gray', alpha=0.8)
+            ax2.tick_params(axis='y', labelcolor='gray', labelsize=10)
             
             # Configuracion del subplot principal
-            ax.set_xlabel('Inversion (M$)', fontsize=9)
-            ax.set_ylabel(f'{title}\n({unit})', fontsize=9)
-            ax.set_title(f'{title}', fontsize=10, fontweight='bold')
+            ax.set_xlabel('Inversion (M$)', fontsize=12, fontweight='bold')
+            ax.set_ylabel(f'{title}\n({unit})', fontsize=12, fontweight='bold')
+            ax.set_title(f'{title}', fontsize=14, fontweight='bold')
+            ax.tick_params(axis='both', labelsize=11)
             ax.grid(True, alpha=0.3)
             
             # Leyenda de eficiencia
@@ -1105,14 +1202,14 @@ class EvolutionDashboardGenerator:
                 Patch(facecolor='#2e7d32', label=f'Eff. >= mediana'),
                 Patch(facecolor='#c62828', label=f'Eff. < mediana'),
             ]
-            ax.legend(handles=legend_elements, loc='best', fontsize=7)
+            ax.legend(handles=legend_elements, loc='best', fontsize=10)
         
         # Ocultar subplot vacio si hay
         if n_vars < len(axes):
             for idx in range(n_vars, len(axes)):
                 axes[idx].axis('off')
         
-        plt.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
+        plt.tight_layout(rect=[0.02, 0.02, 0.98, 0.95])
         
         save_path = self._get_next_figure_path("pareto_curves")
         fig.savefig(save_path, bbox_inches='tight', dpi=150)
@@ -1489,6 +1586,7 @@ class EvolutionDashboardGenerator:
         ax_bar.set_xticks(x_pos)
         ax_bar.set_xticklabels([])  # Sin etiquetas en X (comparte con evo)
         ax_bar.set_xlabel('')
+        ax_bar.set_xlim(0.5, len(tank_groups) + 0.5)  # Alineado con evo
         ax_bar.set_ylabel('Reducción Flooding Flow (m³/s)', fontsize=15, fontweight='bold')
         ax_bar.set_title(f'Efecto en Flooding Flow por Tanque ({len(tank_groups)} Tanques)',
                      fontsize=16, fontweight='bold', pad=35)
