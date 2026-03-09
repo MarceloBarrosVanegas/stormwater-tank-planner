@@ -1,194 +1,213 @@
 # Stormwater Tank Planner
 
-Framework de optimización multi-objetivo para la planificación de tanques de tormenta en redes de alcantarillado urbano, con acoplamiento de modelos hidrodinámicos 1D (SWMM) y 2D (Itzi), y evaluación probabilística de riesgo mediante CLIMADA/JRC.
+Framework de optimización multi-objetivo para planificación de tanques de tormenta con modelación hidrodinámica 1D-2D acoplada.
 
 ---
 
-## Resumen Ejecutivo
+## 1. Marco Teórico y Ecuaciones
 
-Este proyecto implementa una metodología de optimización anidada para determinar la ubicación, número y volumen óptimos de tanques de tormenta en el subsistema de alcantarillado El Colegio Occidental (Quito). El sistema acopla:
+### 1.1 Modelo 1D: Ecuaciones de Saint-Venant (SWMM)
 
-- **Modelo 1D**: SWMM 5.2 con ecuaciones de Saint-Venant en onda dinámica para la red de alcantarillado
-- **Modelo 2D**: Itzi con Shallow Water Equations en aproximación de onda difusiva para inundación superficial
-- **Optimización**: Esquema de tres niveles (NSGA-II + Greedy Secuencial + Evaluación iterativa)
-- **Evaluación de riesgo**: Curvas de vulnerabilidad JRC/CLIMADA para cálculo de Daño Anual Esperado (EAD)
-
----
-
-## Descripción del Área de Estudio
-
-El subsistema El Colegio Occidental está ubicado en los sectores centro norte y norte de Quito, en las laderas occidentales del Pichincha. La cuenca comprende:
-
-| Subcuenca | Área (Ha) | Descripción |
-|-----------|-----------|-------------|
-| Cuenca urbana principal | 1,683 | Área principal del sistema |
-| Quebrada Rumihurco | 942 | Tributaria occidental |
-| Quebrada San Lorenzo | 457 | Tributaria oriental |
-| Quebrada San Antonio | 220 | Tributaria norte |
-| Quebrada San Carlos | 209 | Tributaria sur |
-
-La red principal alivia los colectores San Carlos, Atucucho, Flavio Alfaro, El Colegio, Sabanilla y San Lorenzo, descargando hacia el río Monjas con un caudal pico estimado de 69.41 m³/s para un período de retorno de 25 años.
-
----
-
-## Arquitectura de Optimización
-
-El sistema implementa un esquema anidado de tres niveles para evitar rankings estáticos: la idoneidad de un tanque depende del estado del sistema, que cambia tras cada intervención.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         ARQUITECTURA DE OPTIMIZACIÓN                             │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  NIVEL 1: META-OPTIMIZACIÓN (NSGA-II)                                           │
-│  ─────────────────────────────────────                                          │
-│  Optimiza los pesos w que gobiernan la función de priorización:                 │
-│                                                                                  │
-│      w = [w_flow_over_capacity, w_flow_node_flooding, w_vol_node_flooding,      │
-│            w_outfall_peak_flow, w_failure_probability]                          │
-│                                                                                  │
-│  Restricciones: Σw_k = 1, w_k ≥ 0                                               │
-│                                                                                  │
-│  Vector de objetivos F(w):                                                      │
-│  • ΔV_flood (%) ↑        Reducción de volumen de inundación                     │
-│  • ΔQ_flood (%) ↑        Reducción de caudal de desbordamiento                  │
-│  • ΔQ_outfall (%) ↑      Reducción de caudal pico en outfalls                   │
-│  • H_network ↓           Minimización de h/D en conductos                       │
-│  • C_social (USD) ↓      Costo social neto                                      │
-│                                                                                  │
-│           ↓ Cada individuo (configuración de pesos)                             │
-│                                                                                  │
-│  NIVEL 2: SELECCIÓN SECUENCIAL (Greedy)                                         │
-│  ──────────────────────────────────────                                         │
-│  Construye solución incremental de tanques:                                     │
-│                                                                                  │
-│  while criterio de parada no alcanzado:                                         │
-│      1. Calcular ranking de nodos según pesos w                                 │
-│      2. Seleccionar nodo de mayor puntaje                                       │
-│      3. Encontrar predio óptimo (radio de búsqueda)                             │
-│      4. Diseñar tubería de conexión (Dijkstra sobre OSM)                        │
-│      5. Dimensionar derivación (régimen permanente)                             │
-│      6. Ejecutar simulación 1D-2D iterativa                                     │
-│      7. Extraer métricas (costos, volúmenes, caudales)                          │
-│      8. Actualizar ranking con métricas recalculadas                            │
-│                                                                                  │
-│           ↓ Retorna objetivos F(w) al Nivel 1                                   │
-│                                                                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Componentes del Pipeline de Evaluación (Nivel 2)
-
-Para cada tanque candidato, el sistema ejecuta:
-
-1. **PathFinder** (`rut_00_path_finder.py`): Algoritmo de Dijkstra sobre grafo de OpenStreetMap ponderado por:
-   - Longitud geométrica
-   - Penalización por desnivel adverso (flujo gravitacional)
-   - Factor de ajuste según tipo de vía
-
-2. **SewerPipeline** (`rut_03_run_sewer_design.py`): Dimensionamiento hidráulico en régimen permanente considerando:
-   - Velocidad mínima de auto-limpieza
-   - Velocidad máxima para protección del conducto
-   - Capacidad máxima h/D especificada
-
-3. **SWMM Modifier** (`rut_14_swmm_modifier.py`): Actualización del modelo con:
-   - Nuevo nodo de tanque
-   - Conexión de derivación
-   - Volumen de almacenamiento
-   - Cota de vertedero
-
-4. **Simulación 1D-2D** (`rut_18_itzi_flood_model.py`): Ejecución acoplada SWMM-Itzi
-
-5. **Extracción de métricas** (`rut_27_model_metrics.py`): Cálculo de indicadores de desempeño
-
----
-
-## Modelación Hidrodinámica Acoplada 1D-2D
-
-### Modelo 1D: Red de Alcantarillado (SWMM)
-
-Resuelve las ecuaciones completas de Saint-Venant (onda dinámica) para flujo transitorio:
+El modelo unidimensional resuelve las ecuaciones completas de Saint-Venant en régimen transitorio (onda dinámica):
 
 **Conservación de masa:**
-```
-∂A/∂t + ∂Q/∂x = q_ℓ
-```
+$$
+\frac{\partial A}{\partial t} + \frac{\partial Q}{\partial x} = q_\ell
+$$
 
 **Conservación de momento:**
-```
-∂Q/∂t + ∂(Q²/A)/∂x + gA·∂H/∂x + gA·S_f + gA·S_m = 0
-```
+$$
+\frac{\partial Q}{\partial t} + \frac{\partial}{\partial x}\left(\frac{Q^2}{A}\right) + gA\frac{\partial H}{\partial x} + gA S_f + gA S_m = 0
+$$
 
 Donde:
-- Q = caudal (m³/s)
-- A = área hidráulica (m²)
-- H = z + y = carga hidráulica (m)
-- S_f = n²Q|Q| / (A²R_h^(4/3)) = pendiente de fricción (Manning)
-- S_m = pérdidas locales
+- $Q$ = caudal $(m^3/s)$
+- $A$ = área hidráulica $(m^2)$  
+- $H = z + y$ = carga hidráulica (elevación de fondo $z$ + tirante $y$) $(m)$
+- $q_\ell$ = aportes distribuidos $(m^2/s)$
+- $g$ = gravedad $(m/s^2)$
 
-Permite representar remanso, inversión de flujo y transiciones entre régimen libre y presurizado.
+**Pendiente de fricción (Manning):**
+$$
+S_f = \frac{n^2 Q|Q|}{A^2 R_h^{4/3}}
+$$
 
-### Modelo 2D: Escorrentía Superficial (Itzi)
-
-Resuelve las Shallow Water Equations en aproximación de onda difusiva (esquema de inercia parcial):
-
-**Conservación de masa:**
-```
-∂h/∂t + ∂(uh)/∂x + ∂(vh)/∂y = R - I + q_exc
-```
-
-**Conservación de momento (balance gravitación-fricción):**
-```
-∂(z+h)/∂x + S_f,x = 0
-∂(z+h)/∂y + S_f,y = 0
-```
-
-Donde:
-- h = profundidad de agua (m)
-- (u,v) = velocidades promedio en profundidad (m/s)
-- R, I = tasas de precipitación e infiltración (m/s)
-- q_exc = término de intercambio 1D-2D
-
-### Acoplamiento Bidireccional
-
-El intercambio en pozos de inspección se calcula mediante relación tipo orificio:
-
-```
-Q_exc,i = C_d · A_mh,i · √(2g|ΔH_i|) · sgn(ΔH_i)
-```
-
-Donde:
-- ΔH_i = H_1D,i - H_2D,i = diferencia de carga
-- C_d = coeficiente de descarga
-- A_mh,i = área hidráulica efectiva del pozo
-
-**Condiciones de intercambio:**
-- Si H_1D > H_2D y H_1D > z_i: surgencia (red → superficie)
-- Si H_2D > H_1D y H_2D > z_i: drenaje (superficie → red)
+Con $n$ = coeficiente de Manning y $R_h$ = radio hidráulico.
 
 ---
 
-## Evaluación Probabilística del Riesgo
+### 1.2 Modelo 2D: Shallow Water Equations (Itzi)
 
-### Generación de Escenarios de Amenaza
+El flujo superficial se formula con las ecuaciones de aguas someras en aproximación de onda difusiva:
 
-Para cada período de retorno T_r ∈ {1, 2, 5, 10, 25, 50, 100} años:
+**Conservación de masa:**
+$$
+\frac{\partial h}{\partial t} + \frac{\partial (uh)}{\partial x} + \frac{\partial (vh)}{\partial y} = R - I + q_{exc}
+$$
 
-1. **Ecuación IDF**: Intensidad-Duración-Frecuencia calibrada para Quito
-2. **Método de Bloques Alternos**: Distribución temporal del hietograma
-   - Duración: 60 minutos
-   - Paso temporal: 5 minutos (12 bloques)
-   - Bloque de mayor intensidad centrado
+**Conservación de momento (simplificación de onda difusiva):**
+$$
+\frac{\partial (z+h)}{\partial x} + S_{f,x} = 0, \quad \frac{\partial (z+h)}{\partial y} + S_{f,y} = 0
+$$
 
-### Funciones de Vulnerabilidad (JRC/CLIMADA)
+Donde:
+- $h$ = profundidad de agua $(m)$
+- $(u,v)$ = velocidades promedio en profundidad $(m/s)$
+- $R, I$ = tasas de precipitación e infiltración $(m/s)$
+- $q_{exc}$ = término de intercambio 1D-2D
 
-El daño a edificaciones se cuantifica mediante la Relación Media de Daño (MDR):
+**Fricción de fondo (Manning):**
+$$
+S_{f,x} = \frac{n^2 u \sqrt{u^2+v^2}}{h^{4/3}}, \quad S_{f,y} = \frac{n^2 v \sqrt{u^2+v^2}}{h^{4/3}}
+$$
+
+---
+
+### 1.3 Acoplamiento Bidireccional 1D-2D
+
+El intercambio en pozos de inspección se modela mediante relación tipo orificio:
+
+$$
+Q_{exc,i} = C_d A_{mh,i} \sqrt{2g|\Delta H_i|} \cdot \text{sgn}(\Delta H_i)
+$$
+
+Donde:
+- $\Delta H_i = H_{1D,i} - H_{2D,i}$ = diferencia de carga
+- $H_{2D,i} = z_i + h_i$ = carga superficial
+- $C_d$ = coeficiente de descarga
+- $A_{mh,i}$ = área hidráulica efectiva del pozo
+
+**Mecanismos de intercambio:**
+- **Surgencia**: cuando $H_{1D,i} > z_i$ y $\Delta H_i > 0$ (red → superficie)
+- **Drenaje**: cuando $H_{2D,i} > z_i$ y $\Delta H_i < 0$ (superficie → red)
+
+---
+
+## 2. Metodología de Optimización
+
+### 2.1 Arquitectura de Tres Niveles
+
+La metodología implementa un esquema de optimización anidada:
 
 ```
-MDR_s(h): [0, ∞) → [0, 1]
+NIVEL 1: META-OPTIMIZACIÓN (NSGA-II)
+─────────────────────────────────────
+Optimiza el vector de pesos w que parametriza la función de priorización:
+
+     w = [w_flow_over_capacity
+          w_flow_node_flooding
+          w_vol_node_flooding
+          w_outfall_peak_flow
+          w_failure_probability]
+
+Restricciones: Σw_k = 1,  w_k ≥ 0
+
+         ↓ Cada individuo w ejecuta completamente el Nivel 2
+
+NIVEL 2: SELECCIÓN SECUENCIAL (Greedy)
+──────────────────────────────────────
+Construye solución incremental de tanques:
+
+FOR cada iteración:
+    1. Calcular ranking de nodos según w
+    2. Seleccionar nodo de mayor puntaje
+    3. Encontrar predio óptimo (radio de búsqueda)
+    4. Diseñar tubería (algoritmo de Dijkstra sobre OSM)
+    5. Dimensionar derivación (régimen permanente)
+    6. Ejecutar simulación 1D-2D iterativa
+    7. Extraer métricas (costos, volúmenes, caudales)
+    8. Actualizar ranking con métricas recalculadas
+END
+
+         ↓ Retorna vector de objetivos F(w)
+
+NIVEL 0: LÍNEA BASE
+───────────────────
+Simulación sin tanques para múltiples períodos de retorno
+Cálculo del EAD base
 ```
 
-Donde s indica el sector económico:
+---
+
+### 2.2 Vector de Objetivos
+
+Para cada configuración de pesos $\mathbf{w}$, el desempeño se cuantifica mediante:
+
+$$
+\mathbf{F}(\mathbf{w}) =
+\begin{bmatrix}
+\Delta V_{\text{flood}} \;(\%) \; \uparrow \\[0.3em]
+\Delta Q_{\text{flood}} \;(\%) \; \uparrow \\[0.3em]
+\Delta Q_{\text{outfall}} \;(\%) \; \uparrow \\[0.3em]
+H_{\text{network}} \; \downarrow \\[0.3em]
+C_{\text{social}} \;(\mathrm{USD}) \; \downarrow
+\end{bmatrix}
+$$
+
+Donde:
+- $\Delta V_{\text{flood}}$ = reducción porcentual de volumen de inundación
+- $\Delta Q_{\text{flood}}$ = reducción porcentual de caudal de desbordamiento
+- $\Delta Q_{\text{outfall}}$ = reducción porcentual de caudal pico en outfalls
+- $H_{\text{network}}$ = indicador agregado del estado hidráulico de la red (h/D)
+- $C_{\text{social}}$ = costo social neto = inversión - beneficios por daños evitados
+
+Los símbolos $\uparrow$ y $\downarrow$ indican maximización y minimización respectivamente.
+
+---
+
+### 2.3 Pipeline de Evaluación por Tanque
+
+Para cada tanque candidato, el sistema ejecuta secuencialmente:
+
+1. **PathFinder** (`rut_00`): Algoritmo de Dijkstra sobre grafo de OpenStreetMap
+   - Función de peso: $f(e) = \alpha \cdot L + \beta \cdot \Delta z + \gamma \cdot T_{via}$
+   
+2. **SewerPipeline** (`rut_03`): Dimensionamiento hidráulico
+   - Velocidad de auto-limpieza: $V_{min}$
+   - Velocidad máxima: $V_{max}$
+   - Capacidad máxima: $(h/D)_{max}$
+
+3. **SWMM Modifier** (`rut_14`): Actualización del modelo
+   - Nodo de tanque con carga hidráulica $H_{tank}$
+   - Conexión de derivación con caudal de diseño $Q_{deriv}$
+   - Volumen de almacenamiento $V_{stored}$
+
+4. **Simulación 1D-2D** (`rut_18`): Acoplamiento SWMM-Itzi
+
+5. **Extracción de métricas** (`rut_27`): Indicadores de desempeño
+
+---
+
+## 3. Evaluación Probabilística del Riesgo
+
+### 3.1 Generación de Escenarios
+
+Para cada período de retorno $T_r \in \{1, 2, 5, 10, 25, 50, 100\}$ años:
+
+**Ecuación IDF** (Intensidad-Duración-Frecuencia):
+$$
+I(t, T_r) = \frac{a \cdot \ln(T_r) + b}{(c + t)^d}
+$$
+
+**Método de Bloques Alternos** (*Alternating Block Method*):
+- Duración total: 60 minutos
+- Paso temporal: $\Delta t = 5$ minutos (12 bloques)
+- Bloque de mayor intensidad centrado en el hietograma
+- Bloques restantes distribuidos simétricamente alternados
+
+### 3.2 Funciones de Vulnerabilidad
+
+La cuantificación del daño utiliza curvas del Joint Research Centre (JRC) implementadas en CLIMADA. La **Relación Media de Daño (MDR)** se define como:
+
+$$
+\text{MDR}_s(h): \mathbb{R}_{\geq 0} \rightarrow [0, 1]
+$$
+
+Donde:
+- $h$ = profundidad de inundación $(m)$
+- $s$ = sector económico (residencial, comercial, industrial, infraestructura, agricultura)
+
+**Sectores y curvas:**
 
 | Sector | Curva | Origen |
 |--------|-------|--------|
@@ -198,108 +217,79 @@ Donde s indica el sector económico:
 | Infraestructura | Derivada | Metodología JRC/FEMA |
 | Agricultura | Derivada | Metodología JRC/FAO |
 
-### Cálculo del Daño por Evento
+### 3.3 Cálculo del Daño por Evento
 
-Para un período de retorno T_r:
+Para un período de retorno $T_r$:
 
-```
-D_edif(T_r) = Σ_i∈P(T_r) V_i · MDR_s_i(h_i)
-```
+$$
+D_{\text{edif}}(T_r) = \sum_{i \in \mathcal{P}(T_r)} V_i \cdot \text{MDR}_{s_i}(h_i)
+$$
 
 Donde:
-- V_i = valor de construcción del predio i (excluye terreno)
-- h_i = profundidad de inundación extraída del ráster ITZI
-- s_i = sector económico del predio
+- $V_i$ = valor de construcción del predio $i$ (excluye terreno)
+- $h_i$ = profundidad de inundación extraída del ráster ITZI
+- $s_i$ = sector económico del predio
+- $\mathcal{P}(T_r)$ = conjunto de predios expuestos
 
-### Daño Anual Esperado (EAD)
+### 3.4 Daño Anual Esperado (EAD)
 
-Integración probabilística sobre todos los períodos de retorno:
+El riesgo acumulado se cuantifica mediante integración probabilística:
 
-```
-EAD = ∫ D(T_r) · f(T_r) dT_r
-```
+$$
+\text{EAD} = \int_{T_{min}}^{T_{max}} D(T_r) \cdot f(T_r) \, dT_r
+$$
 
 Aproximado numéricamente mediante integración trapezoidal sobre los escenarios discretos.
 
 ---
 
-## Estructura del Código
+## 4. Implementación
 
-### Módulos de Optimización
+### 4.1 Estructura del Código
+
+**Optimización:**
 - `rut_10_run_tanque_tormenta.py` - Orquestador principal
 - `rut_15_optimizer.py` - Greedy y NSGA-II
-- `rut_16_dynamic_evaluator.py` - Evaluador dinámico de soluciones
+- `rut_16_dynamic_evaluator.py` - Pipeline de evaluación
 - `rut_23_nsga_optimizer.py` - NSGA-II para selección de tanques
-- `rut_29_nsga_ranking_optimizer.py` - NSGA-II para pesos de ranking
+- `rut_29_nsga_ranking_optimizer.py` - NSGA-II para pesos $\mathbf{w}$
 
-### Módulos de Modelado Hidráulico
+**Modelación Hidráulica:**
 - `rut_00_path_finder.py` - Enrutamiento Dijkstra sobre OSM
 - `rut_02_get_flodded_nodes.py` - Identificación de nodos críticos
-- `rut_03_run_sewer_design.py` - Diseño hidráulico de tuberías
+- `rut_03_run_sewer_design.py` - Diseño hidráulico
 - `rut_06_pipe_sizing.py` - Cálculos de capacidad
-- `rut_27_model_metrics.py` - Extracción de métricas SWMM
+- `rut_27_model_metrics.py` - Extracción de métricas
 
-### Módulos de Daños y Riesgo
-- `rut_18_itzi_flood_model.py` - Simulación 2D con Itzi
-- `rut_19_flood_damage_climada.py` - Evaluación CLIMADA/JRC
-- `rut_20_avoided_costs.py` - Costos de reposición diferida
+**Daños y Riesgo:**
+- `rut_18_itzi_flood_model.py` - Simulación 2D
+- `rut_19_flood_damage_climada.py` - CLIMADA/JRC
+- `rut_20_avoided_costs.py` - Costos diferidos
 - `rut_21_construction_cost.py` - Costos de construcción
 - `rut_21_risk_analysis.py` - Análisis probabilístico EAD
 - `rut_26_hydrological_impact.py` - Impacto en outfalls
 
-### Módulos de Utilidad
-- `rut_14_swmm_modifier.py` - Modificación de archivos SWMM
+**Utilidades:**
+- `rut_14_swmm_modifier.py` - Modificación SWMM
 - `rut_15_dashboard.py` - Reportes Excel
 - `rut_17_comparison_reporter.py` - Comparación de escenarios
 - `rut_22_scenario_generator.py` - Generación de escenarios TR
-- `rut_25_from_inp_to_vector.py` - Exportación a vectoriales
+- `rut_25_from_inp_to_vector.py` - Exportación vectorial
 - `rut_28_water_quality.py` - Análisis de TSS y DBO
 
-### Configuración
-- `config.py` - Parámetros globales
+### 4.2 Uso
 
----
-
-## Requisitos
-
-### Software
-- Python 3.10+
-- SWMM 5.2
-- GRASS GIS 8.4 (para Itzi)
-
-### Dependencias Principales
-```
-pyswmm>=2.0
-swmmio>=0.7
-pymoo>=0.6
-geopandas>=0.14
-rasterio>=1.3
-osmnx>=1.6
-climada>=4.0
-```
-
-### Datos de Entrada
-- Modelo SWMM (.inp)
-- DEM del terreno (.tif)
-- Catastro de predios (.gpkg)
-- Red vial OpenStreetMap
-
----
-
-## Uso
-
-### Ejemplo 1: Optimización Completa
+**Optimización completa (modo NSGA-II):**
 
 ```python
 from rut_10_run_tanque_tormenta import StormwaterOptimizationRunner
 import config
 
-# Configurar para análisis probabilístico
 config.TR_LIST = [1, 2, 5, 10, 25, 50, 100]
 
 runner = StormwaterOptimizationRunner(
     project_root=config.PROJECT_ROOT,
-    eval_id="ejemplo_probabilistico"
+    eval_id="analisis_probabilistico"
 )
 
 resultado = runner.run_sequential_analysis(
@@ -310,7 +300,7 @@ resultado = runner.run_sequential_analysis(
 )
 ```
 
-### Ejemplo 2: Análisis Rápido (Greedy)
+**Análisis rápido (modo Greedy):**
 
 ```python
 runner = StormwaterOptimizationRunner()
@@ -322,7 +312,7 @@ resultado = runner.run_sequential_analysis(
 )
 ```
 
-### Ejemplo 3: Meta-optimización de Pesos
+**Meta-optimización de pesos:**
 
 ```python
 from rut_29_nsga_ranking_optimizer import NSGARankingOptimizer
@@ -336,19 +326,18 @@ resultado = optimizer.optimize(
 )
 ```
 
----
+### 4.3 Configuración
 
-## Configuración Clave
-
-### Parámetros de Tanque
+**Parámetros de tanque (`config.py`):**
 ```python
 TANK_DEPTH_M = 15.0              # Profundidad (m)
 TANK_MIN_VOLUME_M3 = 1000.0      # Volumen mínimo (m³)
 TANK_MAX_VOLUME_M3 = 100000.0    # Volumen máximo (m³)
 MAX_TANKS = 30                   # Máximo número de tanques
+TANK_VOLUME_SAFETY_FACTOR = 1.05 # Factor de seguridad
 ```
 
-### Pesos de Priorización
+**Pesos de priorización:**
 ```python
 FLOODING_RANKING_WEIGHTS = {
     'flow_over_capacity': 0.5,    # Exceso de capacidad
@@ -359,7 +348,7 @@ FLOODING_RANKING_WEIGHTS = {
 }
 ```
 
-### NSGA-II
+**NSGA-II:**
 ```python
 NSGA_PARALLEL_WORKERS = 6        # Workers paralelos
 SWMM_THREADS = 1                 # Threads por simulación
@@ -369,38 +358,38 @@ POP_SIZE = 24                    # Tamaño de población
 
 ---
 
-## Resultados
+## 5. Resultados
 
 El sistema genera en `optimization_results/`:
 
 ```
 optimization_results/
 ├── nsga_evaluations/{id}/
-│   ├── best_solution/           # Mejor solución
+│   ├── best_solution/
 │   │   ├── modified.inp         # Modelo SWMM modificado
-│   │   ├── tanks.gpkg           # Ubicación de tanques
+│   │   ├── tanks.gpkg           # Ubicación y geometría de tanques
 │   │   └── report.xlsx          # Reporte detallado
 │   ├── pareto_front.csv         # Frente de Pareto
-│   └── evolution.png            # Convergencia
+│   └── evolution.png            # Gráfico de convergencia
 ├── sequential_analysis/
 │   ├── iteration_001/
 │   ├── iteration_002/
 │   └── ...
 └── itzi_results/
-    ├── max_water_depth.tif      # Profundidad máxima
+    ├── max_water_depth.tif      # Profundidad máxima de inundación
     └── flood_damage_results.gpkg # Daños por predio
 ```
 
 ### Métricas de Salida
 
-| Métrica | Descripción | Unidad |
+| Símbolo | Descripción | Unidad |
 |---------|-------------|--------|
-| ΔV_flood | Reducción de volumen inundado | m³ |
-| ΔV_flood_pct | Reducción porcentual | % |
-| ΔQ_flood | Reducción de caudal de desbordamiento | m³/s |
-| ΔQ_outfall | Reducción de caudal pico en outfall | m³/s |
-| H_network | Health promedio de la red (h/D) | 0-1 |
-| C_social | Costo social neto | USD |
+| $\Delta V_{\text{flood}}$ | Reducción de volumen inundado | m³ |
+| $\Delta V_{\text{flood}}^{\%}$ | Reducción porcentual | % |
+| $\Delta Q_{\text{flood}}$ | Reducción de caudal de desbordamiento | m³/s |
+| $\Delta Q_{\text{outfall}}$ | Reducción de caudal pico en outfall | m³/s |
+| $H_{\text{network}}$ | Health promedio de la red | 0-1 |
+| $C_{\text{social}}$ | Costo social neto | USD |
 | EAD | Daño Anual Esperado | USD/año |
 
 ---
@@ -413,11 +402,9 @@ optimization_results/
 
 3. Deb, K., Pratap, A., Agarwal, S., & Meyarivan, T. (2002). A Fast and Elitist Multiobjective Genetic Algorithm: NSGA-II. *IEEE Transactions on Evolutionary Computation*, 6(2), 182-197.
 
-4. Itzi. *Itzi - A 2D Flood Simulation Tool*. https://itzi.readthedocs.io/
+4. Aznar, B., & Barnadas, M. (2016). *Itzi (version 17.1) [software]*.
 
-5. Aznar, B., & Barnadas, M. (2016). *Itzi (version 17.1) [software]*.
-
-6. OpenStreetMap Contributors. *OpenStreetMap Data*. https://www.openstreetmap.org/
+5. OpenStreetMap Contributors. *OpenStreetMap Data*. https://www.openstreetmap.org/
 
 ---
 
