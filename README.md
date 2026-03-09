@@ -1,132 +1,87 @@
-# Stormwater Tank Planner 🌧️
+# Stormwater Tank Planner
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![SWMM](https://img.shields.io/badge/SWMM-5.2+-green.svg)](https://www.epa.gov/water-research/storm-water-management-model-swmm)
-[![GRASS GIS](https://img.shields.io/badge/GRASS%20GIS-8.4+-orange.svg)](https://grass.osgeo.org/)
-[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
-
-> **Sistema avanzado de optimización multi-objetivo para la planificación de tanques de tormenta en redes de alcantarillado urbano**
-
-Este proyecto implementa un framework completo para la planificación óptima de tanques de tormenta (stormwater detention tanks) utilizando modelado hidráulico SWMM, simulación 2D de inundaciones con Itzi, y algoritmos de optimización NSGA-II. El sistema permite minimizar costos de construcción mientras maximiza la reducción de daños por inundación.
+Framework para planificación de tanques de tormenta mediante optimización multi-objetivo acoplada a modelos hidráulicos SWMM e Itzi.
 
 ---
 
-## 📋 Tabla de Contenidos
+## Descripción
 
-- [Características Principales](#-características-principales)
-- [Arquitectura del Sistema](#-arquitectura-del-sistema)
-- [Requisitos](#-requisitos)
-- [Instalación](#-instalación)
-- [Uso](#-uso)
-- [Módulos Principales](#-módulos-principales)
-- [Configuración](#-configuración)
-- [Workflow de Optimización](#-workflow-de-optimización)
-- [Resultados](#-resultados)
-- [Contribución](#-contribución)
+Este proyecto implementa un sistema de optimización para la ubicación y dimensionamiento de tanques de tormenta en redes de alcantarillado urbano. El sistema acopla modelado hidráulico 1D (SWMM) y simulación de inundaciones 2D (Itzi) con algoritmos de optimización evolutiva (NSGA-II) para minimizar costos de construcción y maximizar la reducción de daños por inundación.
 
 ---
 
-## ✨ Características Principales
+## Tabla de Contenidos
 
-### 🎯 Optimización Multi-Objetivo
-- **NSGA-II Algorithm**: Optimización evolutiva con pymoo para balancear costos vs beneficios
-- **Modo Greedy**: Algoritmo voraz secuencial para análisis rápido de retornos decrecientes
-- **Optimización de Pesos**: Ajuste automático de pesos de ranking mediante NSGA-II (rut_29)
-
-### 🌊 Modelado Hidráulico Integrado
-- **SWMM 5.2+**: Modelado 1D de redes de alcantarillado
-- **Itzi 2D**: Simulación de inundaciones superficiales con GRASS GIS
-- **Análisis Probabilístico**: Cálculo de Daño Anual Esperado (EAD) con múltiples períodos de retorno
-
-### 💰 Evaluación Económica Completa
-- **Costos de Construcción**: Cálculo detallado de tuberías, tanques y terrenos (rut_21)
-- **Daños por Inundación**: Integración con CLIMADA y curvas JRC de daño-profundidad (rut_19)
-- **Análisis de Riesgo**: Evaluación probabilística con bootstrap y mapas de riesgo espacial (rut_21)
-- **Costos Evitados**: Cálculo de inversión diferida en reposición de tuberías (rut_20)
-
-### 🗺️ Análisis Espacial Avanzado
-- **PathFinder**: Enrutamiento óptimo sobre OpenStreetMap considerando elevación y distancia (rut_00)
-- **Diseño de Tuberías**: Dimensionamiento hidráulico automático con cálculo de capacidad (rut_03, rut_06)
-- **Selección de Predios**: Evaluación de predios candidatos con análisis de pendiente y capacidad
-
-### 📊 Visualización y Reportes
-- **Dashboard Interactivo**: Generación de reportes Excel con gráficos comparativos (rut_15)
-- **Mapas de Comparación**: Visualización espacial de escenarios base vs optimizados (rut_17)
-- **Curvas de Daño**: Gráficos de vulnerabilidad y pérdida esperada (rut_20)
+- [Arquitectura](#arquitectura)
+- [Requisitos](#requisitos)
+- [Instalación](#instalación)
+- [Uso](#uso)
+- [Módulos](#módulos)
+- [Configuración](#configuración)
+- [Workflow](#workflow)
+- [Resultados](#resultados)
 
 ---
 
-## 🏗️ Arquitectura del Sistema
+## Arquitectura
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         STORMWATER TANK PLANNER                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
-│  │   INPUTS     │───▶│  PROCESSING  │───▶│   OUTPUTS    │                   │
-│  └──────────────┘    └──────────────┘    └──────────────┘                   │
-│         │                   │                   │                           │
-│         ▼                   ▼                   ▼                           │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
-│  │ • SWMM .inp  │    │ • PathFinder │    │ • Reportes   │                   │
-│  │ • DEM Raster │    │ • SewerDesign│    │ • Mapas      │                   │
-│  │ • Predios    │    │ • SWMM Mod.  │    │ • Dashboards │                   │
-│  │ • Network    │    │ • NSGA-II    │    │ • Gráficas   │                   │
-│  └──────────────┘    └──────────────┘    └──────────────┘                   │
-│                                                                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                         MÓDULOS PRINCIPALES                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Núcleo de Optimización:                                                     │
-│  ├── rut_10_run_tanque_tormenta.py   # Orquestador principal                 │
-│  ├── rut_15_optimizer.py             # Optimizador Greedy + NSGA-II          │
-│  ├── rut_16_dynamic_evaluator.py     # Evaluador dinámico de soluciones      │
-│  ├── rut_23_nsga_optimizer.py        # NSGA-II para selección de tanques     │
-│  └── rut_29_nsga_ranking_optimizer.py# NSGA-II para optimización de pesos    │
-│                                                                              │
-│  Análisis y Modelado:                                                        │
-│  ├── rut_00_path_finder.py           # Enrutamiento sobre OSM                │
-│  ├── rut_01_swmm_handel.py           # Manejo de archivos SWMM               │
-│  ├── rut_02_get_flodded_nodes.py     # Identificación de nodos inundados     │
-│  ├── rut_03_run_sewer_design.py      # Diseño de alcantarillado              │
-│  ├── rut_06_pipe_sizing.py           # Dimensionamiento de tuberías          │
-│  └── rut_27_model_metrics.py         # Extracción de métricas                │
-│                                                                              │
-│  Evaluación de Daños y Riesgo:                                               │
-│  ├── rut_18_itzi_flood_model.py      # Simulación 2D con Itzi                │
-│  ├── rut_19_flood_damage_climada.py  # Daños con CLIMADA/JRC                 │
-│  ├── rut_20_avoided_costs.py         # Costos evitados (reposición)          │
-│  ├── rut_21_construction_cost.py     # Costos de construcción                │
-│  ├── rut_21_risk_analysis.py         # Análisis de riesgo probabilístico     │
-│  └── rut_26_hydrological_impact.py   # Impacto hidrológico                   │
-│                                                                              │
-│  Utilidades y Reportes:                                                      │
-│  ├── rut_14_swmm_modifier.py         # Modificación de archivos SWMM         │
-│  ├── rut_15_dashboard.py             # Generación de dashboards              │
-│  ├── rut_17_comparison_reporter.py   # Comparador de escenarios              │
-│  ├── rut_22_scenario_generator.py    # Generador de escenarios TR            │
-│  ├── rut_25_from_inp_to_vector.py    # Exportación a vectoriales             │
-│  └── rut_28_water_quality.py         # Análisis de calidad de agua           │
-│                                                                              │
-│  Configuración:                                                              │
-│  └── config.py                       # Parámetros globales del proyecto      │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+Entradas                 Procesamiento                Salidas
+─────────────────────────────────────────────────────────────────────
+SWMM .inp    ──┐                                     Reportes Excel
+DEM Raster   ──┼──▶  PathFinder  ──┐                  Mapas GeoPackage
+Predios      ──┤                   ├──▶  Optimizer    Dashboards
+Network      ──┘   SewerPipeline ──┤   (NSGA-II)  ──▶ Gráficas
+                    SWMM Modifier ──┘   o Greedy
+                    Itzi 2D
 ```
+
+### Estructura de Módulos
+
+**Optimización:**
+- `rut_10_run_tanque_tormenta.py` - Orquestador principal del workflow
+- `rut_15_optimizer.py` - Implementación Greedy y NSGA-II
+- `rut_16_dynamic_evaluator.py` - Evaluador dinámico de soluciones
+- `rut_23_nsga_optimizer.py` - NSGA-II para selección de tanques
+- `rut_29_nsga_ranking_optimizer.py` - NSGA-II para optimización de pesos de ranking
+
+**Modelado Hidráulico:**
+- `rut_00_path_finder.py` - Enrutamiento sobre OpenStreetMap
+- `rut_01_swmm_handel.py` - Manejo de archivos SWMM
+- `rut_02_get_flodded_nodes.py` - Identificación de nodos inundados
+- `rut_03_run_sewer_design.py` - Diseño de redes de alcantarillado
+- `rut_06_pipe_sizing.py` - Dimensionamiento de tuberías
+- `rut_27_model_metrics.py` - Extracción de métricas hidráulicas
+
+**Evaluación de Daños:**
+- `rut_18_itzi_flood_model.py` - Simulación 2D con Itzi/GRASS GIS
+- `rut_19_flood_damage_climada.py` - Evaluación de daños con CLIMADA/JRC
+- `rut_20_avoided_costs.py` - Cálculo de costos evitados (inversión diferida)
+- `rut_21_construction_cost.py` - Cálculo de costos de construcción
+- `rut_21_risk_analysis.py` - Análisis de riesgo probabilístico (EAD)
+- `rut_26_hydrological_impact.py` - Evaluación de impacto hidrológico
+
+**Utilidades:**
+- `rut_14_swmm_modifier.py` - Modificación de archivos SWMM
+- `rut_15_dashboard.py` - Generación de reportes Excel
+- `rut_17_comparison_reporter.py` - Comparación de escenarios
+- `rut_22_scenario_generator.py` - Generación de escenarios por período de retorno
+- `rut_25_from_inp_to_vector.py` - Exportación INP a vectoriales
+- `rut_28_water_quality.py` - Análisis de calidad de agua
+
+**Configuración:**
+- `config.py` - Parámetros globales del proyecto
 
 ---
 
-## 📦 Requisitos
+## Requisitos
 
-### Software Requerido
-- **Python** 3.10 o superior
-- **SWMM 5.2+** (Storm Water Management Model)
-- **GRASS GIS 8.4+** (para simulaciones Itzi)
-- **Git** (para control de versiones)
+### Software
+- Python 3.10+
+- SWMM 5.2+
+- GRASS GIS 8.4+ (para simulaciones Itzi)
 
-### Dependencias Python Principales
+### Dependencias Python
 ```
 pyswmm>=2.0
 swmmio>=0.7
@@ -140,108 +95,79 @@ pandas>=2.0
 scipy>=1.10
 matplotlib>=3.7
 climada>=4.0
-itzi (instalado en entorno GRASS)
 ```
 
-### Datos de Entrada Requeridos
-- **Modelo SWMM** (`.inp`): Red de alcantarillado base
-- **DEM** (`.tif`): Modelo Digital de Elevaciones
-- **Predios** (`.gpkg`): Polígonos de predios candidatos
-- **Red** (`.gpkg`): Geometría de la red de alcantarillado
+### Datos de Entrada
+- Modelo SWMM (.inp)
+- Modelo Digital de Elevaciones (.tif)
+- Polígonos de predios candidatos (.gpkg)
+- Geometría de red de alcantarillado (.gpkg)
 
 ---
 
-## 🚀 Instalación
+## Instalación
 
-### 1. Clonar el Repositorio
 ```bash
+# Clonar repositorio
 git clone https://github.com/MarceloBarrosVanegas/stormwater-tank-planner.git
 cd stormwater-tank-planner
-```
 
-### 2. Crear Entorno Conda
-```bash
+# Crear entorno conda
 conda env create -f environment.yml
 conda activate stormwater
-```
 
-### 3. Instalar PyPiper (Dependencia Interna)
-El proyecto requiere el módulo PyPiper ubicado en:
-```
-~/OneDrive/ALCANTARILLADO_PyQt5/00_MODULOS/pypiper
-```
-
-Verificar que la estructura exista o actualizar `config.py` con la ruta correcta.
-
-### 4. Configurar GRASS GIS para Itzi
-Asegurar que GRASS GIS 8.4 esté instalado en:
-```
-C:\Program Files\GRASS GIS 8.4\
-```
-
-### 5. Verificar Instalación
-```bash
-python -c "import config; print('Configuración OK')"
+# Verificar instalación
+python -c "import config; print('OK')"
 ```
 
 ---
 
-## 💻 Uso
+## Uso
 
-### Ejemplo Básico - Análisis Secuencial
+### Ejemplo 1: Análisis Secuencial (Greedy)
 
 ```python
 from rut_10_run_tanque_tormenta import StormwaterOptimizationRunner
 import config
 
-# Inicializar el runner
 runner = StormwaterOptimizationRunner(
     project_root=config.PROJECT_ROOT,
     eval_id="ejemplo_01"
 )
 
-# Ejecutar análisis secuencial con optimizador greedy
 result = runner.run_sequential_analysis(
     max_tanks=10,
     max_iterations=50,
     min_tank_vol=1000.0,
     max_tank_vol=50000.0,
-    optimizer_mode='greedy',  # 'greedy' o 'nsga'
-    stop_at_breakeven=True,
-    breakeven_multiplier=1.0
+    optimizer_mode='greedy',
+    stop_at_breakeven=True
 )
 ```
 
-### Ejemplo - Optimización NSGA-II
+### Ejemplo 2: Optimización NSGA-II
 
 ```python
 from rut_10_run_tanque_tormenta import StormwaterOptimizationRunner
-from rut_23_nsga_optimizer import run_nsga_optimization
 import config
 
-# Configurar para análisis probabilístico (EAD)
 config.TR_LIST = [1, 2, 5, 10, 25, 50, 100]
 
-# Ejecutar NSGA-II
+runner = StormwaterOptimizationRunner()
 result = runner.run_sequential_analysis(
     max_tanks=20,
     optimizer_mode='nsga',
-    optimization_tr_list=[1, 2, 5, 10, 25],  # TRs para optimización
-    validation_tr_list=[1, 2, 5, 10, 25, 50, 100]  # TRs para validación
+    optimization_tr_list=[1, 2, 5, 10, 25],
+    validation_tr_list=[1, 2, 5, 10, 25, 50, 100]
 )
 ```
 
-### Ejemplo - Optimización de Pesos de Ranking
+### Ejemplo 3: Optimización de Pesos de Ranking
 
 ```python
 from rut_29_nsga_ranking_optimizer import NSGARankingOptimizer
 
-# Optimizar pesos de ranking automáticamente
-optimizer = NSGARankingOptimizer(
-    elev_file=config.ELEV_FILE
-)
-
-# Ejecutar optimización
+optimizer = NSGARankingOptimizer(elev_file=config.ELEV_FILE)
 pareto_results = optimizer.optimize(
     n_generations=50,
     pop_size=24,
@@ -251,177 +177,208 @@ pareto_results = optimizer.optimize(
 
 ---
 
-## 📁 Módulos Principales
+## Módulos
 
-### `rut_10_run_tanque_tormenta.py`
-**Orquestador principal** del workflow de optimización.
+### rut_10_run_tanque_tormenta.py
+
+Orquestador principal. Coordina la ejecución del workflow completo de optimización.
 
 ```python
 class StormwaterOptimizationRunner:
-    """Ejecuta el análisis completo de optimización de tanques."""
-    
-    def run_sequential_analysis(...)
+    def run_sequential_analysis(self, max_tanks, optimizer_mode, ...)
         """
-        Análisis secuencial que puede usar:
-        - 'greedy': Algoritmo voraz iterativo
-        - 'nsga': NSGA-II multi-objetivo
+        Ejecuta análisis secuencial.
+        
+        Parameters:
+        -----------
+        optimizer_mode : str
+            'greedy' o 'nsga'
+        max_tanks : int
+            Número máximo de tanques
+        stop_at_breakeven : bool
+            Detener cuando costo >= beneficios
         """
 ```
 
-### `rut_16_dynamic_evaluator.py`
-**Evaluador dinámico** que ejecuta el pipeline completo para cada solución:
-1. PathFinder (enrutamiento)
-2. SewerPipeline (diseño)
-3. SWMMModifier (modificación INP)
-4. SWMM (simulación)
-5. Métricas de resultado
+### rut_16_dynamic_evaluator.py
 
-### `rut_27_model_metrics.py`
-**Extractor de métricas** hidráulicas del sistema:
-- Volúmenes de inundación
-- Caudales pico
-- Profundidades máximas
-- Health de la red
-- Ranking de candidatos
+Evaluador dinámico que ejecuta el pipeline completo para cada solución candidata:
+1. PathFinder: Enrutamiento óptimo sobre OSM
+2. SewerPipeline: Diseño hidráulico de tuberías
+3. SWMMModifier: Modificación del archivo INP
+4. SWMM: Simulación hidráulica
+5. Métricas: Extracción de resultados
 
-### `rut_19_flood_damage_climada.py`
-**Evaluación de daños** usando CLIMADA con curvas JRC:
-- Mapeo de uso de suelo a sectores CLIMADA
-- Curvas de daño por sector (residential, commercial, industrial)
-- Daño total y por predio
+```python
+class DynamicSolutionEvaluator:
+    def __init__(self, path_proy, elev_files_list, proj_to, ...)
+    def evaluate_solution(self, active_pairs, eval_id=None)
+```
 
-### `rut_21_construction_cost.py`
-**Cálculo de costos** de construcción:
-- Tuberías (excavación, relleno, materiales)
-- Tanques (excavación, concreto, impermeabilización)
-- Terrenos (costo por m²)
+### rut_27_model_metrics.py
+
+Extractor de métricas hidráulicas del sistema SWMM.
+
+```python
+class MetricExtractor:
+    def extract_metrics(self) -> SystemMetrics
+    def generate_candidate_pairs(self) -> List[CandidatePair]
+    def rank_candidates(self, pairs: List[CandidatePair]) -> List[CandidatePair]
+```
+
+### rut_19_flood_damage_climada.py
+
+Evaluación de daños por inundación usando CLIMADA con curvas de daño-profundidad JRC.
+
+Funcionalidad:
+- Mapea uso de suelo a sectores CLIMADA (residential, commercial, industrial, infrastructure, agriculture)
+- Aplica curvas de daño JRC para Sudamérica
+- Calcula daño total y por predio en USD
+
+### rut_23_nsga_optimizer.py
+
+Implementación de NSGA-II para selección óptima de tanques.
+
+```python
+class TankOptimizationProblem(Problem):
+    """
+    Variables: Array binario [0,1] para cada candidato
+    Objetivos:
+        1. Minimizar costo de construcción
+        2. Minimizar daño residual (o EAD si probabilístico)
+        3. Minimizar costo de reparación de tuberías
+    Restricciones:
+        - Máximo número de tanques
+        - Capacidad de predios
+    """
+```
+
+### rut_29_nsga_ranking_optimizer.py
+
+Optimización de los pesos de ranking (`FLOODING_RANKING_WEIGHTS` y `CAPACITY_MAX_HD`) mediante NSGA-II. Cada evaluación ejecuta el workflow completo de optimización Greedy.
 
 ---
 
-## ⚙️ Configuración
+## Configuración
 
-El archivo `config.py` contiene todos los parámetros configurables:
+Parámetros principales en `config.py`:
 
-### Parámetros de Tanques
+### Parámetros de Tanque
 ```python
-TANK_DEPTH_M = 15.0              # Profundidad del tanque (m)
+TANK_DEPTH_M = 15.0              # Profundidad (m)
 TANK_MIN_VOLUME_M3 = 1000.0      # Volumen mínimo (m³)
 TANK_MAX_VOLUME_M3 = 100000.0    # Volumen máximo (m³)
-TANK_VOLUME_SAFETY_FACTOR = 1.05 # Factor de seguridad
 MAX_TANKS = 30                   # Máximo número de tanques
+TANK_VOLUME_SAFETY_FACTOR = 1.05 # Factor de seguridad
 ```
 
-### Parámetros de Optimización
+### Pesos de Ranking
 ```python
-# Pesos para ranking de nodos (0 = no se optimiza)
 FLOODING_RANKING_WEIGHTS = {
-    'flow_over_capacity': 0.5,
-    'flow_node_flooding': 0.5,
-    'vol_node_flooding': 0.0,
-    'outfall_peak_flow': 0,
-    'failure_probability': 0,
+    'flow_over_capacity': 0.5,    # Caudal sobre capacidad
+    'flow_node_flooding': 0.5,    # Caudal de inundación
+    'vol_node_flooding': 0.0,     # Volumen de inundación
+    'outfall_peak_flow': 0,       # Caudal pico outfall
+    'failure_probability': 0,     # Probabilidad de falla
 }
-
-# NSGA-II
-NSGA_PARALLEL_WORKERS = 6
-SWMM_THREADS = 1
 ```
 
-### Parámetros de Costo
+### NSGA-II
+```python
+NSGA_PARALLEL_WORKERS = 6        # Workers paralelos
+SWMM_THREADS = 1                 # Threads por simulación SWMM
+N_GENERATIONS = 50               # Generaciones NSGA-II
+POP_SIZE = 24                    # Tamaño de población
+```
+
+### Componentes de Costo
 ```python
 COST_COMPONENTS = {
-    'deferred_investment': True,   # Costo de reposición de tuberías
+    'deferred_investment': True,   # Inversión diferida (reposición tuberías)
     'flood_damage': False,          # Daño por inundación (CLIMADA)
     'river_damage': False,         # Impacto downstream
 }
-
-LAND_COST_PER_M2 = 50.0          # Costo del terreno ($/m²)
+LAND_COST_PER_M2 = 50.0          # Costo de terreno ($/m²)
 ```
 
 ---
 
-## 🔄 Workflow de Optimización
+## Workflow
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    WORKFLOW DE OPTIMIZACIÓN                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-
 FASE 1: PREPARACIÓN
 ───────────────────
-  │
-  ├──▶ Cargar modelo SWMM base
-  ├──▶ Cargar predios y red
-  ├──▶ Calcular elevaciones y pendientes
-  └──▶ Identificar nodos inundados (baseline)
-       │
-       ▼
+Cargar modelo SWMM base
+Cargar predios y red
+Calcular elevaciones y pendientes
+Identificar nodos inundados (baseline)
+
 FASE 2: RANKING DE CANDIDATOS
 ──────────────────────────────
-  │
-  ├──▶ Generar pares (nodo → predio)
-  ├──▶ Calcular distancias y desniveles
-  ├──▶ Aplicar pesos de ranking (FLOODING_RANKING_WEIGHTS)
-  └──▶ Ordenar candidatos por score
-       │
-       ▼
-FASE 3: OPTIMIZACIÓN (Greedy o NSGA-II)
-────────────────────────────────────────
-  │
-  ┌─▶ GREEDY MODE                          ┌─▶ NSGA-II MODE
-  │   ─────────────                         │   ──────────────
-  │   Para cada iteración:                  │   Para cada generación:
-  │   1. Seleccionar mejor candidato        │   1. Generar población
-  │   2. Diseñar tubería (PathFinder)       │   2. Evaluar fitness (SWMM)
-  │   3. Dimensionar tubería                │   3. Cruzamiento y mutación
-  │   4. Agregar tanque a SWMM              │   4. Selección no dominada
-  │   5. Correr SWMM                        │   5. Elitismo
-  │   6. Evaluar resultados                 │
-  │   7. Si útil, agregar a solución        │
-  │                                          │
-  ▼                                          ▼
-FASE 4: EVALUACIÓN DE RESULTADOS
-─────────────────────────────────
-  │
-  ├──▶ Comparar vs baseline
-  ├──▶ Calcular métricas:
-  │    • Reducción de volumen inundado
-  │    • Reducción de caudal pico
-  │    • Health de la red
-  │    • Costo total
-  └──▶ Generar reportes y mapas
-       │
-       ▼
-FASE 5: ANÁLISIS DE DAÑOS (Opcional)
+Generar pares (nodo → predio)
+Calcular distancias y desniveles
+Aplicar pesos de ranking
+Ordenar candidatos por score
+
+FASE 3: OPTIMIZACIÓN
+─────────────────────
+Modo Greedy:
+    1. Seleccionar mejor candidato
+    2. Diseñar tubería (PathFinder)
+    3. Dimensionar tubería
+    4. Agregar tanque a SWMM
+    5. Correr SWMM
+    6. Evaluar resultados
+    7. Si útil, agregar a solución
+    8. Repetir
+
+Modo NSGA-II:
+    1. Generar población inicial
+    2. Evaluar fitness (SWMM)
+    3. Cruzamiento SBX
+    4. Mutación polinomial
+    5. Selección no dominada
+    6. Elitismo
+    7. Repetir hasta N generaciones
+
+FASE 4: EVALUACIÓN
+───────────────────
+Comparar vs baseline
+Calcular métricas:
+    - Reducción de volumen inundado
+    - Reducción de caudal pico
+    - Health de la red
+    - Costo total
+Generar reportes y mapas
+
+FASE 5: ANÁLISIS DE DAÑOS (opcional)
 ─────────────────────────────────────
-  │
-  ├──▶ Ejecutar Itzi 2D
-  ├──▶ Calcular daños con CLIMADA
-  ├──▶ Calcular EAD (Expected Annual Damage)
-  └──▶ Generar curvas de daño
+Ejecutar Itzi 2D
+Calcular daños con CLIMADA
+Calcular EAD (Daño Anual Esperado)
+Generar curvas de daño
 ```
 
 ---
 
-## 📊 Resultados
+## Resultados
 
-Los resultados se guardan en `optimization_results/`:
+Estructura de salida en `optimization_results/`:
 
 ```
 optimization_results/
-├── nsga_evaluations/              # Resultados de NSGA-II
+├── nsga_evaluations/
 │   └── {eval_id}/
-│       ├── best_solution/         # Mejor solución encontrada
-│       ├── pareto_front.csv       # Frente de Pareto
-│       └── evolution.png          # Gráfico de evolución
-├── sequential_analysis/           # Análisis secuencial (Greedy)
+│       ├── best_solution/
+│       ├── pareto_front.csv
+│       └── evolution.png
+├── sequential_analysis/
 │   ├── iteration_001/
 │   ├── iteration_002/
 │   └── ...
-├── comparison_reports/            # Reportes comparativos
-│   ├── comparison_baseline_vs_solution.xlsx
-│   └── maps/
-└── itzi_results/                  # Resultados de inundación 2D
+├── comparison_reports/
+│   └── comparison_baseline_vs_solution.xlsx
+└── itzi_results/
     ├── max_water_depth.tif
     └── flood_damage_results.gpkg
 ```
@@ -430,58 +387,26 @@ optimization_results/
 
 | Métrica | Descripción | Unidad |
 |---------|-------------|--------|
-| `flooding_vol_reduction` | Reducción de volumen inundado | m³ |
-| `flooding_vol_reduction_pct` | Reducción porcentual de volumen | % |
-| `flooding_peak_flow_reduction` | Reducción de caudal pico de inundación | m³/s |
-| `outfall_peak_flow_reduction` | Reducción de caudal en outfall | m³/s |
-| `network_health` | Health promedio de la red | 0-1 |
-| `total_cost` | Costo total de construcción | USD |
-| `bc_ratio` | Relación Beneficio/Costo | - |
+| flooding_vol_reduction | Reducción de volumen inundado | m³ |
+| flooding_vol_reduction_pct | Reducción porcentual de volumen | % |
+| flooding_peak_flow_reduction | Reducción de caudal pico de inundación | m³/s |
+| outfall_peak_flow_reduction | Reducción de caudal en outfall | m³/s |
+| network_health | Health promedio de la red | 0-1 |
+| total_cost | Costo total de construcción | USD |
+| bc_ratio | Relación Beneficio/Costo | - |
 
 ---
 
-## 🤝 Contribución
-
-### Guías de Contribución
-1. Fork el repositorio
-2. Crear rama feature (`git checkout -b feature/nueva-funcionalidad`)
-3. Commit cambios (`git commit -am 'Agregar nueva funcionalidad'`)
-4. Push a la rama (`git push origin feature/nueva-funcionalidad`)
-5. Crear Pull Request
-
-### Reportar Issues
-Para reportar bugs o solicitar funcionalidades, usar el [issue tracker](https://github.com/MarceloBarrosVanegas/stormwater-tank-planner/issues).
-
----
-
-## 📄 Licencia
-
-Este proyecto está licenciado bajo MIT License - ver [LICENSE](LICENSE) para detalles.
-
----
-
-## 👥 Autores
-
-- **Marcelo Barros Vanegas** - *Desarrollo principal* - [GitHub](https://github.com/MarceloBarrosVanegas)
-
-### Agradecimientos
-- EPMAPS (Empresa Pública Metropolitana de Agua Potable y Saneamiento de Quito)
-- CLIMADA Project por las curvas de daño JRC
-- EPA por SWMM
-- Itzi Development Team
-
----
-
-## 📚 Referencias
+## Referencias
 
 1. EPA. (2022). *Storm Water Management Model (SWMM) Version 5.2*. Environmental Protection Agency.
-2. CLIMADA Project. (2024). *JRC Depth-Damage Curves for South America*.
-3. Deb, K. (2002). A Fast and Elitist Multiobjective Genetic Algorithm: NSGA-II. *IEEE Transactions on Evolutionary Computation*.
-4. Itzi. (2024). *Itzi - A 2D Flood Simulation Tool*. https://itzi.readthedocs.io/
-5. OpenStreetMap Contributors. (2024). *OpenStreetMap Data*.
+2. CLIMADA Project. *JRC Depth-Damage Curves for South America*.
+3. Deb, K. (2002). A Fast and Elitist Multiobjective Genetic Algorithm: NSGA-II. *IEEE Transactions on Evolutionary Computation*, 6(2), 182-197.
+4. Itzi. *Itzi - A 2D Flood Simulation Tool*. https://itzi.readthedocs.io/
+5. OpenStreetMap Contributors. *OpenStreetMap Data*.
 
 ---
 
-<p align="center">
-  <strong>Stormwater Tank Planner</strong> - Optimizando la infraestructura de drenaje urbano 🌧️
-</p>
+## Licencia
+
+MIT License
