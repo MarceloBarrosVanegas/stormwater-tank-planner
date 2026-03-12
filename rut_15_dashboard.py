@@ -10,6 +10,8 @@ import matplotlib.patches as mpatches
 from datetime import datetime
 from matplotlib.ticker import MaxNLocator, FuncFormatter
 
+import config
+
 
 
 class EvolutionDashboardGenerator:
@@ -51,8 +53,17 @@ class EvolutionDashboardGenerator:
         self._figure_counter += 1
         return self.output_dir / filename
         
-    def generate_all(self):
-        """Generates all dashboard plots."""
+    def generate_all(self, enable_cross_tr_validation: bool = False, 
+                     solution_inp_path: Path = None,
+                     solution_tr: int = 25):
+        """
+        Generates all dashboard plots.
+        
+        Args:
+            enable_cross_tr_validation: Si True, ejecuta validación cruzada TR
+            solution_inp_path: Ruta al modelo con tanques (para cross-TR)
+            solution_tr: TR de diseño de la solución (default: 25)
+        """
         if self.df.empty:
             print("  [Dashboard] No data to plot.")
             return
@@ -66,6 +77,13 @@ class EvolutionDashboardGenerator:
         self.plot_individual_roi_curves()
         self.plot_pareto_curves()
         self.plot_system_evolution()
+        
+        # Validación cruzada TR (opcional)
+        if enable_cross_tr_validation:
+            self.generate_cross_tr_validation(
+                solution_inp_path=solution_inp_path,
+                solution_tr=solution_tr
+            )
 
     def format_currency_smart(self, x, pos=None):
         """Dynamic formatting for large currency values."""
@@ -1854,6 +1872,147 @@ class EvolutionDashboardGenerator:
         
         save_path = self._get_next_figure_path("system_evolution")
         fig.savefig(save_path, dpi=200, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"  [Dashboard] Saved: {save_path}")
+    
+    def generate_cross_tr_validation(self, solution_inp_path: Path = None, 
+                                     solution_tr: int = 25,
+                                     tr_list: list = None):
+        """
+        Genera validación cruzada TR comparando la solución contra múltiples baselines.
+        
+        Args:
+            solution_inp_path: Ruta al modelo con tanques. Si None, intenta inferir del último paso.
+            solution_tr: TR para el que fue diseñada la solución (default: 25)
+            tr_list: Lista de TR para comparar. Default: [1, 2, 5, 10, 25, 50]
+        """
+        try:
+            from rut_30_cross_tr_validator import CrossTRValidator
+        except ImportError:
+            print("  [Dashboard] Warning: rut_30_cross_tr_validator not found. Skipping cross-TR validation.")
+            return
+        
+        if tr_list is None:
+            tr_list = [1, 2, 5, 10, 25, 50]
+        
+        # Inferir ruta del modelo solución si no se proporciona
+        if solution_inp_path is None:
+            # Buscar en el directorio de resultados
+            potential_paths = [
+                self.output_dir / "model_final.inp",
+                self.output_dir / "model_Seq_Iter_" / f"model_Seq_Iter_{self.df['step'].max():02d}.inp",
+            ]
+            for p in potential_paths:
+                if p.exists():
+                    solution_inp_path = p
+                    break
+        
+        if solution_inp_path is None or not solution_inp_path.exists():
+            print(f"  [Dashboard] Warning: Solution INP not found. Skipping cross-TR validation.")
+            return
+        
+        print(f"  [Dashboard] Generating cross-TR validation...")
+        
+        # Crear subdirectorio propio
+        cross_tr_dir = self.output_dir / "03_cross_tr_validation"
+        cross_tr_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Ejecutar validación
+        validator = CrossTRValidator(
+            baseline_inp=config.SWMM_FILE,
+            solution_inp=solution_inp_path,
+            solution_design_tr=solution_tr,
+            work_dir=cross_tr_dir,
+            enable_caching=True
+        )
+        
+        df_func, df_stat = validator.run_full_validation(tr_list=tr_list)
+        
+        # Generar figuras adicionales específicas del dashboard
+        self._plot_cross_tr_summary(df_func, df_stat, cross_tr_dir)
+        
+        print(f"  [Dashboard] Cross-TR validation saved in: {cross_tr_dir}")
+    
+    def _plot_cross_tr_summary(self, df_func: pd.DataFrame, df_stat: pd.DataFrame, 
+                               output_dir: Path):
+        """Genera resumen visual de la validación cruzada para el dashboard."""
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Validación Cruzada: Desempeño vs Múltiples TR', 
+                    fontsize=18, fontweight='bold', y=0.98)
+        
+        # 1. Comparación funcional - volumen
+        if not df_func.empty:
+            ax = axes[0, 0]
+            tr_labels = [f"TR{int(r)}" for r in df_func['tr_base']]
+            x = np.arange(len(tr_labels))
+            width = 0.35
+            
+            bars1 = ax.bar(x - width/2, df_func['base_flood_volume'], width, 
+                          label='Baseline', alpha=0.8, color='lightcoral', edgecolor='black')
+            bars2 = ax.bar(x + width/2, df_func['sol_flood_volume'], width,
+                          label='Solución', alpha=0.8, color='steelblue', edgecolor='black')
+            
+            ax.set_ylabel('Volumen Inundado (m³)', fontsize=12, fontweight='bold')
+            ax.set_title('Comparación Funcional: Volumen', fontsize=13, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(tr_labels)
+            ax.legend(fontsize=11)
+            ax.grid(True, alpha=0.3, axis='y')
+        
+        # 2. Ratios funcionales
+        if not df_func.empty:
+            ax = axes[0, 1]
+            ax.plot(range(len(df_func)), df_func['ratio_volume'], 'o-', 
+                   linewidth=3, markersize=10, label='Ratio Volumen', color='green')
+            ax.axhline(y=1.0, color='red', linestyle='--', alpha=0.5, label='Línea Base (1.0)')
+            ax.axhline(y=0.5, color='orange', linestyle='--', alpha=0.3, label='Reducción 50%')
+            ax.set_ylabel('Ratio (Sol/Baseline)', fontsize=12, fontweight='bold')
+            ax.set_title('Eficiencia: Ratio vs Cada TR', fontsize=13, fontweight='bold')
+            ax.set_xticks(range(len(df_func)))
+            ax.set_xticklabels(tr_labels)
+            ax.legend(fontsize=10)
+            ax.grid(True, alpha=0.3)
+        
+        # 3. Comparación estadística - barras
+        if not df_stat.empty:
+            ax = axes[1, 0]
+            stat_labels = [f"TR{int(r)}" for r in df_stat['tr_base']]
+            x = np.arange(len(stat_labels))
+            
+            ax.bar(x, df_stat['base_flood_volume'], alpha=0.7, color='wheat', 
+                  edgecolor='black', label='Baseline')
+            ax.bar(x, [df_stat['sol_flood_volume'].iloc[0]] * len(x), 
+                  alpha=0.7, color='forestgreen', edgecolor='black', label='Solución TR25')
+            
+            ax.set_ylabel('Volumen (m³)', fontsize=12, fontweight='bold')
+            ax.set_title('Comparación Estadística: Sol TR25 vs Baselines', 
+                        fontsize=13, fontweight='bold')
+            ax.set_xticks(x)
+            ax.set_xticklabels(stat_labels)
+            ax.legend(fontsize=11)
+            ax.grid(True, alpha=0.3, axis='y')
+        
+        # 4. Resumen de ratios estadísticos
+        if not df_stat.empty:
+            ax = axes[1, 1]
+            colors = ['green' if r < 1.0 else 'red' for r in df_stat['ratio_volume']]
+            bars = ax.barh(range(len(df_stat)), df_stat['ratio_volume'], color=colors, alpha=0.7, edgecolor='black')
+            ax.axvline(x=1.0, color='black', linestyle='--', linewidth=2)
+            ax.set_xlabel('Ratio Volumen (Sol TR25 / Baseline)', fontsize=12, fontweight='bold')
+            ax.set_title('Performance vs Eventos Menores', fontsize=13, fontweight='bold')
+            ax.set_yticks(range(len(df_stat)))
+            ax.set_yticklabels([f"vs TR{int(r)}" for r in df_stat['tr_base']])
+            ax.grid(True, alpha=0.3, axis='x')
+            
+            # Añadir valores
+            for i, (bar, val) in enumerate(zip(bars, df_stat['ratio_volume'])):
+                ax.text(val + 0.05 if val < 1.5 else val - 0.15, i, f'{val:.2f}', 
+                       va='center', fontsize=11, fontweight='bold')
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+        save_path = output_dir / "dashboard_cross_tr_summary.png"
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"  [Dashboard] Saved: {save_path}")
 
