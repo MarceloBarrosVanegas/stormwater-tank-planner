@@ -87,7 +87,7 @@ FAILIURE_RISK_FILE = CODIGOS_DIR / "probabilistic_results/risk_estimation/04_spa
 # MAIN PROJECT FILES
 # =============================================================================
 # SWMM
-SWMM_FILE = CODIGOS_DIR / "COLEGIO_TR25_v6.inp"
+SWMM_FILE = CODIGOS_DIR / "base_swmm.inp"
 BASE_INP_TR = 25  # Return Period (years) of the base INP file
 
 # Return Period List for analysis:
@@ -242,10 +242,10 @@ DEFAULT_ROAD_PREFERENCES = {
 }
 
 FLOODING_RANKING_WEIGHTS = {
-    'flow_over_capacity': 0.5,
-    'flow_node_flooding': 0.5,
+    'flow_over_capacity': 0.25,
+    'flow_node_flooding': 0.50,
     'vol_node_flooding': 0.0,
-    'outfall_peak_flow': 0,
+    'outfall_peak_flow': 0.25,
     'failure_probability': 0,
 }  # Pesos = 0 no se optimizan. Suma debe ser 1.0
 
