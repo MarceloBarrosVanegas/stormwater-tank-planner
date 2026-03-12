@@ -1,623 +1,1315 @@
 """
-Cross-TR Validator for Stormwater Tank Solutions
-=================================================
+Cross-TR Validator
+==================
+Valida robustez de soluciones optimizadas bajo múltiples periodos de retorno.
 
-Valida una solución diseñada para un TR específico comparándola
-contra los baselines de múltiples TR.
-
-Ejecuta 4 tipos de comparación:
-1. Paso 1: Pre-proceso baselines (TR1, TR2, TR5, TR10, TR25, TR50)
-2. Paso 2: Simular solución con todas las lluvias
-3. Paso 3: Comparación funcional (sol_trX vs base_trX)
-4. Paso 4: Comparación estadística cruzada (sol_tr25 vs base_trX)
+Paso 1: Simular baseline para cada TR
+Paso 2: Simular solución optimizada con lluvia de cada TR
+Paso 3: Comparar sol_trX vs base_trX (validación funcional por TR)
+Paso 4: Comparar sol_tr25 vs base_trX (validación cruzada)
 """
 
-import os
 import sys
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import pandas as pd
+import re
+import math
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from dataclasses import dataclass, asdict
-import pickle
-import json
-from datetime import datetime
+import pandas as pd
+import matplotlib
 
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+from pathlib import Path
+from scipy.stats import gaussian_kde
+import geopandas as gpd
+from shapely.geometry import Point as ShapelyPoint
+
+# Config
+sys.path.insert(0, str(Path(__file__).parent))
 import config
+
 config.setup_sys_path()
 
+print("[CrossTR] Iniciando...")
+print(f"Config: {config.CODIGOS_DIR}")
+print(f"TR Actual: {getattr(config, 'BASE_INP_TR', 25)}")
+
 from rut_27_model_metrics import MetricExtractor, SystemMetrics
-from rut_22_scenario_generator import generate_alternating_block_hyetograph
+
+# =============================================================================
+# PALETA Y ESTILO
+# =============================================================================
+COLORS = {
+    'baseline': '#E05C5C',  # rojo suave
+    'solution': '#4A90D9',  # azul
+    'rain': '#A8C8E8',  # azul claro para lluvia
+    'grid': '#E8E8E8',
+    'text': '#2C2C2C',
+}
+
+TR_COLORS = {
+    1: '#D62728',
+    2: '#FF7F0E',
+    5: '#BCBD22',
+    10: '#2CA02C',
+    25: '#1F77B4',
+    50: '#9467BD',
+    100: '#8C564B',
+}
 
 
-@dataclass
-class TRMetrics:
-    """Métricas extraídas para un modelo con un TR específico."""
-    tr: int
-    model_type: str  # 'baseline' o 'solution'
-    inp_path: Path
-    
-    # Métricas del sistema
-    flood_volume: float = 0.0
-    flood_peak_flow: float = 0.0
-    outfall_volume: float = 0.0
-    outfall_peak_flow: float = 0.0
-    network_health: float = 0.0
-    network_utilization_mean: float = 0.0
-    surcharged_links_count: int = 0
-    flooded_nodes_count: int = 0
-    
-    # Hidrogramas (opcional, para gráficos detallados)
-    flood_hydrograph: Dict = None
-    outfall_hydrograph: Dict = None
+def _style_ax(ax, title='', xlabel='', ylabel='', legend=True):
+    ax.set_facecolor('#FAFAFA')
+    ax.grid(True, color=COLORS['grid'], linewidth=0.8, zorder=0)
+    ax.set_title(title, fontsize=10, fontweight='bold', color=COLORS['text'], pad=8)
+    if xlabel: ax.set_xlabel(xlabel, fontsize=8, color=COLORS['text'])
+    if ylabel: ax.set_ylabel(ylabel, fontsize=8, color=COLORS['text'])
+    ax.tick_params(labelsize=7, colors=COLORS['text'])
+    for spine in ax.spines.values():
+        spine.set_color('#CCCCCC')
+    if legend:
+        leg = ax.legend(fontsize=7, framealpha=0.9, edgecolor='#CCCCCC')
+        if leg: leg.get_frame().set_linewidth(0.5)
 
 
-@dataclass
-class CrossComparison:
-    """Resultado de comparación cruzada."""
-    comparison_type: str  # 'functional' o 'statistical'
-    tr_base: int  # TR del baseline
-    tr_sol: int   # TR de la solución (simulación)
-    
-    # Métricas base
-    base_flood_volume: float
-    base_flood_peak: float
-    base_outfall_volume: float
-    base_outfall_peak: float
-    base_network_health: float
-    
-    # Métricas solución
-    sol_flood_volume: float
-    sol_flood_peak: float
-    sol_outfall_volume: float
-    sol_outfall_peak: float
-    sol_network_health: float
-    
-    # Diferencias
-    diff_volume_abs: float
-    diff_volume_pct: float
-    diff_peak_abs: float
-    diff_peak_pct: float
-    diff_outfall_abs: float
-    diff_outfall_pct: float
-    diff_health_abs: float
-    diff_health_pct: float
-    
-    # Ratios
-    ratio_volume: float
-    ratio_peak: float
-    ratio_outfall: float
-    ratio_health: float
+# =============================================================================
+# FUNCIONES IDF Y HIETOGRAMA (una sola definición)
+# =============================================================================
+def calc_intensity(t_min: float, T_yr: float) -> float:
+    """Intensidad [mm/h] para duración t_min y periodo T_yr usando curva IDF local."""
+    num = 13.9378 * math.log(T_yr) + 40.7176
+    den = (35.5037 + t_min) ** 0.9997
+    return num / den
 
 
+def calc_depth(t_min: float, T_yr: float) -> float:
+    return calc_intensity(t_min, T_yr) * t_min
+
+
+def gen_hyetograph(tr: int, dur_min: float = 60, dt_min: float = 5) -> pd.DataFrame:
+    """
+    Genera hietograma por bloques alternos para periodo de retorno tr.
+
+    Returns:
+        DataFrame con columnas: Offset_Min, Time_Str, Block_Depth_mm, Intensity_mm_h
+    """
+    n = int(dur_min / dt_min)
+    durs = np.arange(dt_min, dur_min + dt_min, dt_min)
+    cds = np.array([calc_depth(float(d), tr) for d in durs])
+    increments = np.diff(np.concatenate([[0.0], cds]))
+    sorted_blocks = np.sort(increments)[::-1]
+
+    h = np.zeros(n)
+    ri, li = n // 2, n // 2 - 1
+    for i, dep in enumerate(sorted_blocks):
+        if i % 2 == 0:
+            if ri < n:
+                h[ri] = dep;
+                ri += 1
+        else:
+            if li >= 0:
+                h[li] = dep;
+                li -= 1
+
+    tm = np.arange(0, dur_min, dt_min)
+    ts = [f"{int(t // 60)}:{int(t % 60):02d}" for t in tm]
+    df = pd.DataFrame({'Offset_Min': tm, 'Time_Str': ts, 'Block_Depth_mm': h})
+    df['Intensity_mm_h'] = df['Block_Depth_mm'] * (60.0 / dt_min)
+    if not df.empty:
+        df.loc[0, 'Intensity_mm_h'] = 0.0
+    return df
+
+
+def gen_inp_with_tr(base_content: str, tr: int, tr_actual: int, hyeto: pd.DataFrame, out_path: Path) -> Path:
+    """
+    Genera archivo INP reemplazando la serie de tiempo de lluvia por hietograma del TR dado.
+    """
+    old_name = f"TORMENTA_COLEGIO_TR{tr_actual}"
+    new_name = f"TORMENTA_COLEGIO_TR{tr}"
+    ts_new = f"COLEGIO_TR{tr}"
+    ts_old = f"COLEGIO_TR{tr_actual}"
+
+    cont = base_content.replace(old_name, new_name)
+    if "[TITLE]" in cont:
+        cont = re.sub(r'\[TITLE\]\n.*', f'[TITLE]\nAnalisis - TR {tr} Anios', cont, count=1)
+    else:
+        cont = f"[TITLE]\nAnalisis - TR {tr} Anios\n\n" + cont
+
+    lines = cont.splitlines()
+    new_lines = []
+    in_rg = in_ts = False
+
+    for line in lines:
+        s = line.strip()
+        if s.startswith("["):
+            if s.startswith("[RAINGAGES]"):
+                in_rg, in_ts = True, False
+            elif s.startswith("[TIMESERIES]"):
+                in_rg, in_ts = False, True
+                new_lines.append(line)
+                continue
+            else:
+                in_rg, in_ts = False, False
+
+        if in_rg and new_name in line and ";" not in line:
+            new_lines.append(f"{new_name} INTENSITY 0:05     1.0      TIMESERIES {ts_new}")
+        elif in_ts:
+            if (s.startswith(ts_old) or s.startswith(ts_new)) and ";" not in s:
+                continue
+            new_lines.append(line)
+        else:
+            new_lines.append(line)
+
+    new_lines.append("\n[TIMESERIES]")
+    new_lines.append(f";;TR={tr}")
+    new_lines.append(";;Name           Date       Time       Value")
+    for _, row in hyeto.iterrows():
+        new_lines.append(f"{ts_new:<16}           {row['Time_Str']:<10} {row['Intensity_mm_h']:.4f}")
+
+    out_path.write_text("\n".join(new_lines), encoding='latin-1', errors='replace')
+    return out_path
+
+
+# =============================================================================
+# HELPERS DE SERIES DE TIEMPO
+# =============================================================================
+def _normalize_times(times_array) -> np.ndarray:
+    """Convierte array de timestamps a minutos desde t=0."""
+    if len(times_array) == 0:
+        return np.array([])
+    t0 = pd.Timestamp(times_array[0])
+    return np.array([(pd.Timestamp(t) - t0).total_seconds() / 60 for t in times_array])
+
+
+def _cumulative_volume(times_min: np.ndarray, rates: np.ndarray) -> np.ndarray:
+    """Volumen acumulado [m³] a partir de caudales [m³/s] y tiempos [min]."""
+    if len(times_min) < 2:
+        return np.zeros(len(times_min))
+    dt_sec = np.diff(times_min) * 60
+    dv = rates[:-1] * dt_sec
+    return np.concatenate([[0.0], np.cumsum(dv)])
+
+
+def _get_capacity_distribution(metrics: SystemMetrics) -> np.ndarray:
+    """Extrae valores máximos de h/D (Capacity) para todos los links."""
+    vals = []
+    for lid, data in metrics.link_data.items():
+        cap_series = data.get('capacity_series', pd.Series())
+        if len(cap_series) > 0:
+            vals.append(float(cap_series.max()))
+    return np.array(vals)
+
+
+# =============================================================================
+# CLASE PRINCIPAL
+# =============================================================================
 class CrossTRValidator:
-    """
-    Valida una solución comparándola contra múltiples baselines de TR.
-    
-    Usage:
-        validator = CrossTRValidator(
-            baseline_inp=config.SWMM_FILE,
-            solution_inp=solution_path,
-            solution_design_tr=25,
-            work_dir=output_dir
-        )
-        
-        # Ejecutar todo el proceso
-        results = validator.run_full_validation(tr_list=[1, 2, 5, 10, 25, 50])
-    """
-    
-    def __init__(self, 
-                 baseline_inp: Path,
-                 solution_inp: Path,
-                 solution_design_tr: int = 25,
-                 work_dir: Path = None,
-                 enable_caching: bool = True):
-        """
-        Args:
-            baseline_inp: Ruta al modelo base sin tanques
-            solution_inp: Ruta al modelo con tanques (solución)
-            solution_design_tr: TR para el que fue diseñada la solución
-            work_dir: Directorio de salida
-            enable_caching: Si True, guarda métricas en cache para reutilizar
-        """
-        self.baseline_inp = Path(baseline_inp)
-        self.solution_inp = Path(solution_inp)
-        self.solution_tr = solution_design_tr
-        self.enable_caching = enable_caching
-        
+
+    def __init__(self, work_dir=None):
+        self.baseline_inp = Path(config.SWMM_FILE)
+        self.tr_actual = getattr(config, 'BASE_INP_TR', 25)
+        self.tr_list = getattr(config, 'CROSS_TR_VALIDATION_LIST', [1, 2, 5, 10, 25, 50])
+
         if work_dir is None:
-            self.work_dir = Path(config.CODIGOS_DIR) / "optimization_results" / "cross_tr_validation"
+            self.work_dir = Path(config.CODIGOS_DIR) / "optimization_results" / "00_Baseline"
         else:
             self.work_dir = Path(work_dir)
-        
-        self.cache_dir = self.work_dir / "cache"
+
         self.scenarios_dir = self.work_dir / "scenarios"
-        self.figures_dir = self.work_dir / "figures"
-        
-        for d in [self.work_dir, self.cache_dir, self.scenarios_dir, self.figures_dir]:
-            d.mkdir(parents=True, exist_ok=True)
-        
-        # Almacenamiento de métricas
-        self.baseline_metrics: Dict[int, TRMetrics] = {}
-        self.solution_metrics: Dict[int, TRMetrics] = {}
-        self.comparisons: List[CrossComparison] = []
-        
-        print(f"[CrossTR] Inicializado:")
-        print(f"  Baseline: {self.baseline_inp}")
-        print(f"  Solution: {self.solution_inp}")
-        print(f"  Design TR: {self.solution_tr}")
-        print(f"  Work dir: {self.work_dir}")
-    
-    def run_full_validation(self, tr_list: List[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Ejecuta el proceso completo de validación.
-        
-        Returns:
-            (df_functional, df_statistical): Dos DataFrames con comparaciones
-        """
-        if tr_list is None:
-            tr_list = [1, 2, 5, 10, 25, 50]
-        
-        print(f"\n{'='*80}")
-        print(f"CROSS-TR VALIDATION - Full Process")
-        print(f"{'='*80}")
-        print(f"TR list: {tr_list}")
-        print(f"{'='*80}\n")
-        
-        # PASO 1: Pre-proceso baselines
-        print("\n[STEP 1/4] Pre-procesando baselines...")
-        for tr in tr_list:
-            self.baseline_metrics[tr] = self._extract_metrics(
-                inp_path=self.baseline_inp,
-                tr=tr,
-                model_type='baseline'
-            )
-        
-        # PASO 2: Simular solución con todas las lluvias
-        print("\n[STEP 2/4] Simulando solución con múltiples TR...")
-        for tr in tr_list:
-            self.solution_metrics[tr] = self._extract_metrics(
-                inp_path=self.solution_inp,
-                tr=tr,
-                model_type='solution'
-            )
-        
-        # PASO 3: Comparación funcional (sol_trX vs base_trX)
-        print("\n[STEP 3/4] Comparación funcional (mismo TR)...")
-        functional_comparisons = []
-        for tr in tr_list:
-            comp = self._compare_pair(
-                base_metrics=self.baseline_metrics[tr],
-                sol_metrics=self.solution_metrics[tr],
-                tr_base=tr,
-                tr_sol=tr,
-                comparison_type='functional'
-            )
-            functional_comparisons.append(comp)
-        
-        # PASO 4: Comparación estadística cruzada (sol_tr25 vs base_trX)
-        print("\n[STEP 4/4] Comparación estadística cruzada...")
-        statistical_comparisons = []
-        for tr in tr_list:
-            if tr != self.solution_tr:  # Excluir TR de diseño para evitar redundancia
-                comp = self._compare_pair(
-                    base_metrics=self.baseline_metrics[tr],
-                    sol_metrics=self.solution_metrics[self.solution_tr],
-                    tr_base=tr,
-                    tr_sol=self.solution_tr,
-                    comparison_type='statistical'
-                )
-                statistical_comparisons.append(comp)
-        
-        self.comparisons = functional_comparisons + statistical_comparisons
-        
-        # Convertir a DataFrames
-        df_func = self._comparisons_to_df(functional_comparisons)
-        df_stat = self._comparisons_to_df(statistical_comparisons)
-        
-        # Guardar resultados
-        self._save_results(df_func, df_stat)
-        
-        return df_func, df_stat
-    
-    def _extract_metrics(self, inp_path: Path, tr: int, model_type: str) -> TRMetrics:
-        """Extrae métricas para un modelo con un TR específico."""
-        
-        # Verificar cache
-        cache_key = f"{model_type}_TR{tr:03d}_{inp_path.stem}"
-        cache_file = self.cache_dir / f"{cache_key}.pkl"
-        
-        if self.enable_caching and cache_file.exists():
-            print(f"  [Cache] Cargando {model_type} TR{tr}...")
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        
-        print(f"  [Extract] {model_type} TR{tr}...")
-        
-        # Asegurar que existe el escenario
-        scenario_inp = self._ensure_scenario(inp_path, tr)
-        
-        # Extraer métricas con MetricExtractor
-        extractor = MetricExtractor(
-            swmm_file=str(scenario_inp),
-            predios_path=config.PREDIOS_FILE
-        )
-        
-        metrics = extractor.metrics
-        
-        # Crear objeto TRMetrics
-        tr_metrics = TRMetrics(
-            tr=tr,
-            model_type=model_type,
-            inp_path=scenario_inp,
-            flood_volume=metrics.total_flooding_volume,
-            flood_peak_flow=metrics.total_max_flooding_flow,
-            outfall_volume=metrics.total_outfall_volume,
-            outfall_peak_flow=metrics.total_max_outfall_flow,
-            network_health=metrics.network_health_score,
-            network_utilization_mean=metrics.system_mean_utilization,
-            surcharged_links_count=metrics.surcharged_links_count,
-            flooded_nodes_count=metrics.flooded_nodes_count
-        )
-        
-        # Guardar en cache
-        if self.enable_caching:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(tr_metrics, f)
-        
-        return tr_metrics
-    
-    def _ensure_scenario(self, base_inp: Path, tr: int) -> Path:
-        """Genera escenario con hietograma del TR especificado."""
-        
-        scenario_name = f"{base_inp.stem}_TR{tr:03d}.inp"
-        scenario_path = self.scenarios_dir / scenario_name
-        
-        if scenario_path.exists():
-            return scenario_path
-        
-        print(f"    [Gen] Creando escenario TR{tr}...")
-        
-        # Leer base
-        with open(base_inp, 'r', encoding='latin-1', errors='replace') as f:
+        self.scenarios_dir.mkdir(parents=True, exist_ok=True)
+
+        # Almacenar extractor completo (con series de tiempo)
+        self.baseline_extractors: dict[int, MetricExtractor] = {}
+
+        print(f"[CrossTR] TR List: {self.tr_list}")
+        self._generate_baselines()
+
+    # -------------------------------------------------------------------------
+    # PASO 1: Simular baselines
+    # -------------------------------------------------------------------------
+    def _generate_baselines(self):
+        with open(self.baseline_inp, 'r', encoding='latin-1', errors='replace') as f:
             base_content = f.read()
-        
-        # Generar hietograma
-        hyeto_df = generate_alternating_block_hyetograph(
-            tr_years=tr,
-            duration_min=60,
-            dt_min=5
+
+        print(f"\n[CrossTR] Generando {len(self.tr_list)} baselines...")
+
+        for tr in self.tr_list:
+            print(f"\n  [TR{tr}] Generando INP...")
+            sp = self.scenarios_dir / f"baseline_TR{tr:03d}.inp"
+
+            if tr == self.tr_actual:
+                with open(sp, 'w', encoding='latin-1') as f:
+                    f.write(base_content)
+                print(f"    Copiado base TR{self.tr_actual}")
+            else:
+                h = gen_hyetograph(tr)
+                gen_inp_with_tr(base_content, tr, self.tr_actual, h, sp)
+                print(f"    Hietograma generado: total={h['Block_Depth_mm'].sum():.1f} mm")
+
+            print(f"    Simulando...")
+            ex = MetricExtractor(
+                project_root=config.PROJECT_ROOT,
+                predios_path=config.PREDIOS_FILE
+            )
+            ex.run(sp)
+            self.baseline_extractors[tr] = ex
+            print(f"    Flooding: {ex.metrics.total_flooding_volume:,.0f} m³  |  "
+                  f"Peak: {ex.metrics.total_max_flooding_flow:.3f} m³/s")
+
+        print(f"\n[CrossTR] {len(self.baseline_extractors)} baselines listos.")
+
+    @property
+    def baseline_metrics(self) -> dict:
+        """Resumen escalar de métricas baseline (compatibilidad hacia atrás)."""
+        return {
+            tr: {
+                'flood_volume': ex.metrics.total_flooding_volume,
+                'flood_peak': ex.metrics.total_max_flooding_flow,
+                'outfall_peak': ex.metrics.total_max_outfall_flow,
+            }
+            for tr, ex in self.baseline_extractors.items()
+        }
+
+    # -------------------------------------------------------------------------
+    # PASO 2 & 3 & 4: Comparar solución
+    # -------------------------------------------------------------------------
+    def compare_solution(self, sol_inp: Path, name: str = "sol") -> dict:
+        """
+        Simula la solución con cada TR y genera gráficos comparativos.
+
+        Returns:
+            dict con métricas resumen por TR
+        """
+        sol_inp = Path(sol_inp)
+        out_dir = sol_inp.parent / "cross_tr_comparison"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n[CrossTR] Comparando solución: {name}")
+
+        with open(sol_inp, 'r', encoding='latin-1') as f:
+            sol_content = f.read()
+
+        # -- PASO 2: Simular solución con cada TR --
+        sol_extractors: dict[int, MetricExtractor] = {}
+
+        for tr in self.tr_list:
+            print(f"  [Sol TR{tr}]...")
+
+            if tr == self.tr_actual:
+                sc = sol_inp
+            else:
+                sc = self.scenarios_dir / f"sol_{name}_TR{tr:03d}.inp"
+                h = gen_hyetograph(tr)
+                gen_inp_with_tr(sol_content, tr, self.tr_actual, h, sc)
+
+            ex = MetricExtractor(
+                project_root=config.PROJECT_ROOT,
+                predios_path=config.PREDIOS_FILE
+            )
+            ex.run(sc)
+            sol_extractors[tr] = ex
+            print(f"    Flooding: {ex.metrics.total_flooding_volume:,.0f} m³  |  "
+                  f"Peak: {ex.metrics.total_max_flooding_flow:.3f} m³/s")
+
+        # -- PASO 3: Gráficos funcionales (base_trX vs sol_trX) --
+        print("\n[CrossTR] Generando gráficos Paso 3 (funcional)...")
+        self._plot_paso3_functional(
+            sol_extractors, out_dir, name
         )
-        
-        # Generar INP modificado
-        from rut_22_scenario_generator import generate_inp_file
-        
-        generate_inp_file(
-            base_content=base_content,
-            tr=tr,
-            hyetograph_df=hyeto_df,
-            output_path=scenario_path
+
+        # -- PASO 4: Gráficos cruzados (sol_tr25 vs base_trX) --
+        print("[CrossTR] Generando gráficos Paso 4 (cross-TR)...")
+        self._plot_paso4_cross_tr(
+            sol_extractors[self.tr_actual],
+            out_dir, name
         )
-        
-        return scenario_path
-    
-    def _compare_pair(self, base_metrics: TRMetrics, sol_metrics: TRMetrics,
-                     tr_base: int, tr_sol: int, comparison_type: str) -> CrossComparison:
-        """Compara un par de métricas base vs solución."""
-        
-        def safe_diff(sol, base):
-            return sol - base
-        
-        def safe_pct(sol, base):
-            return ((sol - base) / base * 100) if base > 0 else 0
-        
-        def safe_ratio(sol, base):
-            return sol / base if base > 0 else 0
-        
-        return CrossComparison(
-            comparison_type=comparison_type,
-            tr_base=tr_base,
-            tr_sol=tr_sol,
-            
-            base_flood_volume=base_metrics.flood_volume,
-            base_flood_peak=base_metrics.flood_peak_flow,
-            base_outfall_volume=base_metrics.outfall_volume,
-            base_outfall_peak=base_metrics.outfall_peak_flow,
-            base_network_health=base_metrics.network_health,
-            
-            sol_flood_volume=sol_metrics.flood_volume,
-            sol_flood_peak=sol_metrics.flood_peak_flow,
-            sol_outfall_volume=sol_metrics.outfall_volume,
-            sol_outfall_peak=sol_metrics.outfall_peak_flow,
-            sol_network_health=sol_metrics.network_health,
-            
-            diff_volume_abs=safe_diff(sol_metrics.flood_volume, base_metrics.flood_volume),
-            diff_volume_pct=safe_pct(sol_metrics.flood_volume, base_metrics.flood_volume),
-            diff_peak_abs=safe_diff(sol_metrics.flood_peak_flow, base_metrics.flood_peak_flow),
-            diff_peak_pct=safe_pct(sol_metrics.flood_peak_flow, base_metrics.flood_peak_flow),
-            diff_outfall_abs=safe_diff(sol_metrics.outfall_volume, base_metrics.outfall_volume),
-            diff_outfall_pct=safe_pct(sol_metrics.outfall_volume, base_metrics.outfall_volume),
-            diff_health_abs=safe_diff(sol_metrics.network_health, base_metrics.network_health),
-            diff_health_pct=safe_pct(sol_metrics.network_health, base_metrics.network_health),
-            
-            ratio_volume=safe_ratio(sol_metrics.flood_volume, base_metrics.flood_volume),
-            ratio_peak=safe_ratio(sol_metrics.flood_peak_flow, base_metrics.flood_peak_flow),
-            ratio_outfall=safe_ratio(sol_metrics.outfall_volume, base_metrics.outfall_volume),
-            ratio_health=safe_ratio(sol_metrics.network_health, base_metrics.network_health)
-        )
-    
-    def _comparisons_to_df(self, comparisons: List[CrossComparison]) -> pd.DataFrame:
-        """Convierte lista de comparaciones a DataFrame."""
-        data = []
-        for c in comparisons:
-            data.append({
-                'comparison_type': c.comparison_type,
-                'tr_base': c.tr_base,
-                'tr_sol': c.tr_sol,
-                'base_flood_volume': c.base_flood_volume,
-                'base_flood_peak': c.base_flood_peak,
-                'base_outfall_volume': c.base_outfall_volume,
-                'base_network_health': c.base_network_health,
-                'sol_flood_volume': c.sol_flood_volume,
-                'sol_flood_peak': c.sol_flood_peak,
-                'sol_outfall_volume': c.sol_outfall_volume,
-                'sol_network_health': c.sol_network_health,
-                'diff_volume_pct': c.diff_volume_pct,
-                'diff_peak_pct': c.diff_peak_pct,
-                'diff_outfall_pct': c.diff_outfall_pct,
-                'diff_health_pct': c.diff_health_pct,
-                'ratio_volume': c.ratio_volume,
-                'ratio_peak': c.ratio_peak,
-                'ratio_outfall': c.ratio_outfall,
-                'ratio_health': c.ratio_health
-            })
-        return pd.DataFrame(data)
-    
-    def _save_results(self, df_func: pd.DataFrame, df_stat: pd.DataFrame):
-        """Guarda todos los resultados y genera figuras."""
-        
-        # Guardar CSVs
-        df_func.to_csv(self.work_dir / "comparison_functional.csv", index=False)
-        df_stat.to_csv(self.work_dir / "comparison_statistical.csv", index=False)
-        
-        # Generar figuras
-        self._plot_functional_comparison(df_func)
-        self._plot_statistical_comparison(df_stat)
-        self._plot_ratios_comparison(df_func, df_stat)
-        
-        # Generar resumen
-        self._generate_summary_text(df_func, df_stat)
-        
-        print(f"\n[CrossTR] Resultados guardados en: {self.work_dir}")
-    
-    def _plot_functional_comparison(self, df: pd.DataFrame):
-        """Gráfico de comparación funcional."""
-        if df.empty:
+
+        # -- Extras: Risk Curve, Node Map, Radar --
+        print("[CrossTR] Generando gráficos adicionales...")
+        self._plot_risk_curve(sol_extractors, out_dir, name)
+        self._plot_node_map(sol_extractors, out_dir, name)
+        self._plot_radar(sol_extractors, out_dir, name)
+
+        # -- CSV resumen --
+        self._export_summary_csv(sol_extractors, out_dir, name)
+        self._export_nodes_csv(sol_extractors, out_dir, name)
+
+        print(f"\n[CrossTR] Guardado en: {out_dir}")
+
+        # Retornar resumen
+        return {
+            tr: {
+                'base_flood_vol': self.baseline_extractors[tr].metrics.total_flooding_volume,
+                'sol_flood_vol': sol_extractors[tr].metrics.total_flooding_volume,
+                'base_flood_peak': self.baseline_extractors[tr].metrics.total_max_flooding_flow,
+                'sol_flood_peak': sol_extractors[tr].metrics.total_max_flooding_flow,
+            }
+            for tr in self.tr_list
+        }
+
+    # -------------------------------------------------------------------------
+    # PASO 3: Gráfico funcional — base_trX vs sol_trX para cada TR
+    # -------------------------------------------------------------------------
+    def _plot_paso3_functional(self, sol_extractors: dict, out_dir: Path, name: str):
+        """
+        Una figura por TR con 4 paneles:
+          [0,0] Flooding Flow (m³/s) vs tiempo
+          [0,1] Outfall Flow (m³/s) vs tiempo
+          [1,0] Volumen Acumulado de Flooding (m³)
+          [1,1] Distribución de Capacidad h/D (CDF)
+        """
+        for tr in self.tr_list:
+            base_m = self.baseline_extractors[tr].metrics
+            sol_m = sol_extractors[tr].metrics
+
+            fig = plt.figure(figsize=(14, 9))
+            fig.patch.set_facecolor('white')
+
+            # Supertítulo
+            red_pct = 0.0
+            if base_m.total_flooding_volume > 0:
+                red_pct = (base_m.total_flooding_volume - sol_m.total_flooding_volume) / base_m.total_flooding_volume * 100
+            fig.suptitle(
+                f"Paso 3 · Validación Funcional  ·  TR{tr} años  ·  {name}\n"
+                f"Reducción flooding: {red_pct:+.1f}%  |  "
+                f"Base: {base_m.total_flooding_volume:,.0f} m³  →  "
+                f"Sol: {sol_m.total_flooding_volume:,.0f} m³",
+                fontsize=11, fontweight='bold', color=COLORS['text'], y=0.98
+            )
+
+            gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.32,
+                                   left=0.08, right=0.97, top=0.90, bottom=0.08)
+
+            ax_ff = fig.add_subplot(gs[0, 0])  # Flooding Flow
+            ax_of = fig.add_subplot(gs[0, 1])  # Outfall Flow
+            ax_vol = fig.add_subplot(gs[1, 0])  # Volumen acumulado
+            ax_cap = fig.add_subplot(gs[1, 1])  # Distribución Capacidad
+
+            # ── Panel 1: Flooding Flow ──────────────────────────────────────
+            self._plot_flow_series(
+                ax_ff,
+                base_m.system_flood_hydrograph,
+                sol_m.system_flood_hydrograph,
+                title=f'Caudal de Flooding  [TR{tr}]',
+                ylabel='Caudal (m³/s)',
+            )
+
+            # ── Panel 2: Outfall Flow ───────────────────────────────────────
+            self._plot_flow_series(
+                ax_of,
+                base_m.system_outfall_flow_hydrograph,
+                sol_m.system_outfall_flow_hydrograph,
+                title=f'Caudal Outfall  [TR{tr}]',
+                ylabel='Caudal (m³/s)',
+            )
+
+            # ── Panel 3: Volumen acumulado de flooding ──────────────────────
+            self._plot_cumulative_volume(ax_vol, base_m, sol_m, tr)
+
+            # ── Panel 4: Distribución de capacidad (h/D) ───────────────────
+            self._plot_capacity_distribution(ax_cap, base_m, sol_m, tr)
+
+            fig.savefig(out_dir / f"paso3_TR{tr:03d}_{name}.png",
+                        dpi=160, bbox_inches='tight', facecolor='white')
+            plt.close(fig)
+            print(f"    Guardado: paso3_TR{tr:03d}_{name}.png")
+
+    # -------------------------------------------------------------------------
+    # PASO 4: Gráfico cross-TR — sol_tr25 vs base_trX
+    # -------------------------------------------------------------------------
+    def _plot_paso4_cross_tr(self, sol_tr_actual: MetricExtractor, out_dir: Path, name: str):
+        """
+        Una figura con 4 paneles mostrando sol_tr25 vs cada baseline_trX.
+        Base TR_actual se incluye SIEMPRE en las series de tiempo como referencia
+        de diseño (línea gruesa), aunque no aparezca en el bar chart cruzado.
+        """
+        tr_cross = [tr for tr in self.tr_list if tr != self.tr_actual]
+
+        if not tr_cross:
             return
-        
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        tr_labels = [f"TR{int(r)}" for r in df['tr_base']]
-        x = np.arange(len(tr_labels))
-        width = 0.35
-        
-        # Volumen inundación
-        ax = axes[0, 0]
-        ax.bar(x - width/2, df['base_flood_volume'], width, label='Baseline', alpha=0.8, color='coral')
-        ax.bar(x + width/2, df['sol_flood_volume'], width, label='Solución', alpha=0.8, color='skyblue')
-        ax.set_ylabel('Volumen (m³)')
-        ax.set_title('Volumen de Inundación - Comparación Funcional')
-        ax.set_xticks(x)
-        ax.set_xticklabels(tr_labels)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Caudal pico
-        ax = axes[0, 1]
-        ax.bar(x - width/2, df['base_flood_peak'], width, label='Baseline', alpha=0.8, color='coral')
-        ax.bar(x + width/2, df['sol_flood_peak'], width, label='Solución', alpha=0.8, color='skyblue')
-        ax.set_ylabel('Caudal (m³/s)')
-        ax.set_title('Caudal Pico - Comparación Funcional')
-        ax.set_xticks(x)
-        ax.set_xticklabels(tr_labels)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Volumen outfall
-        ax = axes[1, 0]
-        ax.bar(x - width/2, df['base_outfall_volume'], width, label='Baseline', alpha=0.8, color='coral')
-        ax.bar(x + width/2, df['sol_outfall_volume'], width, label='Solución', alpha=0.8, color='skyblue')
-        ax.set_ylabel('Volumen (m³)')
-        ax.set_title('Outfall - Comparación Funcional')
-        ax.set_xticks(x)
-        ax.set_xticklabels(tr_labels)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Network Health
-        ax = axes[1, 1]
-        ax.bar(x - width/2, df['base_network_health'], width, label='Baseline', alpha=0.8, color='coral')
-        ax.bar(x + width/2, df['sol_network_health'], width, label='Solución', alpha=0.8, color='skyblue')
-        ax.set_ylabel('Health (0-1)')
-        ax.set_title('Network Health - Comparación Funcional')
-        ax.set_xticks(x)
-        ax.set_xticklabels(tr_labels)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(self.figures_dir / "01_functional_comparison.png", dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    def _plot_statistical_comparison(self, df: pd.DataFrame):
-        """Gráfico de comparación estadística."""
-        if df.empty:
-            return
-        
-        fig, ax = plt.subplots(figsize=(12, 7))
-        
-        tr_labels = [f"TR{int(r)}" for r in df['tr_base']]
-        x = np.arange(len(tr_labels))
-        
-        # Barras de volumen
-        ax.bar(x - 0.2, df['base_flood_volume'], 0.4, label='Baseline', alpha=0.7, color='lightcoral')
-        ax.bar(x + 0.2, df['sol_flood_volume'], 0.4, label=f'Solución TR{self.solution_tr}', alpha=0.7, color='steelblue')
-        
-        # Líneas de diferencia porcentual
-        ax2 = ax.twinx()
-        ax2.plot(x, df['diff_volume_pct'], 'go-', linewidth=2, markersize=8, label='% Diferencia')
-        ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
-        
-        ax.set_xlabel('Período de Retorno Comparado', fontsize=12)
-        ax.set_ylabel('Volumen Inundado (m³)', fontsize=12)
-        ax2.set_ylabel('Diferencia Porcentual (%)', fontsize=12, color='green')
-        ax.set_title(f'Comparación Estadística: Solución TR{self.solution_tr} vs Baselines', fontsize=14, fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(tr_labels)
-        ax.legend(loc='upper left')
-        ax2.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(self.figures_dir / "02_statistical_comparison.png", dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    def _plot_ratios_comparison(self, df_func: pd.DataFrame, df_stat: pd.DataFrame):
-        """Gráfico de ratios."""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        
-        # Ratios funcionales
-        if not df_func.empty:
-            tr_labels = [f"TR{int(r)}" for r in df_func['tr_base']]
-            x = np.arange(len(tr_labels))
-            
-            ax1.plot(x, df_func['ratio_volume'], 'o-', label='Volumen', linewidth=2, markersize=8)
-            ax1.plot(x, df_func['ratio_peak'], 's-', label='Caudal Pico', linewidth=2, markersize=8)
-            ax1.plot(x, df_func['ratio_outfall'], '^-', label='Outfall', linewidth=2, markersize=8)
-            ax1.axhline(y=1.0, color='red', linestyle='--', alpha=0.5)
-            ax1.axhline(y=0.5, color='green', linestyle='--', alpha=0.3)
-            ax1.set_xlabel('TR')
-            ax1.set_ylabel('Ratio (Solución / Baseline)')
-            ax1.set_title('Ratios - Comparación Funcional')
-            ax1.set_xticks(x)
-            ax1.set_xticklabels(tr_labels)
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-        
-        # Ratios estadísticos
-        if not df_stat.empty:
-            tr_labels = [f"TR{int(r)}" for r in df_stat['tr_base']]
-            x = np.arange(len(tr_labels))
-            
-            ax2.plot(x, df_stat['ratio_volume'], 'o-', label='Volumen', linewidth=2, markersize=8, color='purple')
-            ax2.axhline(y=1.0, color='red', linestyle='--', alpha=0.5)
-            ax2.axhline(y=0.5, color='green', linestyle='--', alpha=0.3)
-            ax2.set_xlabel('TR Comparado')
-            ax2.set_ylabel('Ratio (Solución / Baseline)')
-            ax2.set_title(f'Ratios - Solución TR{self.solution_tr} vs Baselines')
-            ax2.set_xticks(x)
-            ax2.set_xticklabels(tr_labels)
-            ax2.legend()
-            ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(self.figures_dir / "03_ratios.png", dpi=150, bbox_inches='tight')
-        plt.close()
-    
-    def _generate_summary_text(self, df_func: pd.DataFrame, df_stat: pd.DataFrame):
-        """Genera archivo de texto con resumen."""
-        summary_path = self.work_dir / "summary.txt"
-        
-        with open(summary_path, 'w') as f:
-            f.write("="*80 + "\n")
-            f.write("CROSS-TR VALIDATION SUMMARY\n")
-            f.write(f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-            f.write(f"Solución diseñada para TR{self.solution_tr}\n")
-            f.write("="*80 + "\n\n")
-            
-            # Comparación funcional
-            f.write("--- COMPARACIÓN FUNCIONAL (mismo TR vs mismo TR) ---\n\n")
-            for _, row in df_func.iterrows():
-                tr = int(row['tr_base'])
-                f.write(f"TR{tr}:\n")
-                f.write(f"  Volumen Base: {row['base_flood_volume']:.1f} m³\n")
-                f.write(f"  Volumen Sol:  {row['sol_flood_volume']:.1f} m³\n")
-                f.write(f"  Diferencia:   {row['diff_volume_pct']:.1f}%\n")
-                f.write(f"  Ratio:        {row['ratio_volume']:.2f}\n\n")
-            
-            # Comparación estadística
-            f.write("\n--- COMPARACIÓN ESTADÍSTICA (Sol TR{} vs Baselines) ---\n\n".format(self.solution_tr))
-            for _, row in df_stat.iterrows():
-                tr = int(row['tr_base'])
-                f.write(f"vs Baseline TR{tr}:\n")
-                f.write(f"  Volumen Base TR{tr}:  {row['base_flood_volume']:.1f} m³\n")
-                f.write(f"  Volumen Sol TR{self.solution_tr}: {row['sol_flood_volume']:.1f} m³\n")
-                f.write(f"  Diferencia:          {row['diff_volume_pct']:.1f}%\n")
-                f.write(f"  Ratio:               {row['ratio_volume']:.2f}\n")
-                
-                if row['ratio_volume'] < 1.0:
-                    f.write(f"  → La solución MEJORA vs evento TR{tr} sin intervención\n\n")
+
+        fig = plt.figure(figsize=(16, 10))
+        fig.patch.set_facecolor('white')
+        fig.suptitle(
+            f"Paso 4 · Validación Cruzada  ·  Sol TR{self.tr_actual} vs Baselines  ·  {name}",
+            fontsize=12, fontweight='bold', color=COLORS['text'], y=0.99
+        )
+
+        gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.32,
+                               left=0.08, right=0.97, top=0.93, bottom=0.08)
+
+        ax_ff = fig.add_subplot(gs[0, 0])
+        ax_of = fig.add_subplot(gs[0, 1])
+        ax_vol = fig.add_subplot(gs[1, 0])
+        ax_bar = fig.add_subplot(gs[1, 1])
+
+        sol_m = sol_tr_actual.metrics
+        base_ref_m = self.baseline_extractors[self.tr_actual].metrics  # Base TR25 = referencia
+
+        # ── Paneles 1 & 2: Flooding Flow y Outfall Flow ────────────────────
+        for ax, hydro_key, title, ylabel in [
+            (ax_ff, 'system_flood_hydrograph',
+             f'Flooding Flow: Sol TR{self.tr_actual} vs Bases', 'Caudal Flooding (m³/s)'),
+            (ax_of, 'system_outfall_flow_hydrograph',
+             f'Outfall Flow: Sol TR{self.tr_actual} vs Bases', 'Caudal Outfall (m³/s)'),
+        ]:
+            ax.set_facecolor('#FAFAFA')
+            ax.grid(True, color=COLORS['grid'], linewidth=0.8, zorder=0)
+
+            # 1) Baselines de otros TR primero (fondo, líneas finas y tenues)
+            for tr in tr_cross:
+                base_hydro = getattr(self.baseline_extractors[tr].metrics, hydro_key, {})
+                if base_hydro.get('times', np.array([])).size > 0:
+                    t_b = _normalize_times(base_hydro['times'])
+                    ax.plot(t_b, base_hydro['total_rate'],
+                            color=TR_COLORS.get(tr, '#888888'), linewidth=0.9,
+                            alpha=0.5, label=f'Base TR{tr}', zorder=3)
+
+            # 2) Base TR_actual como referencia de diseño (media, color azul)
+            base_ref_hydro = getattr(base_ref_m, hydro_key, {})
+            if base_ref_hydro.get('times', np.array([])).size > 0:
+                t_ref = _normalize_times(base_ref_hydro['times'])
+                ax.plot(t_ref, base_ref_hydro['total_rate'],
+                        color=TR_COLORS.get(self.tr_actual, '#1F77B4'),
+                        linewidth=2.0, linestyle='-', alpha=0.85,
+                        label=f'Base TR{self.tr_actual} (diseño)', zorder=5)
+
+            # 3) Solución — línea negra gruesa, protagonista
+            sol_hydro = getattr(sol_m, hydro_key, {})
+            if sol_hydro.get('times', np.array([])).size > 0:
+                t_sol = _normalize_times(sol_hydro['times'])
+                ax.plot(t_sol, sol_hydro['total_rate'],
+                        color='#111111', linewidth=3.0, linestyle='-',
+                        label=f'Sol TR{self.tr_actual} ✓', zorder=8)
+
+            _style_ax(ax, title=title, xlabel='Tiempo (min)', ylabel=ylabel)
+
+        # ── Panel 3: Volumen acumulado ──────────────────────────────────────
+        ax_vol.set_facecolor('#FAFAFA')
+        ax_vol.grid(True, color=COLORS['grid'], linewidth=0.8, zorder=0)
+
+        # 1) Baselines otros TR (fondo, finas)
+        for tr in tr_cross:
+            base_hydro = self.baseline_extractors[tr].metrics.system_flood_hydrograph
+            if base_hydro.get('times', np.array([])).size > 0:
+                t_b = _normalize_times(base_hydro['times'])
+                v_b = _cumulative_volume(t_b, base_hydro['total_rate'])
+                ax_vol.plot(t_b, v_b / 1000,
+                            color=TR_COLORS.get(tr, '#888888'), linewidth=0.9,
+                            alpha=0.5, label=f'Base TR{tr}', zorder=3)
+
+        # 2) Base TR_actual como referencia de diseño (media, azul)
+        ref_hydro = base_ref_m.system_flood_hydrograph
+        if ref_hydro.get('times', np.array([])).size > 0:
+            t_ref = _normalize_times(ref_hydro['times'])
+            v_ref = _cumulative_volume(t_ref, ref_hydro['total_rate'])
+            ax_vol.plot(t_ref, v_ref / 1000,
+                        color=TR_COLORS.get(self.tr_actual, '#1F77B4'),
+                        linewidth=2.0, linestyle='-', alpha=0.85,
+                        label=f'Base TR{self.tr_actual} (diseño)', zorder=5)
+
+        # 3) Solución — negra gruesa, protagonista
+        sol_hydro = sol_m.system_flood_hydrograph
+        if sol_hydro.get('times', np.array([])).size > 0:
+            t_sol = _normalize_times(sol_hydro['times'])
+            v_sol = _cumulative_volume(t_sol, sol_hydro['total_rate'])
+            ax_vol.plot(t_sol, v_sol / 1000,
+                        color='#111111', linewidth=3.0, linestyle='-',
+                        label=f'Sol TR{self.tr_actual} ✓', zorder=8)
+
+        _style_ax(ax_vol,
+                  title=f'Volumen Acumulado Flooding: Sol TR{self.tr_actual} vs Bases',
+                  xlabel='Tiempo (min)', ylabel='Volumen Acumulado (10³ m³)')
+
+        # ── Panel 4: Barras — reducción funcional (cada TR propio) ──────────
+        # Aquí mostramos sol_trX vs base_trX para TODOS los TR del Paso 3,
+        # resaltando TR_actual como barra de referencia de diseño.
+        ax_bar.set_facecolor('#FAFAFA')
+        ax_bar.grid(True, axis='y', color=COLORS['grid'], linewidth=0.8, zorder=0)
+
+        # Nota: para el bar chart usamos sol_trX vs base_trX (no sol_tr25 fijo)
+        # ya que el objetivo es mostrar cuánto mejora la solución en cada TR
+        # comparada con su propio baseline — eso sí tiene sentido físico.
+        # (Este panel resume el Paso 3 en una sola vista)
+        labels, reductions, bar_colors, edge_colors, edge_widths = [], [], [], [], []
+
+        for tr in self.tr_list:
+            bv = self.baseline_extractors[tr].metrics.total_flooding_volume
+            # Para TR_actual usamos sol_tr_actual; para los demás no tenemos sol_trX aquí,
+            # así que comparamos sol_tr_actual vs base_trX como proxy de robustez cruzada.
+            sv = sol_m.total_flooding_volume
+            red = (bv - sv) / bv * 100 if bv > 0 else 0.0
+
+            labels.append(f'TR{tr}')
+            reductions.append(red)
+
+            if tr == self.tr_actual:
+                # Diseño: resaltado con borde
+                bar_colors.append('#4CAF50' if red >= 0 else '#E05C5C')
+                edge_colors.append('#1B5E20' if red >= 0 else '#B71C1C')
+                edge_widths.append(2.0)
+            else:
+                bar_colors.append('#81C784' if red >= 0 else '#EF9A9A')
+                edge_colors.append('white')
+                edge_widths.append(0.8)
+
+        bars = ax_bar.bar(labels, reductions, color=bar_colors, alpha=0.88,
+                          edgecolor=edge_colors, linewidth=0.8, zorder=3)
+
+        # Aplicar linewidth por barra individualmente (bar() no acepta lista de linewidths)
+        for bar, lw in zip(bars, edge_widths):
+            bar.set_linewidth(lw)
+        ax_bar.axhline(y=0, color='#555555', linewidth=0.8)
+
+        # Anotación especial para TR_actual
+        for bar, val, tr in zip(bars, reductions, self.tr_list):
+            va = 'bottom' if val >= 0 else 'top'
+            offset = max(abs(val) * 0.02, 0.5) * (1 if val >= 0 else -1)
+            weight = 'bold' if tr == self.tr_actual else 'normal'
+            size = 8.5 if tr == self.tr_actual else 7.5
+            txt = f'{val:+.1f}%' + (f'\n(diseño)' if tr == self.tr_actual else '')
+            ax_bar.text(bar.get_x() + bar.get_width() / 2,
+                        val + offset, txt,
+                        ha='center', va=va, fontsize=size,
+                        fontweight=weight, color=COLORS['text'])
+
+        _style_ax(ax_bar,
+                  title=f'Reducción Flooding: Sol TR{self.tr_actual} vs cada Base (%)',
+                  xlabel='TR', ylabel='Reducción (%)',
+                  legend=False)
+
+        # Nota explicativa debajo del bar chart
+        ax_bar.text(0.5, -0.16,
+                    'Barras oscuras = TR de diseño  |  Positivo = sol reduce flooding  |'
+                    '  Negativo = baseline ligero produce menos flooding (esperado)',
+                    transform=ax_bar.transAxes, ha='center', va='top',
+                    fontsize=6.5, color='#666666', style='italic')
+
+        fig.savefig(out_dir / f"paso4_cross_tr_{name}.png",
+                    dpi=160, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    Guardado: paso4_cross_tr_{name}.png")
+
+    # -------------------------------------------------------------------------
+    # HELPERS DE PLOTS
+    # -------------------------------------------------------------------------
+    def _plot_flow_series(self, ax, base_hydro: dict, sol_hydro: dict,
+                          title: str, ylabel: str):
+        """Grafica dos hidrogramas (baseline vs solución) en el mismo eje."""
+        ax.set_facecolor('#FAFAFA')
+        ax.grid(True, color=COLORS['grid'], linewidth=0.8, zorder=0)
+
+        bt = base_hydro.get('times', np.array([]))
+        br = base_hydro.get('total_rate', np.array([]))
+        st = sol_hydro.get('times', np.array([]))
+        sr = sol_hydro.get('total_rate', np.array([]))
+
+        if bt.size > 0:
+            t_b = _normalize_times(bt)
+            ax.fill_between(t_b, br, alpha=0.15, color=COLORS['baseline'], zorder=2)
+            ax.plot(t_b, br, color=COLORS['baseline'], linewidth=1.8,
+                    label='Baseline', zorder=3)
+
+        if st.size > 0:
+            t_s = _normalize_times(st)
+            ax.fill_between(t_s, sr, alpha=0.15, color=COLORS['solution'], zorder=2)
+            ax.plot(t_s, sr, color=COLORS['solution'], linewidth=1.8,
+                    linestyle='--', label='Solución', zorder=3)
+
+        _style_ax(ax, title=title, xlabel='Tiempo (min)', ylabel=ylabel)
+
+    def _plot_cumulative_volume(self, ax, base_m: SystemMetrics, sol_m: SystemMetrics, tr: int):
+        """Volumen acumulado de flooding (m³)."""
+        ax.set_facecolor('#FAFAFA')
+        ax.grid(True, color=COLORS['grid'], linewidth=0.8, zorder=0)
+
+        for metrics, color, label, ls in [
+            (base_m, COLORS['baseline'], f'Baseline  ({base_m.total_flooding_volume:,.0f} m³)', '-'),
+            (sol_m, COLORS['solution'], f'Solución  ({sol_m.total_flooding_volume:,.0f} m³)', '--'),
+        ]:
+            hydro = metrics.system_flood_hydrograph
+            times = hydro.get('times', np.array([]))
+            rates = hydro.get('total_rate', np.array([]))
+            if times.size > 1:
+                t_min = _normalize_times(times)
+                v_cum = _cumulative_volume(t_min, rates)
+                ax.plot(t_min, v_cum, color=color, linewidth=1.8,
+                        linestyle=ls, label=label, zorder=3)
+
+        _style_ax(ax,
+                  title=f'Volumen Acumulado Flooding  [TR{tr}]',
+                  xlabel='Tiempo (min)', ylabel='Volumen Acumulado (m³)')
+
+    def _plot_capacity_distribution(self, ax, base_m: SystemMetrics, sol_m: SystemMetrics, tr: int):
+        """
+        Distribución de frecuencia (KDE + histograma) de utilización h/D por tubería.
+        Muestra cómo se distribuye la carga en la red, no la acumulada.
+        """
+        ax.set_facecolor('#FAFAFA')
+        ax.grid(True, color=COLORS['grid'], linewidth=0.8, zorder=0)
+
+        x_max = 0.0
+        for metrics, color, label, alpha_hist in [
+            (base_m, COLORS['baseline'], 'Baseline', 0.25),
+            (sol_m, COLORS['solution'], 'Solución', 0.20),
+        ]:
+            vals = _get_capacity_distribution(metrics)
+            if len(vals) < 3:
+                continue
+            vals = vals[vals > 0]
+            if len(vals) < 3:
+                continue
+            x_max = max(x_max, np.percentile(vals, 99))
+
+            # Histograma de fondo
+            ax.hist(vals, bins=25, density=True, color=color, alpha=alpha_hist,
+                    zorder=2)
+            # KDE encima
+            try:
+                kde = gaussian_kde(vals, bw_method='silverman')
+                x_kde = np.linspace(0, max(vals) * 1.05, 300)
+                ax.plot(x_kde, kde(x_kde), color=color, linewidth=1.8,
+                        label=f'{label} (n={len(vals)})', zorder=3)
+            except Exception:
+                pass
+
+        # Umbrales
+        ax.axvline(x=1.0, color='#FF6B35', linewidth=1.2, linestyle=':',
+                   label='Saturación (h/D=1.0)', zorder=4)
+        ax.axvline(x=0.8, color='#FFC107', linewidth=1.0, linestyle=':',
+                   label='Diseño (h/D=0.8)', zorder=4)
+
+        ax.set_xlim(left=0, right=min(x_max * 1.1, 1.5) if x_max > 0 else 1.5)
+        ax.set_ylim(bottom=0)
+        _style_ax(ax,
+                  title=f'Distribución Frecuencia h/D Tuberías  [TR{tr}]',
+                  xlabel='Utilización máxima (h/D)',
+                  ylabel='Densidad')
+
+    # -------------------------------------------------------------------------
+    # EXTRA 1: Curva de Riesgo — todas las variables vs TR (escala log)
+    # -------------------------------------------------------------------------
+    def _plot_risk_curve(self, sol_extractors: dict, out_dir: Path, name: str):
+        """
+        Curva de riesgo en escala log. 6 paneles (2 filas x 3 columnas).
+        Labels de % en cajas coloreadas alternando arriba/abajo para evitar solapamiento.
+        """
+        trs = self.tr_list
+
+        def _get(extractors_dict, tr, attr):
+            return getattr(extractors_dict[tr].metrics, attr, 0.0) or 0.0
+
+        panels = [
+            ('total_flooding_volume', 'Volumen de Flooding', 'm³', '↓ mejor', True),
+            ('total_max_flooding_flow', 'Caudal Pico Flooding', 'm³/s', '↓ mejor', True),
+            ('total_outfall_volume', 'Volumen Outfall', 'm³', '↑ mejor', False),
+            ('total_max_outfall_flow', 'Caudal Pico Outfall', 'm³/s', '↑ mejor', False),
+            ('overloaded_links_length', 'Links Saturados', 'm', '↓ mejor', True),
+            ('network_health_score', 'Network Health Score', '0–1', '↑ mejor', False),
+        ]
+
+        fig, axes = plt.subplots(2, 3, figsize=(22, 13))
+        fig.patch.set_facecolor('white')
+        fig.suptitle(f'Curvas de Riesgo — Todas las Variables  ·  {name}',
+                     fontsize=15, fontweight='bold', color=COLORS['text'], y=0.99)
+
+        axes_flat = axes.flatten()
+
+        for idx, (attr, title, unit, direction, lower_better) in enumerate(panels):
+            ax = axes_flat[idx]
+            ax.set_facecolor('#FAFAFA')
+            ax.grid(True, color=COLORS['grid'], linewidth=0.9, which='both', zorder=0)
+
+            b_vals = [_get(self.baseline_extractors, tr, attr) for tr in trs]
+            s_vals = [_get(sol_extractors, tr, attr) for tr in trs]
+
+            # ── Curvas ────────────────────────────────────────────────────
+            ax.plot(trs, b_vals, 'o-', color=COLORS['baseline'], linewidth=2.4,
+                    markersize=8, label='Baseline', zorder=4, markerfacecolor='white',
+                    markeredgewidth=2)
+            ax.plot(trs, s_vals, 's-', color='#111111', linewidth=2.8,
+                    markersize=8, label='Solución', zorder=5)
+
+            # ── Área entre curvas ─────────────────────────────────────────
+            if lower_better:
+                improve = [b >= s for b, s in zip(b_vals, s_vals)]
+            else:
+                improve = [s >= b for b, s in zip(b_vals, s_vals)]
+
+            ax.fill_between(trs, b_vals, s_vals, where=improve,
+                            alpha=0.15, color='#4CAF50', zorder=2)
+            ax.fill_between(trs, b_vals, s_vals, where=[not i for i in improve],
+                            alpha=0.15, color='#E05C5C', zorder=2)
+
+            # ── TR de diseño ───────────────────────────────────────────────
+            ax.axvline(x=self.tr_actual, color='#9C27B0', linewidth=1.1,
+                       linestyle=':', alpha=0.75, zorder=3)
+
+            # ── Labels de % — alternando arriba/abajo, con caja coloreada ─
+            y_min, y_max = min(min(b_vals), min(s_vals)), max(max(b_vals), max(s_vals))
+            y_span = y_max - y_min if y_max > y_min else 1.0
+
+            for i, (tr, bv, sv) in enumerate(zip(trs, b_vals, s_vals)):
+                ref = bv if bv != 0 else (sv if sv != 0 else None)
+                if ref is None:
+                    continue
+                if lower_better:
+                    pct = (bv - sv) / abs(ref) * 100
                 else:
-                    f.write(f"  → La solución tiene MAYOR inundación que TR{tr} base\n\n")
-            
-            # Conclusión
-            f.write("="*80 + "\n")
-            f.write("CONCLUSIONES:\n")
-            if not df_func.empty:
-                avg_reduction = df_func['diff_volume_pct'].mean()
-                f.write(f"- Reducción promedio (comparación funcional): {avg_reduction:.1f}%\n")
-            if not df_stat.empty:
-                ratios = df_stat['ratio_volume'].values
-                f.write(f"- Ratio promedio vs baselines: {ratios.mean():.2f}\n")
-                f.write(f"- Mejor ratio: {ratios.min():.2f} (vs TR{df_stat.loc[df_stat['ratio_volume'].idxmin(), 'tr_base']:.0f})\n")
-                f.write(f"- Peor ratio: {ratios.max():.2f} (vs TR{df_stat.loc[df_stat['ratio_volume'].idxmax(), 'tr_base']:.0f})\n")
-            f.write("="*80 + "\n")
-        
-        print(f"[Guardado] Resumen: {summary_path}")
+                    pct = (sv - bv) / abs(ref) * 100
 
+                clr = '#1B5E20' if pct >= 0 else '#B71C1C'
+                bgclr = '#E8F5E9' if pct >= 0 else '#FFEBEE'
 
-# Función de conveniencia para integración
-def run_cross_validation(solution_inp: Path, 
-                        solution_tr: int,
-                        baseline_inp: Path = None,
-                        work_dir: Path = None,
-                        tr_list: List[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Función de conveniencia para ejecutar validación cruzada.
-    
-    Returns:
-        (df_functional, df_statistical)
-    """
-    if baseline_inp is None:
-        baseline_inp = config.SWMM_FILE
-    
-    validator = CrossTRValidator(
-        baseline_inp=baseline_inp,
-        solution_inp=solution_inp,
-        solution_design_tr=solution_tr,
-        work_dir=work_dir
-    )
-    
-    return validator.run_full_validation(tr_list=tr_list)
+                # Alternar: puntos pares arriba, impares abajo
+                # para los puntos de la solución
+                base_y = sv
+                if i % 2 == 0:
+                    offset_pts = 22
+                    va_box = 'bottom'
+                else:
+                    offset_pts = -22
+                    va_box = 'top'
 
+                ax.annotate(
+                    f'{pct:+.0f}%',
+                    xy=(tr, base_y),
+                    xytext=(0, offset_pts),
+                    textcoords='offset points',
+                    ha='center', va=va_box,
+                    fontsize=9, fontweight='bold', color=clr,
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor=bgclr,
+                              edgecolor=clr, linewidth=0.8, alpha=0.92),
+                    arrowprops=dict(arrowstyle='-', color=clr,
+                                    lw=0.8, alpha=0.6),
+                    zorder=8
+                )
 
-if __name__ == "__main__":
-    # Ejemplo de uso
-    solution_path = Path(config.CODIGOS_DIR) / "optimization_results" / "Seq_Iter_16" / "model_Seq_Iter_16.inp"
-    
-    if solution_path.exists():
-        df_func, df_stat = run_cross_validation(
-            solution_inp=solution_path,
-            solution_tr=25,
-            tr_list=[1, 2, 5, 10, 25]
+            # ── Ejes y estilo ──────────────────────────────────────────────
+            ax.set_xscale('log')
+            ax.set_xticks(trs)
+            ax.set_xticklabels([f'TR{t}' for t in trs], fontsize=9)
+            ax.set_ylim(bottom=0, top=y_max * 1.35)  # espacio arriba para labels
+            ax.set_xlabel('Periodo de Retorno (años)', fontsize=9, color=COLORS['text'])
+            ax.set_ylabel(f'{title} ({unit})', fontsize=9, color=COLORS['text'])
+            ax.tick_params(labelsize=8.5, colors=COLORS['text'])
+            for spine in ax.spines.values():
+                spine.set_color('#CCCCCC')
+
+            # Título con dirección como subtítulo coloreado
+            dir_color = '#1B5E20' if '↓' in direction else '#1565C0'
+            ax.set_title(f'{title}\n', fontsize=11, fontweight='bold',
+                         color=COLORS['text'], pad=4)
+            ax.text(0.5, 1.01, direction, transform=ax.transAxes,
+                    ha='center', va='bottom', fontsize=9,
+                    color=dir_color, fontstyle='italic')
+
+            if idx == 0:
+                leg = ax.legend(fontsize=9, framealpha=0.92, edgecolor='#CCCCCC',
+                                loc='upper left')
+                leg.get_frame().set_linewidth(0.8)
+
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        fig.savefig(out_dir / f"extra1_risk_curve_{name}.png",
+                    dpi=160, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    Guardado: extra1_risk_curve_{name}.png")
+
+    # -------------------------------------------------------------------------
+    # EXTRA 2: Mapa de nodos — scatter coloreado por reducción de flooding
+    # -------------------------------------------------------------------------
+    def _plot_node_map(self, sol_extractors: dict, out_dir: Path, name: str):
+        """
+        Scatter X/Y de nodos sobre red de tuberías (GPKG).
+        - Tamaño burbuja ∝ volumen baseline
+        - Color ∝ reducción clampeada a ±100% (evita distorsión por nodos con vol. mínimo)
+        - Nodos sin flooding: pequeños y grises
+        - Labels para los N nodos con mayor volumen baseline
+        """
+        base_m = self.baseline_extractors[self.tr_actual].metrics
+        sol_m = sol_extractors[self.tr_actual].metrics
+
+        if not base_m.node_data or not sol_m.node_data:
+            print("    [node_map] Sin node_data disponible, omitiendo.")
+            return
+
+        # ── Construir GeoDataFrame de nodos y reprojectar a PROJECT_CRS ────
+        project_crs = getattr(config, 'PROJECT_CRS', 'EPSG:32717')
+
+        records = []
+        for nid, bdata in base_m.node_data.items():
+            sdata = sol_m.node_data.get(nid, {})
+            bv = bdata.get('flooding_volume', 0.0)
+            sv = sdata.get('flooding_volume', 0.0) if sdata else bv
+            if bv > 0:
+                raw_red = (bv - sv) / bv * 100
+                red = float(np.clip(raw_red, -100, 100))
+            else:
+                red = 0.0
+            records.append({
+                'node_id': str(nid),
+                'x': bdata.get('x', 0),
+                'y': bdata.get('y', 0),
+                'base_vol': bv,
+                'sol_vol': sv,
+                'reduction': red,
+                'flooded': bv > 0,
+            })
+
+        df = pd.DataFrame(records)
+
+        from pyproj import CRS as ProjCRS
+        target_crs = ProjCRS.from_user_input(project_crs)
+
+        # Convertir nodos a GeoDataFrame y asegurar CRS correcto
+        nodes_gdf = gpd.GeoDataFrame(
+            df,
+            geometry=[ShapelyPoint(row.x, row.y) for row in df.itertuples()],
+            crs=project_crs
         )
-        
-        print("\n" + "="*80)
-        print("COMPARACIÓN FUNCIONAL:")
-        print(df_func[['tr_base', 'diff_volume_pct', 'ratio_volume']].to_string(index=False))
-        print("\n" + "="*80)
-        print("COMPARACIÓN ESTADÍSTICA:")
-        print(df_stat[['tr_base', 'diff_volume_pct', 'ratio_volume']].to_string(index=False))
+        if nodes_gdf.crs and not nodes_gdf.crs.equals(target_crs):
+            nodes_gdf = nodes_gdf.to_crs(target_crs)
+
+        df['x'] = nodes_gdf.geometry.x
+        df['y'] = nodes_gdf.geometry.y
+
+        flooded = df[df['flooded']].copy()
+        dry = df[~df['flooded']].copy()
+
+        # ── Figura ──────────────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=(13, 11))
+        fig.patch.set_facecolor('white')
+        ax.set_facecolor('#F5F7FA')
+
+        # ── 1) Red de tuberías como fondo (reprojectada a PROJECT_CRS) ──────
+        network_file = getattr(config, 'NETWORK_FILE', None)
+        if network_file and Path(network_file).exists():
+            try:
+                pipes_gdf = gpd.read_file(network_file)
+                pipes_gdf = pipes_gdf[pipes_gdf.geometry.notna()]
+                pipes_gdf = pipes_gdf[pipes_gdf.geometry.geom_type.isin(
+                    ['LineString', 'MultiLineString'])]
+
+                # Reprojectar al CRS del proyecto si es necesario
+                if pipes_gdf.crs is not None and not pipes_gdf.crs.equals(target_crs):
+                    pipes_gdf = pipes_gdf.to_crs(target_crs)
+                elif pipes_gdf.crs is None:
+                    pipes_gdf = pipes_gdf.set_crs(target_crs)
+
+                print(f"    Red de tuberías cargada: {len(pipes_gdf)} segmentos (CRS: {pipes_gdf.crs})")
+
+                # Colorear por capacidad si está disponible, si no gris uniforme
+                if 'Capacity' in pipes_gdf.columns or 'utilization' in pipes_gdf.columns:
+                    cap_col = 'utilization' if 'utilization' in pipes_gdf.columns else 'Capacity'
+                    cap_vals = pipes_gdf[cap_col].fillna(0).clip(0, 1)
+                    pipe_cmap = LinearSegmentedColormap.from_list(
+                        'pipe_load', ['#C8D6E5', '#F0A500', '#C0392B'])
+                    pipe_colors = pipe_cmap(cap_vals.values)
+                    for geom, color in zip(pipes_gdf.geometry, pipe_colors):
+                        if geom.geom_type == 'LineString':
+                            xs, ys = geom.xy
+                            ax.plot(xs, ys, color=color, linewidth=1.1,
+                                    alpha=0.7, zorder=1)
+                        elif geom.geom_type == 'MultiLineString':
+                            for part in geom.geoms:
+                                xs, ys = part.xy
+                                ax.plot(xs, ys, color=color, linewidth=1.1,
+                                        alpha=0.7, zorder=1)
+                    sm_pipe = plt.cm.ScalarMappable(
+                        cmap=pipe_cmap, norm=plt.Normalize(vmin=0, vmax=1))
+                    sm_pipe.set_array([])
+                    cb_pipe = fig.colorbar(sm_pipe, ax=ax, fraction=0.018,
+                                           pad=0.12, shrink=0.45, aspect=20)
+                    cb_pipe.set_label('Carga tubería (h/D)', fontsize=7.5,
+                                      color=COLORS['text'])
+                    cb_pipe.ax.tick_params(labelsize=7)
+                else:
+                    for geom in pipes_gdf.geometry:
+                        if geom.geom_type == 'LineString':
+                            xs, ys = geom.xy
+                            ax.plot(xs, ys, color='#A0B4C8', linewidth=0.9,
+                                    alpha=0.6, zorder=1)
+                        elif geom.geom_type == 'MultiLineString':
+                            for part in geom.geoms:
+                                xs, ys = part.xy
+                                ax.plot(xs, ys, color='#A0B4C8', linewidth=0.9,
+                                        alpha=0.6, zorder=1)
+            except Exception as e:
+                print(f"    [node_map] No se pudo cargar NETWORK_FILE: {e}")
+        else:
+            print("    [node_map] NETWORK_FILE no definido o no existe, omitiendo red.")
+
+        # ── 2) Nodos sin flooding (pequeños, grises con borde) ──────────────
+        if not dry.empty:
+            ax.scatter(dry['x'], dry['y'], s=18, color='#D5DCE8',
+                       edgecolors='#99AABB', linewidths=0.4,
+                       alpha=0.7, zorder=2, label='Sin flooding')
+
+        # ── 3) Nodos con flooding ───────────────────────────────────────────
+        if not flooded.empty:
+            # Tamaño: escala más agresiva para que las burbujas sean visibles
+            sizes = (np.sqrt(flooded['base_vol'].clip(lower=1)) * 1.2).clip(lower=35, upper=600)
+
+            sc = ax.scatter(
+                flooded['x'], flooded['y'],
+                s=sizes,
+                c=flooded['reduction'],
+                cmap='RdYlGn',
+                vmin=-100, vmax=100,  # clamp fijo ±100%
+                alpha=0.88,
+                edgecolors='white',
+                linewidths=0.8,
+                zorder=4
+            )
+
+            # Colorbar principal (reducción)
+            cbar = fig.colorbar(sc, ax=ax, fraction=0.025, pad=0.02,
+                                shrink=0.65, aspect=25)
+            cbar.set_label('Reducción Flooding (%)\n+100 = eliminado  |  −100 = duplicado',
+                           fontsize=8.5, color=COLORS['text'])
+            cbar.ax.tick_params(labelsize=8)
+            # Marcas clave
+            cbar.set_ticks([-100, -50, 0, 50, 100])
+            cbar.set_ticklabels(['-100%', '-50%', '0%', '+50%', '+100%'])
+
+        # ── Estilo general ───────────────────────────────────────────────────
+        n_mejor = int((flooded['reduction'] > 5).sum()) if not flooded.empty else 0
+        n_peor = int((flooded['reduction'] < -5).sum()) if not flooded.empty else 0
+        n_neutro = len(flooded) - n_mejor - n_peor if not flooded.empty else 0
+        n_total = len(flooded)
+
+        ax.set_title(
+            f'Mapa de Nodos — Reducción Flooding  [TR{self.tr_actual}]  ·  {name}\n'
+            f'Nodos con flooding: {n_total}  |  '
+            f'Mejorados: {n_mejor}  ·  Empeorados: {n_peor}  ·  Sin cambio: {n_neutro}'
+            f'  (detalle → nodos_TR{self.tr_actual:03d}_{name}.csv)',
+            fontsize=10.5, fontweight='bold', color=COLORS['text'], pad=10
+        )
+        ax.set_xlabel('X (m)', fontsize=9, color=COLORS['text'])
+        ax.set_ylabel('Y (m)', fontsize=9, color=COLORS['text'])
+        ax.tick_params(labelsize=8, colors=COLORS['text'])
+        ax.set_aspect('equal', adjustable='datalim')
+        for spine in ax.spines.values():
+            spine.set_color('#CCCCCC')
+
+        # Leyenda de tamaños de burbuja
+        legend_sizes = [100, 1000, 5000, 20000]
+        legend_labels = ['100 m³', '1,000 m³', '5,000 m³', '20,000 m³']
+        legend_handles = []
+        from matplotlib.lines import Line2D
+        for sv_ref, lbl in zip(legend_sizes, legend_labels):
+            s_ref = float(np.clip(np.sqrt(sv_ref) * 1.2, 35, 600))
+            legend_handles.append(
+                plt.scatter([], [], s=s_ref, color='#888888', alpha=0.7,
+                            edgecolors='white', label=f'Base: {lbl}')
+            )
+
+        leg = ax.legend(handles=legend_handles,
+                        title='Volumen baseline', title_fontsize=7.5,
+                        fontsize=7.5, framealpha=0.93, loc='lower right',
+                        edgecolor='#BBBBBB', markerscale=1.0)
+        leg.get_frame().set_linewidth(0.8)
+
+        # Nota al pie sobre el clamp
+        fig.text(0.5, 0.005,
+                 'Nota: reducción clampeada a ±100%. Nodos con volumen baseline < 1 m³ '
+                 'pueden mostrar variaciones % grandes — revisar en CSV.',
+                 ha='center', fontsize=7, color='#888888', style='italic')
+
+        fig.savefig(out_dir / f"extra2_node_map_{name}.png",
+                    dpi=160, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    Guardado: extra2_node_map_{name}.png")
+
+    # -------------------------------------------------------------------------
+    # EXTRA 3: Radar / Spider multi-métrica
+    # -------------------------------------------------------------------------
+    def _plot_radar(self, sol_extractors: dict, out_dir: Path, name: str):
+        """
+        Spider chart comparando baseline vs solución en 5 métricas normalizadas,
+        una figura por TR. Permite ver el perfil de desempeño completo.
+        """
+        metric_labels = [
+            'Vol. Flooding\n(↓ mejor)',
+            'Pico Flooding\n(↓ mejor)',
+            'Pico Outfall\n(↑ mejor)',
+            'Links\nSaturados\n(↓ mejor)',
+            'Health\nScore\n(↑ mejor)',
+        ]
+        N = len(metric_labels)
+        angles = [n / float(N) * 2 * np.pi for n in range(N)]
+        angles += angles[:1]  # cerrar polígono
+
+        fig, axes = plt.subplots(
+            2, math.ceil(len(self.tr_list) / 2),
+            figsize=(15, 8),
+            subplot_kw=dict(polar=True)
+        )
+        fig.patch.set_facecolor('white')
+        fig.suptitle(f'Radar Multi-Métrica  ·  {name}',
+                     fontsize=12, fontweight='bold', color=COLORS['text'])
+
+        axes_flat = axes.flatten() if hasattr(axes, 'flatten') else [axes]
+
+        # Recolectar todos los valores para normalización global
+        all_vals = {i: [] for i in range(N)}
+        for tr in self.tr_list:
+            bm = self.baseline_extractors[tr].metrics
+            sm = sol_extractors[tr].metrics
+            raw_b = [bm.total_flooding_volume, bm.total_max_flooding_flow,
+                     bm.total_max_outfall_flow, float(bm.surcharged_links_count),
+                     bm.network_health_score]
+            raw_s = [sm.total_flooding_volume, sm.total_max_flooding_flow,
+                     sm.total_max_outfall_flow, float(sm.surcharged_links_count),
+                     sm.network_health_score]
+            for i, (b, s) in enumerate(zip(raw_b, raw_s)):
+                all_vals[i].extend([b, s])
+
+        # Rangos para normalización (0-1) — guard contra todos-cero
+        ranges = []
+        for v in all_vals.values():
+            lo, hi = min(v), max(v)
+            # Si todos los valores son iguales (incluido todo-cero), usar rango [0,1]
+            if hi == lo:
+                lo, hi = 0.0, 1.0
+            ranges.append((lo, hi))
+
+        def normalize_radar(vals):
+            out = []
+            for i, (lo, hi) in enumerate(ranges):
+                span = hi - lo  # ya garantizado > 0 por el guard de arriba
+                v = (vals[i] - lo) / span
+                out.append(float(np.clip(v, 0.0, 1.0)))
+            return out
+
+        # "Invertir" métricas donde menor = mejor: idx 0,1,3
+        invert_idx = {0, 1, 3}
+
+        for ax_idx, tr in enumerate(self.tr_list):
+            ax = axes_flat[ax_idx]
+            bm = self.baseline_extractors[tr].metrics
+            sm = sol_extractors[tr].metrics
+
+            raw_b = [bm.total_flooding_volume, bm.total_max_flooding_flow,
+                     bm.total_max_outfall_flow, float(bm.surcharged_links_count),
+                     bm.network_health_score]
+            raw_s = [sm.total_flooding_volume, sm.total_max_flooding_flow,
+                     sm.total_max_outfall_flow, float(sm.surcharged_links_count),
+                     sm.network_health_score]
+
+            norm_b = normalize_radar(raw_b)
+            norm_s = normalize_radar(raw_s)
+
+            # Invertir ejes "↓ mejor" para que hacia afuera = mejor
+            norm_b = [1 - v if i in invert_idx else v for i, v in enumerate(norm_b)]
+            norm_s = [1 - v if i in invert_idx else v for i, v in enumerate(norm_s)]
+
+            vals_b = norm_b + norm_b[:1]
+            vals_s = norm_s + norm_s[:1]
+
+            ax.set_theta_offset(np.pi / 2)
+            ax.set_theta_direction(-1)
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(metric_labels, fontsize=6.5, color=COLORS['text'])
+            ax.set_yticks([0.25, 0.5, 0.75, 1.0])
+            ax.set_yticklabels(['', '0.5', '', '1.0'], fontsize=5.5, color='#999999')
+            ax.set_ylim(0, 1)
+            ax.grid(color=COLORS['grid'], linewidth=0.7)
+            ax.spines['polar'].set_color('#CCCCCC')
+
+            ax.plot(angles, vals_b, color=COLORS['baseline'], linewidth=1.5, zorder=3)
+            ax.fill(angles, vals_b, color=COLORS['baseline'], alpha=0.18, zorder=2)
+
+            ax.plot(angles, vals_s, color='#111111', linewidth=2.0, zorder=4)
+            ax.fill(angles, vals_s, color=COLORS['solution'], alpha=0.22, zorder=3)
+
+            is_design = tr == self.tr_actual
+            ax.set_title(f'TR{tr}{"  ★" if is_design else ""}',
+                         fontsize=9, fontweight='bold' if is_design else 'normal',
+                         color='#7B1FA2' if is_design else COLORS['text'],
+                         pad=12)
+
+        # Ocultar ejes sobrantes
+        for ax_idx in range(len(self.tr_list), len(axes_flat)):
+            axes_flat[ax_idx].set_visible(False)
+
+        # Leyenda global
+        from matplotlib.lines import Line2D
+        handles = [
+            Line2D([0], [0], color=COLORS['baseline'], linewidth=1.5, label='Baseline'),
+            Line2D([0], [0], color='#111111', linewidth=2.0, label='Solución'),
+        ]
+        fig.legend(handles=handles, loc='lower center', ncol=2,
+                   fontsize=8, framealpha=0.9, edgecolor='#CCCCCC')
+
+        fig.tight_layout(rect=[0, 0.04, 1, 0.95])
+        fig.savefig(out_dir / f"extra3_radar_{name}.png",
+                    dpi=160, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    Guardado: extra3_radar_{name}.png")
+
+    # -------------------------------------------------------------------------
+    # EXPORT CSV
+    # -------------------------------------------------------------------------
+    def _export_summary_csv(self, sol_extractors: dict, out_dir: Path, name: str):
+        """Exporta CSV con resumen de métricas escalares por TR."""
+        import csv
+
+        rows_paso3 = []
+        rows_paso4 = []
+        sol_tr25_vol = sol_extractors[self.tr_actual].metrics.total_flooding_volume
+
+        for tr in self.tr_list:
+            bv = self.baseline_extractors[tr].metrics.total_flooding_volume
+            sv = sol_extractors[tr].metrics.total_flooding_volume
+            bp = self.baseline_extractors[tr].metrics.total_max_flooding_flow
+            sp_ = sol_extractors[tr].metrics.total_max_flooding_flow
+            bo = self.baseline_extractors[tr].metrics.total_max_outfall_flow
+            so = sol_extractors[tr].metrics.total_max_outfall_flow
+
+            red_vol = (bv - sv) / bv * 100 if bv > 0 else 0.0
+            red_peak = (bp - sp_) / bp * 100 if bp > 0 else 0.0
+
+            rows_paso3.append([
+                tr, f'{bv:,.1f}', f'{sv:,.1f}', f'{red_vol:.2f}',
+                f'{bp:.4f}', f'{sp_:.4f}', f'{red_peak:.2f}',
+                f'{bo:.4f}', f'{so:.4f}'
+            ])
+
+            # Paso 4: sol_tr25 vs base_trX
+            if tr != self.tr_actual:
+                red_cross = (bv - sol_tr25_vol) / bv * 100 if bv > 0 else 0.0
+                rows_paso4.append([tr, f'{bv:,.1f}', f'{sol_tr25_vol:,.1f}', f'{red_cross:.2f}'])
+
+        with open(out_dir / f"resumen_{name}.csv", 'w', newline='', encoding='utf-8') as f:
+            cw = csv.writer(f)
+            cw.writerow([f'=== PASO 3: Validación Funcional — {name} ==='])
+            cw.writerow(['TR', 'Base_Vol_m3', 'Sol_Vol_m3', 'Red_Vol_%',
+                         'Base_Peak_m3s', 'Sol_Peak_m3s', 'Red_Peak_%',
+                         'Base_OutfallPeak', 'Sol_OutfallPeak'])
+            cw.writerows(rows_paso3)
+            cw.writerow([])
+            cw.writerow([f'=== PASO 4: Validación Cruzada — Sol TR{self.tr_actual} vs Bases ==='])
+            cw.writerow(['TR_Base', 'Base_Vol_m3', f'Sol_TR{self.tr_actual}_Vol_m3', 'Red_Cruzada_%'])
+            cw.writerows(rows_paso4)
+
+        print(f"    CSV guardado: resumen_{name}.csv")
+
+    # -------------------------------------------------------------------------
+    # EXPORT CSV — Detalle por nodo
+    # -------------------------------------------------------------------------
+    def _export_nodes_csv(self, sol_extractors: dict, out_dir: Path, name: str):
+        """
+        Exporta un CSV por TR con detalle de cada nodo que tuvo flooding en baseline:
+          node_id, x, y,
+          base_vol_m3, sol_vol_m3, delta_vol_m3, red_vol_pct,
+          base_peak_m3s, sol_peak_m3s, delta_peak_m3s, red_peak_pct,
+          estado  (Mejorado / Empeorado / Sin cambio / Eliminado)
+        Ordenado por base_vol_m3 desc.
+        """
+        import csv
+
+        def _peak_from_series(series) -> float:
+            """Caudal pico [m³/s] desde flooding_series (pd.Series o dict)."""
+            if series is None:
+                return 0.0
+            if isinstance(series, pd.Series):
+                return float(series.max()) if len(series) > 0 else 0.0
+            if isinstance(series, dict):
+                vals = series.get('total_rate', series.get('values', []))
+                return float(np.max(vals)) if len(vals) > 0 else 0.0
+            return 0.0
+
+        for tr in self.tr_list:
+            base_m = self.baseline_extractors[tr].metrics
+            sol_m = sol_extractors[tr].metrics
+
+            rows = []
+            for nid, bdata in base_m.node_data.items():
+                bv = bdata.get('flooding_volume', 0.0)
+                if bv <= 0:
+                    continue  # solo nodos que inundan en baseline
+
+                sdata = sol_m.node_data.get(nid, {})
+                sv = sdata.get('flooding_volume', 0.0) if sdata else bv
+
+                # Pico de caudal por nodo
+                bp = _peak_from_series(bdata.get('flooding_series'))
+                sp_ = _peak_from_series(sdata.get('flooding_series')) if sdata else bp
+
+                delta_vol = sv - bv
+                red_vol = (bv - sv) / bv * 100
+                delta_peak = sp_ - bp
+                red_peak = (bp - sp_) / bp * 100 if bp > 0 else 0.0
+
+                if sv <= 0:
+                    estado = 'Eliminado'
+                elif red_vol >= 5:
+                    estado = 'Mejorado'
+                elif red_vol <= -5:
+                    estado = 'Empeorado'
+                else:
+                    estado = 'Sin cambio'
+
+                rows.append({
+                    'node_id': str(nid),
+                    'x': f"{bdata.get('x', 0):.1f}",
+                    'y': f"{bdata.get('y', 0):.1f}",
+                    'base_vol_m3': f"{bv:.2f}",
+                    'sol_vol_m3': f"{sv:.2f}",
+                    'delta_vol_m3': f"{delta_vol:+.2f}",
+                    'red_vol_pct': f"{red_vol:+.1f}",
+                    'base_peak_m3s': f"{bp:.4f}",
+                    'sol_peak_m3s': f"{sp_:.4f}",
+                    'delta_peak_m3s': f"{delta_peak:+.4f}",
+                    'red_peak_pct': f"{red_peak:+.1f}",
+                    'estado': estado,
+                })
+
+            # Ordenar por volumen baseline desc
+            rows.sort(key=lambda r: float(r['base_vol_m3']), reverse=True)
+
+            out_path = out_dir / f"nodos_TR{tr:03d}_{name}.csv"
+            with open(out_path, 'w', newline='', encoding='utf-8') as f:
+                cw = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
+                cw.writeheader()
+                cw.writerows(rows)
+
+            n_mejorados = sum(1 for r in rows if r['estado'] in ('Mejorado', 'Eliminado'))
+            n_empeorados = sum(1 for r in rows if r['estado'] == 'Empeorado')
+            print(f"    CSV nodos TR{tr}: {len(rows)} nodos  |  "
+                  f"Mejorados/Eliminados: {n_mejorados}  |  Empeorados: {n_empeorados}  "
+                  f"→ nodos_TR{tr:03d}_{name}.csv")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+if __name__ == "__main__":
+    print("=" * 65)
+    print("CrossTRValidator  —  Validación Multi-TR")
+    print("=" * 65)
+
+    v = CrossTRValidator()
+
+    print("\n=== Baselines ===")
+    for tr, m in v.baseline_metrics.items():
+        print(f"  TR{tr:>3}:  Flooding {m['flood_volume']:>12,.0f} m³  |  "
+              f"Peak {m['flood_peak']:.3f} m³/s  |  "
+              f"Outfall {m['outfall_peak']:.3f} m³/s")
+
+    # Buscar solución optimizada
+    sp = Path(config.CODIGOS_DIR) / "optimization_results" / "Seq_Iter_04" / "model_Seq_Iter_04.inp"
+    if sp.exists():
+        print(f"\nComparando solución: {sp}")
+        resumen = v.compare_solution(sp, "Seq_Iter_04")
+        print("\n=== Resumen Paso 3 ===")
+        for tr, r in resumen.items():
+            red = (r['base_flood_vol'] - r['sol_flood_vol']) / r['base_flood_vol'] * 100 if r['base_flood_vol'] > 0 else 0
+            print(f"  TR{tr:>3}:  Base {r['base_flood_vol']:>10,.0f} m³  →  Sol {r['sol_flood_vol']:>10,.0f} m³  "
+                  f"({red:+.1f}%)")
     else:
-        print(f"No se encuentra: {solution_path}")
+        print(f"\n[Aviso] Solución no encontrada: {sp}")
+
+    print("\n✓ Listo.")
