@@ -38,6 +38,7 @@ from rut_13_cost_functions import CostCalculator
 from rut_15_dashboard import EvolutionDashboardGenerator
 from rut_17_comparison_reporter import ScenarioComparator
 from rut_26_hydrological_impact import HydrologicalImpactAssessment
+from rut_30_cross_tr_validator import CrossTRValidator
 
 
 
@@ -106,6 +107,7 @@ class GreedyTankOptimizer:
                  dynamic_evaluator: Optional[object] = None,
                  stop_at_breakeven: bool = False,  # Stop when cost >= savings * multiplier
                  breakeven_multiplier: float = 1.0,  # Allow investment up to X times avoided damage
+                 enable_cross_tr_per_iteration: bool = False,  # Validar contra TR menores en cada iteración
                  ):
         
         self.evaluator = dynamic_evaluator
@@ -113,6 +115,7 @@ class GreedyTankOptimizer:
         self.comparator = ScenarioComparator(self.metrics_extractor.metrics, baseline_inp_path=str(config.SWMM_FILE))
         self.stop_at_breakeven = stop_at_breakeven
         self.breakeven_multiplier = breakeven_multiplier
+        self.enable_cross_tr_per_iteration = enable_cross_tr_per_iteration
         
         
     def compare_solutions(self, active_pairs):
@@ -179,6 +182,10 @@ class GreedyTankOptimizer:
                 tank_details=active_pairs,
                 show_predios=False
             )
+            
+            # --- 3.5 CROSS-TR VALIDATION (Por iteración) ---
+            if getattr(self, 'enable_cross_tr_per_iteration', False):
+                self._run_cross_tr_validation_for_iteration(active_pairs)
     
             # --- 4. GLOBAL PERFORMANCE SUMMARY (Deltas) ---
             vol_b = self.baseline_metrics.total_flooding_volume
@@ -207,6 +214,57 @@ class GreedyTankOptimizer:
                 baseline_inp=str(config.SWMM_FILE),
                 solution_inp=str(self.current_inp_file)
             )
+    
+    def _run_cross_tr_validation_for_iteration(self, active_pairs: list):
+        """
+        Ejecuta validación cruzada TR para la iteración actual.
+        Compara el modelo actual (con N tanques) contra baselines de TR menores.
+        """
+        try:
+            from rut_30_cross_tr_validator import CrossTRValidator
+        except ImportError:
+            print("  [CrossTR] Warning: rut_30_cross_tr_validator not found. Skipping.")
+            return
+        
+        print(f"\n  [CrossTR] Running cross-TR validation for {self.solution_name}...")
+        
+        # Crear subdirectorio para esta iteración
+        cross_tr_dir = Path(self.case_dir) / "03_cross_tr_validation"
+        cross_tr_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            validator = CrossTRValidator(
+                baseline_inp=config.SWMM_FILE,
+                solution_inp=Path(self.current_inp_file),
+                solution_design_tr=config.BASE_INP_TR,  # TR para el que se diseñó (ej: 25)
+                work_dir=cross_tr_dir,
+                enable_caching=True
+            )
+            
+            # Validar contra TR menores (excluir el de diseño para no repetir)
+            tr_list = [1, 2, 5, 10]  # Solo menores al de diseño
+            if config.BASE_INP_TR not in tr_list:
+                tr_list.append(config.BASE_INP_TR)
+                tr_list.sort()
+            
+            df_func, df_stat = validator.run_full_validation(tr_list=tr_list)
+            
+            # Log resumen breve
+            if not df_stat.empty:
+                avg_ratio = df_stat['ratio_volume'].mean()
+                print(f"  [CrossTR] Resumen: Ratio promedio vs baselines = {avg_ratio:.2f}")
+                for _, row in df_stat.iterrows():
+                    tr = int(row['tr_base'])
+                    ratio = row['ratio_volume']
+                    pct = row['diff_volume_pct']
+                    print(f"    vs TR{tr}: {ratio:.2f}x ({pct:+.1f}%)")
+            
+            print(f"  [CrossTR] Resultados guardados en: {cross_tr_dir}")
+            
+        except Exception as e:
+            print(f"  [CrossTR] Error en validación: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _remove_case_directory(self):
         """Remove a case directory if it exists, preserving hydrological_impact files."""
