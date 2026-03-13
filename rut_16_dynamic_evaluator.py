@@ -43,6 +43,7 @@ from rut_14_swmm_modifier import SWMMModifier
 from rut_20_avoided_costs import AvoidedCostRunner
 from rut_21_construction_cost import SewerConstructionCost
 from rut_27_model_metrics import MetricExtractor, SystemMetrics
+from rut_30_cross_tr_validator import CrossTRValidator
 
 
 
@@ -168,6 +169,11 @@ class DynamicSolutionEvaluator:
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
     def _init_baseline(self):
+
+        if config.COMPARE_TR:
+            self.cross_tr_validator = CrossTRValidator(
+                work_dir=self.work_dir / "00_Baseline"
+            )
         
         if self.baseline_extractor_path and Path(self.baseline_extractor_path).exists():
             with open(self.baseline_extractor_path, 'rb') as f:

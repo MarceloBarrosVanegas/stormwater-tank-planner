@@ -48,6 +48,16 @@ COLORS = {
     'text': '#2C2C2C',
 }
 
+TR_MARKERS = {
+    1:  'o',   # círculo
+    2:  's',   # cuadrado
+    5:  '^',   # triángulo
+    10: 'D',   # diamante
+    25: '*',   # estrella
+    50: 'P',   # cruz gruesa
+    100:'X',
+}
+
 TR_COLORS = {
     1: '#D62728',
     2: '#FF7F0E',
@@ -276,74 +286,81 @@ class CrossTRValidator:
     # -------------------------------------------------------------------------
     def compare_solution(self, sol_inp: Path, name: str = "sol") -> dict:
         """
-        Simula la solución con cada TR y genera gráficos comparativos.
+        Corre la solución una sola vez (con tr_actual) y compara contra todos
+        los baseline_extractors ya en memoria. No re-simula los baselines.
+
+        Args:
+            sol_inp: INP de la solución (se corre solo con tr_actual).
+            name:    Nombre identificador para archivos de salida.
 
         Returns:
-            dict con métricas resumen por TR
+            dict con métricas resumen por TR.
         """
         sol_inp = Path(sol_inp)
-        out_dir = sol_inp.parent / "cross_tr_comparison"
-        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Directorio de salida numerado según carpetas existentes
+        existing = [p for p in sol_inp.parent.iterdir() if p.is_dir()]
+        next_idx = len(existing) + 1
+        out_dir      = sol_inp.parent / f"{next_idx:02d}_compare_tr"
+        sol_scen_dir = out_dir / "modelos"
+        sol_fig_dir  = out_dir / "figuras"
+        sol_scen_dir.mkdir(parents=True, exist_ok=True)
+        sol_fig_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n[CrossTR] Comparando solución: {name}")
+        print(f"          Output → {out_dir}")
 
-        with open(sol_inp, 'r', encoding='latin-1') as f:
+        # -- PASO 2: Correr solución para cada TR --
+        with open(sol_inp, 'r', encoding='latin-1', errors='replace') as f:
             sol_content = f.read()
 
-        # -- PASO 2: Simular solución con cada TR --
         sol_extractors: dict[int, MetricExtractor] = {}
-
         for tr in self.tr_list:
-            print(f"  [Sol TR{tr}]...")
-
+            sp = sol_scen_dir / f"sol_{name}_TR{tr:03d}.inp"
             if tr == self.tr_actual:
-                sc = sol_inp
+                with open(sp, 'w', encoding='latin-1') as f:
+                    f.write(sol_content)
             else:
-                sc = self.scenarios_dir / f"sol_{name}_TR{tr:03d}.inp"
                 h = gen_hyetograph(tr)
-                gen_inp_with_tr(sol_content, tr, self.tr_actual, h, sc)
+                gen_inp_with_tr(sol_content, tr, self.tr_actual, h, sp)
 
+            print(f"  [Sol TR{tr}] Simulando...")
             ex = MetricExtractor(
                 project_root=config.PROJECT_ROOT,
                 predios_path=config.PREDIOS_FILE
             )
-            ex.run(sc)
+            ex.run(sp)
             sol_extractors[tr] = ex
             print(f"    Flooding: {ex.metrics.total_flooding_volume:,.0f} m³  |  "
                   f"Peak: {ex.metrics.total_max_flooding_flow:.3f} m³/s")
 
         # -- PASO 3: Gráficos funcionales (base_trX vs sol_trX) --
         print("\n[CrossTR] Generando gráficos Paso 3 (funcional)...")
-        self._plot_paso3_functional(
-            sol_extractors, out_dir, name
-        )
+        self._plot_paso3_functional(sol_extractors, sol_fig_dir, name)
 
         # -- PASO 4: Gráficos cruzados (sol_tr25 vs base_trX) --
         print("[CrossTR] Generando gráficos Paso 4 (cross-TR)...")
-        self._plot_paso4_cross_tr(
-            sol_extractors[self.tr_actual],
-            out_dir, name
-        )
+        self._plot_paso4_cross_tr(sol_extractors[self.tr_actual], sol_fig_dir, name)
 
         # -- Extras: Risk Curve, Node Map, Radar --
         print("[CrossTR] Generando gráficos adicionales...")
-        self._plot_risk_curve(sol_extractors, out_dir, name)
-        self._plot_node_map(sol_extractors, out_dir, name)
-        self._plot_radar(sol_extractors, out_dir, name)
+        self._plot_risk_curve(sol_extractors, sol_fig_dir, name)
+        self._plot_node_map(sol_extractors, sol_fig_dir, name)
+        self._plot_radar(sol_extractors, sol_fig_dir, name)
 
         # -- CSV resumen --
-        self._export_summary_csv(sol_extractors, out_dir, name)
-        self._export_nodes_csv(sol_extractors, out_dir, name)
+        self._export_summary_csv(sol_extractors, sol_fig_dir, name)
+        self._export_nodes_csv(sol_extractors, sol_fig_dir, name)
 
         print(f"\n[CrossTR] Guardado en: {out_dir}")
 
         # Retornar resumen
         return {
             tr: {
-                'base_flood_vol': self.baseline_extractors[tr].metrics.total_flooding_volume,
-                'sol_flood_vol': sol_extractors[tr].metrics.total_flooding_volume,
+                'base_flood_vol':  self.baseline_extractors[tr].metrics.total_flooding_volume,
+                'sol_flood_vol':   sol_extractors[tr].metrics.total_flooding_volume,
                 'base_flood_peak': self.baseline_extractors[tr].metrics.total_max_flooding_flow,
-                'sol_flood_peak': sol_extractors[tr].metrics.total_max_flooding_flow,
+                'sol_flood_peak':  sol_extractors[tr].metrics.total_max_flooding_flow,
             }
             for tr in self.tr_list
         }
@@ -462,20 +479,30 @@ class CrossTRValidator:
                 base_hydro = getattr(self.baseline_extractors[tr].metrics, hydro_key, {})
                 if base_hydro.get('times', np.array([])).size > 0:
                     t_b = _normalize_times(base_hydro['times'])
-                    ax.plot(t_b, base_hydro['total_rate'],
+                    r_b = base_hydro['total_rate']
+                    mk  = TR_MARKERS.get(tr, 'o')
+                    # markers cada ~15 puntos para no saturar
+                    every = max(1, len(t_b) // 15)
+                    ax.plot(t_b, r_b,
                             color=TR_COLORS.get(tr, '#888888'), linewidth=0.9,
-                            alpha=0.5, label=f'Base TR{tr}', zorder=3)
+                            alpha=0.6, label=f'Base TR{tr}',
+                            marker=mk, markevery=every, markersize=5,
+                            markeredgewidth=0.5, zorder=3)
 
-            # 2) Base TR_actual como referencia de diseño (media, color azul)
+            # 2) Base TR_actual como referencia de diseño
             base_ref_hydro = getattr(base_ref_m, hydro_key, {})
             if base_ref_hydro.get('times', np.array([])).size > 0:
                 t_ref = _normalize_times(base_ref_hydro['times'])
+                mk = TR_MARKERS.get(self.tr_actual, '*')
+                every = max(1, len(t_ref) // 15)
                 ax.plot(t_ref, base_ref_hydro['total_rate'],
                         color=TR_COLORS.get(self.tr_actual, '#1F77B4'),
                         linewidth=2.0, linestyle='-', alpha=0.85,
-                        label=f'Base TR{self.tr_actual} (diseño)', zorder=5)
+                        label=f'Base TR{self.tr_actual} (diseño)',
+                        marker=mk, markevery=every, markersize=7,
+                        markeredgewidth=0.5, zorder=5)
 
-            # 3) Solución — línea negra gruesa, protagonista
+            # 3) Solución — línea negra gruesa, sin marker (protagonista)
             sol_hydro = getattr(sol_m, hydro_key, {})
             if sol_hydro.get('times', np.array([])).size > 0:
                 t_sol = _normalize_times(sol_hydro['times'])
@@ -489,102 +516,97 @@ class CrossTRValidator:
         ax_vol.set_facecolor('#FAFAFA')
         ax_vol.grid(True, color=COLORS['grid'], linewidth=0.8, zorder=0)
 
-        # 1) Baselines otros TR (fondo, finas)
         for tr in tr_cross:
             base_hydro = self.baseline_extractors[tr].metrics.system_flood_hydrograph
             if base_hydro.get('times', np.array([])).size > 0:
                 t_b = _normalize_times(base_hydro['times'])
                 v_b = _cumulative_volume(t_b, base_hydro['total_rate'])
+                mk = TR_MARKERS.get(tr, 'o')
+                every = max(1, len(t_b) // 15)
                 ax_vol.plot(t_b, v_b / 1000,
                             color=TR_COLORS.get(tr, '#888888'), linewidth=0.9,
-                            alpha=0.5, label=f'Base TR{tr}', zorder=3)
+                            alpha=0.6, label=f'Base TR{tr}',
+                            marker=mk, markevery=every, markersize=5,
+                            markeredgewidth=0.5, zorder=3)
 
-        # 2) Base TR_actual como referencia de diseño (media, azul)
         ref_hydro = base_ref_m.system_flood_hydrograph
         if ref_hydro.get('times', np.array([])).size > 0:
             t_ref = _normalize_times(ref_hydro['times'])
             v_ref = _cumulative_volume(t_ref, ref_hydro['total_rate'])
+            mk = TR_MARKERS.get(self.tr_actual, '*')
+            every = max(1, len(t_ref) // 15)
             ax_vol.plot(t_ref, v_ref / 1000,
                         color=TR_COLORS.get(self.tr_actual, '#1F77B4'),
-                        linewidth=2.0, linestyle='-', alpha=0.85,
-                        label=f'Base TR{self.tr_actual} (diseño)', zorder=5)
+                        linewidth=2.0, alpha=0.85,
+                        label=f'Base TR{self.tr_actual} (diseño)',
+                        marker=mk, markevery=every, markersize=7,
+                        markeredgewidth=0.5, zorder=5)
 
-        # 3) Solución — negra gruesa, protagonista
         sol_hydro = sol_m.system_flood_hydrograph
         if sol_hydro.get('times', np.array([])).size > 0:
             t_sol = _normalize_times(sol_hydro['times'])
             v_sol = _cumulative_volume(t_sol, sol_hydro['total_rate'])
             ax_vol.plot(t_sol, v_sol / 1000,
-                        color='#111111', linewidth=3.0, linestyle='-',
+                        color='#111111', linewidth=3.0,
                         label=f'Sol TR{self.tr_actual} ✓', zorder=8)
 
         _style_ax(ax_vol,
                   title=f'Volumen Acumulado Flooding: Sol TR{self.tr_actual} vs Bases',
                   xlabel='Tiempo (min)', ylabel='Volumen Acumulado (10³ m³)')
 
-        # ── Panel 4: Barras — reducción funcional (cada TR propio) ──────────
-        # Aquí mostramos sol_trX vs base_trX para TODOS los TR del Paso 3,
-        # resaltando TR_actual como barra de referencia de diseño.
+        # ── Panel 4: TR equivalente — ¿a qué baseline se parece la solución? ─
         ax_bar.set_facecolor('#FAFAFA')
-        ax_bar.grid(True, axis='y', color=COLORS['grid'], linewidth=0.8, zorder=0)
+        ax_bar.grid(True, axis='x', color=COLORS['grid'], linewidth=0.8, zorder=0)
 
-        # Nota: para el bar chart usamos sol_trX vs base_trX (no sol_tr25 fijo)
-        # ya que el objetivo es mostrar cuánto mejora la solución en cada TR
-        # comparada con su propio baseline — eso sí tiene sentido físico.
-        # (Este panel resume el Paso 3 en una sola vista)
-        labels, reductions, bar_colors, edge_colors, edge_widths = [], [], [], [], []
-
+        sol_vol = sol_m.total_flooding_volume
+        diffs   = []
         for tr in self.tr_list:
-            bv = self.baseline_extractors[tr].metrics.total_flooding_volume
-            # Para TR_actual usamos sol_tr_actual; para los demás no tenemos sol_trX aquí,
-            # así que comparamos sol_tr_actual vs base_trX como proxy de robustez cruzada.
-            sv = sol_m.total_flooding_volume
-            red = (bv - sv) / bv * 100 if bv > 0 else 0.0
+            bv   = self.baseline_extractors[tr].metrics.total_flooding_volume
+            diff = abs(bv - sol_vol) / max(bv, sol_vol) * 100  # % diferencia
+            diffs.append((tr, diff, bv))
 
-            labels.append(f'TR{tr}')
-            reductions.append(red)
+        diffs.sort(key=lambda x: x[1])  # menor diff = más similar
+        best_tr = diffs[0][0]
 
-            if tr == self.tr_actual:
-                # Diseño: resaltado con borde
-                bar_colors.append('#4CAF50' if red >= 0 else '#E05C5C')
-                edge_colors.append('#1B5E20' if red >= 0 else '#B71C1C')
-                edge_widths.append(2.0)
-            else:
-                bar_colors.append('#81C784' if red >= 0 else '#EF9A9A')
-                edge_colors.append('white')
-                edge_widths.append(0.8)
+        trs_sorted   = [d[0] for d in diffs]
+        diffs_sorted = [d[1] for d in diffs]
+        bar_colors   = ['#4CAF50' if tr == best_tr else
+                        ('#FFA726' if diffs_sorted[i] < 20 else '#EF9A9A')
+                        for i, tr in enumerate(trs_sorted)]
 
-        bars = ax_bar.bar(labels, reductions, color=bar_colors, alpha=0.88,
-                          edgecolor=edge_colors, linewidth=0.8, zorder=3)
+        y_pos = np.arange(len(trs_sorted))
+        bars  = ax_bar.barh(y_pos, diffs_sorted, color=bar_colors,
+                            alpha=0.85, edgecolor='white', zorder=3)
 
-        # Aplicar linewidth por barra individualmente (bar() no acepta lista de linewidths)
-        for bar, lw in zip(bars, edge_widths):
-            bar.set_linewidth(lw)
-        ax_bar.axhline(y=0, color='#555555', linewidth=0.8)
+        ax_bar.set_yticks(y_pos)
+        ax_bar.set_yticklabels([f'TR{tr}{"  ★" if tr == self.tr_actual else ""}'
+                                 for tr in trs_sorted], fontsize=9)
+        ax_bar.set_xlabel('Diferencia vs Solución (%)', fontsize=9, color=COLORS['text'])
+        ax_bar.invert_yaxis()
 
-        # Anotación especial para TR_actual
-        for bar, val, tr in zip(bars, reductions, self.tr_list):
-            va = 'bottom' if val >= 0 else 'top'
-            offset = max(abs(val) * 0.02, 0.5) * (1 if val >= 0 else -1)
-            weight = 'bold' if tr == self.tr_actual else 'normal'
-            size = 8.5 if tr == self.tr_actual else 7.5
-            txt = f'{val:+.1f}%' + (f'\n(diseño)' if tr == self.tr_actual else '')
-            ax_bar.text(bar.get_x() + bar.get_width() / 2,
-                        val + offset, txt,
-                        ha='center', va=va, fontsize=size,
-                        fontweight=weight, color=COLORS['text'])
+        # Anotar valor y volumen baseline
+        for i, (tr, diff, bv) in enumerate(diffs):
+            label = f'{diff:.1f}%  ({bv/1000:.0f}k m³)'
+            ax_bar.text(diff + 0.5, i, label, va='center', fontsize=8,
+                        color=COLORS['text'])
 
-        _style_ax(ax_bar,
-                  title=f'Reducción Flooding: Sol TR{self.tr_actual} vs cada Base (%)',
-                  xlabel='TR', ylabel='Reducción (%)',
-                  legend=False)
+        # Línea vertical en 0
+        ax_bar.axvline(x=0, color='#555555', linewidth=0.8)
 
-        # Nota explicativa debajo del bar chart
-        ax_bar.text(0.5, -0.16,
-                    'Barras oscuras = TR de diseño  |  Positivo = sol reduce flooding  |'
-                    '  Negativo = baseline ligero produce menos flooding (esperado)',
-                    transform=ax_bar.transAxes, ha='center', va='top',
-                    fontsize=6.5, color='#666666', style='italic')
+        # Anotación del ganador
+        ax_bar.text(0.98, 0.04,
+                    f'TR más similar: TR{best_tr}',
+                    transform=ax_bar.transAxes, ha='right', va='bottom',
+                    fontsize=10, fontweight='bold', color='#2E7D32',
+                    bbox=dict(boxstyle='round,pad=0.4', facecolor='#E8F5E9',
+                              edgecolor='#4CAF50', linewidth=1.2))
+
+        ax_bar.set_title(f'¿A qué TR se parece la Solución TR{self.tr_actual}?\n'
+                         f'(por volumen de flooding)',
+                         fontsize=10, fontweight='bold', color=COLORS['text'], pad=8)
+        ax_bar.tick_params(labelsize=8, colors=COLORS['text'])
+        for spine in ax_bar.spines.values():
+            spine.set_color('#CCCCCC')
 
         fig.savefig(out_dir / f"paso4_cross_tr_{name}.png",
                     dpi=160, bbox_inches='tight', facecolor='white')
@@ -1111,9 +1133,9 @@ class CrossTRValidator:
             ax.set_theta_offset(np.pi / 2)
             ax.set_theta_direction(-1)
             ax.set_xticks(angles[:-1])
-            ax.set_xticklabels(metric_labels, fontsize=6.5, color=COLORS['text'])
+            ax.set_xticklabels(metric_labels, fontsize=9, color=COLORS['text'])
             ax.set_yticks([0.25, 0.5, 0.75, 1.0])
-            ax.set_yticklabels(['', '0.5', '', '1.0'], fontsize=5.5, color='#999999')
+            ax.set_yticklabels(['', '0.5', '', '1.0'], fontsize=7, color='#999999')
             ax.set_ylim(0, 1)
             ax.grid(color=COLORS['grid'], linewidth=0.7)
             ax.spines['polar'].set_color('#CCCCCC')
@@ -1141,7 +1163,8 @@ class CrossTRValidator:
             Line2D([0], [0], color='#111111', linewidth=2.0, label='Solución'),
         ]
         fig.legend(handles=handles, loc='lower center', ncol=2,
-                   fontsize=8, framealpha=0.9, edgecolor='#CCCCCC')
+                   fontsize=12, framealpha=0.95, edgecolor='#CCCCCC',
+                   markerscale=1.5)
 
         fig.tight_layout(rect=[0, 0.04, 1, 0.95])
         fig.savefig(out_dir / f"extra3_radar_{name}.png",

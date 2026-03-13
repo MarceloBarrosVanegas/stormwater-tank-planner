@@ -95,7 +95,7 @@ BASE_INP_TR = 25  # Return Period (years) of the base INP file
 #   [tr1, tr2, ...]     = Probabilistic (EAD calculation)
 TR_LIST = [BASE_INP_TR]  # Change to [1,2,5,10,25,50,100] for probabilistic EAD
 VALIDATION_TR_LIST = [1,2,5,10,25,50,100]  # For NSGA final validation
-
+COMPARE_TR  =  True
 
 
 
@@ -242,10 +242,10 @@ DEFAULT_ROAD_PREFERENCES = {
 }
 
 FLOODING_RANKING_WEIGHTS = {
-    'flow_over_capacity': 0.25,
+    'flow_over_capacity': 0.50,
     'flow_node_flooding': 0.50,
     'vol_node_flooding': 0.0,
-    'outfall_peak_flow': 0.25,
+    'outfall_peak_flow': 0.0,
     'failure_probability': 0,
 }  # Pesos = 0 no se optimizan. Suma debe ser 1.0
 
