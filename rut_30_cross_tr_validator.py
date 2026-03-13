@@ -556,57 +556,131 @@ class CrossTRValidator:
 
         # ── Panel 4: TR equivalente — ¿a qué baseline se parece la solución? ─
         ax_bar.set_facecolor('#FAFAFA')
-        ax_bar.grid(True, axis='x', color=COLORS['grid'], linewidth=0.8, zorder=0)
 
+        # Calcular las 3 métricas para la solución
+        sol_ff_peak = max(sol_m.system_flood_hydrograph.get('total_rate', [0]))
         sol_vol = sol_m.total_flooding_volume
-        diffs   = []
+        sol_of_peak = max(sol_m.system_outfall_flow_hydrograph.get('total_rate', [0]))
+
+        # Calcular diferencias para cada TR y cada métrica
+        tr_metrics = {}
         for tr in self.tr_list:
-            bv   = self.baseline_extractors[tr].metrics.total_flooding_volume
-            diff = abs(bv - sol_vol) / max(bv, sol_vol) * 100  # % diferencia
-            diffs.append((tr, diff, bv))
+            base_m = self.baseline_extractors[tr].metrics
+            
+            base_ff = max(base_m.system_flood_hydrograph.get('total_rate', [0]))
+            base_vol = base_m.total_flooding_volume
+            base_of = max(base_m.system_outfall_flow_hydrograph.get('total_rate', [0]))
+            
+            tr_metrics[tr] = {
+                'ff': {'value': base_ff, 'diff': abs(base_ff - sol_ff_peak) / max(base_ff, sol_ff_peak, 1e-10) * 100},
+                'vol': {'value': base_vol, 'diff': abs(base_vol - sol_vol) / max(base_vol, sol_vol, 1e-10) * 100},
+                'of': {'value': base_of, 'diff': abs(base_of - sol_of_peak) / max(base_of, sol_of_peak, 1e-10) * 100},
+            }
 
-        diffs.sort(key=lambda x: x[1])  # menor diff = más similar
-        best_tr = diffs[0][0]
+        # Colores por métrica
+        metric_colors = {'ff': '#E74C3C', 'vol': '#3498DB', 'of': '#2ECC71'}
+        metric_names = {'ff': 'Flooding Flow Peak', 'vol': 'Flooding Volume', 'of': 'Outfall Flow Peak'}
 
-        trs_sorted   = [d[0] for d in diffs]
-        diffs_sorted = [d[1] for d in diffs]
-        bar_colors   = ['#4CAF50' if tr == best_tr else
-                        ('#FFA726' if diffs_sorted[i] < 20 else '#EF9A9A')
-                        for i, tr in enumerate(trs_sorted)]
+        # Función para dibujar grupo de barras
+        def _plot_metric_group(ax, y_start, metric_key, label):
+            diffs = [tr_metrics[tr][metric_key]['diff'] for tr in self.tr_list]
+            min_diff = min(diffs)
+            best_idx = diffs.index(min_diff)
+            color = metric_colors[metric_key]
+            
+            # Título del grupo
+            ax.text(-2, y_start + 0.6, label, va='bottom', ha='right',
+                    fontsize=9, fontweight='bold', color='#2C2C2C')
+            
+            # Dibujar barras
+            for i, tr in enumerate(self.tr_list):
+                y = y_start - i * 0.7
+                diff = tr_metrics[tr][metric_key]['diff']
+                is_best = (i == best_idx)
+                is_design = (tr == self.tr_actual)
+                
+                # Estilo de barra
+                alpha = 1.0 if is_best else 0.35
+                edge = '#2C2C2C' if is_best else 'white'
+                lw = 2 if is_best else 0.5
+                
+                ax.barh(y, diff, height=0.55, color=color, alpha=alpha,
+                        edgecolor=edge, linewidth=lw, zorder=3)
+                
+                # Etiqueta TR
+                tr_lbl = f'TR{tr}'
+                if is_design:
+                    tr_lbl += ' ★'
+                if is_best:
+                    tr_lbl += ' ✓'
+                
+                weight = 'bold' if (is_best or is_design) else 'normal'
+                lbl_color = '#2E7D32' if is_best else ('#1F77B4' if is_design else '#666666')
+                ax.text(-0.5, y, tr_lbl, va='center', ha='right', fontsize=8,
+                        fontweight=weight, color=lbl_color)
+                
+                # Valor
+                ax.text(diff + 0.8, y, f'{diff:.1f}%', va='center', fontsize=8,
+                        fontweight='bold' if is_best else 'normal', color='#2C2C2C')
+            
+            return min_diff, self.tr_list[best_idx], y_start - len(self.tr_list) * 0.7
 
-        y_pos = np.arange(len(trs_sorted))
-        bars  = ax_bar.barh(y_pos, diffs_sorted, color=bar_colors,
-                            alpha=0.85, edgecolor='white', zorder=3)
+        # Dibujar los 3 grupos
+        y_pos = 13
+        results = []
+        
+        min_ff, best_ff, y_pos = _plot_metric_group(ax_bar, y_pos, 'ff', 'Flooding Flow Peak')
+        results.append(('Flooding Flow', best_ff, min_ff))
+        
+        y_pos -= 0.8
+        min_vol, best_vol, y_pos = _plot_metric_group(ax_bar, y_pos, 'vol', 'Flooding Volume')
+        results.append(('Flooding Volume', best_vol, min_vol))
+        
+        y_pos -= 0.8
+        min_of, best_of, y_pos = _plot_metric_group(ax_bar, y_pos, 'of', 'Outfall Flow Peak')
+        results.append(('Outfall Flow', best_of, min_of))
 
-        ax_bar.set_yticks(y_pos)
-        ax_bar.set_yticklabels([f'TR{tr}{"  ★" if tr == self.tr_actual else ""}'
-                                 for tr in trs_sorted], fontsize=9)
+        # Configurar ejes
+        ax_bar.set_xlim(-12, max(80, max([
+            max(tr_metrics[tr]['ff']['diff'] for tr in self.tr_list),
+            max(tr_metrics[tr]['vol']['diff'] for tr in self.tr_list),
+            max(tr_metrics[tr]['of']['diff'] for tr in self.tr_list)
+        ]) * 1.2))
+        ax_bar.set_ylim(y_pos - 1, 15)
         ax_bar.set_xlabel('Diferencia vs Solución (%)', fontsize=9, color=COLORS['text'])
-        ax_bar.invert_yaxis()
+        ax_bar.set_yticks([])
+        
+        # Grid y spines
+        ax_bar.grid(True, axis='x', color='#E0E0E0', linewidth=0.8, zorder=0)
+        ax_bar.spines['left'].set_visible(False)
+        ax_bar.spines['right'].set_visible(False)
+        ax_bar.spines['top'].set_visible(False)
+        ax_bar.spines['bottom'].set_color('#CCCCCC')
 
-        # Anotar valor y volumen baseline
-        for i, (tr, diff, bv) in enumerate(diffs):
-            label = f'{diff:.1f}%  ({bv/1000:.0f}k m³)'
-            ax_bar.text(diff + 0.5, i, label, va='center', fontsize=8,
-                        color=COLORS['text'])
+        # Título
+        ax_bar.set_title(f'¿A qué TR se parece la Solución TR{self.tr_actual}?\n(comparación por métrica)',
+                         fontsize=10, fontweight='bold', color=COLORS['text'], pad=10)
 
-        # Línea vertical en 0
-        ax_bar.axvline(x=0, color='#555555', linewidth=0.8)
+        # Leyenda
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=metric_colors['ff'], label='Flooding Flow', alpha=0.8),
+            Patch(facecolor=metric_colors['vol'], label='Flooding Volume', alpha=0.8),
+            Patch(facecolor=metric_colors['of'], label='Outfall Flow', alpha=0.8),
+        ]
+        ax_bar.legend(handles=legend_elements, loc='lower right', fontsize=8,
+                      framealpha=0.9, edgecolor='#CCCCCC', title='Métricas')
 
-        # Anotación del ganador
-        ax_bar.text(0.98, 0.04,
-                    f'TR más similar: TR{best_tr}',
-                    transform=ax_bar.transAxes, ha='right', va='bottom',
-                    fontsize=10, fontweight='bold', color='#2E7D32',
+        # Resumen
+        note_lines = ['Más similar por métrica:']
+        for metric, tr, diff in results:
+            note_lines.append(f'✓ {metric}: TR{tr} ({diff:.1f}%)')
+        note_lines.append('★ TR de diseño')
+        
+        ax_bar.text(0.98, 0.98, '\n'.join(note_lines), transform=ax_bar.transAxes,
+                    fontsize=8, va='top', ha='right', color='#2C2C2C', linespacing=1.2,
                     bbox=dict(boxstyle='round,pad=0.4', facecolor='#E8F5E9',
-                              edgecolor='#4CAF50', linewidth=1.2))
-
-        ax_bar.set_title(f'¿A qué TR se parece la Solución TR{self.tr_actual}?\n'
-                         f'(por volumen de flooding)',
-                         fontsize=10, fontweight='bold', color=COLORS['text'], pad=8)
-        ax_bar.tick_params(labelsize=8, colors=COLORS['text'])
-        for spine in ax_bar.spines.values():
-            spine.set_color('#CCCCCC')
+                              edgecolor='#4CAF50', linewidth=1.5))
 
         fig.savefig(out_dir / f"paso4_cross_tr_{name}.png",
                     dpi=160, bbox_inches='tight', facecolor='white')
