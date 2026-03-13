@@ -303,7 +303,7 @@ class CrossTRValidator:
         next_idx = len(existing) + 1
         out_dir      = sol_inp.parent / f"{next_idx:02d}_compare_tr"
         sol_scen_dir = out_dir / "modelos"
-        sol_fig_dir  = out_dir / "figuras"
+        sol_fig_dir  = out_dir  # Guardar figuras directamente en compare_tr, sin subcarpeta 'figuras'
         sol_scen_dir.mkdir(parents=True, exist_ok=True)
         sol_fig_dir.mkdir(parents=True, exist_ok=True)
 
@@ -562,7 +562,9 @@ class CrossTRValidator:
         sol_vol = sol_m.total_flooding_volume
         sol_of_peak = max(sol_m.system_outfall_flow_hydrograph.get('total_rate', [0]))
 
-        # Calcular diferencias para cada TR y cada métrica
+        # Calcular diferencias CON SIGNO para cada TR y cada métrica
+        # Positivo = baseline tiene más que solución (solución redujo)
+        # Negativo = baseline tiene menos que solución (solución empeoró)
         tr_metrics = {}
         for tr in self.tr_list:
             base_m = self.baseline_extractors[tr].metrics
@@ -571,21 +573,38 @@ class CrossTRValidator:
             base_vol = base_m.total_flooding_volume
             base_of = max(base_m.system_outfall_flow_hydrograph.get('total_rate', [0]))
             
+            # Diferencia relativa con signo: (base - sol) / sol * 100
             tr_metrics[tr] = {
-                'ff': {'value': base_ff, 'diff': abs(base_ff - sol_ff_peak) / max(base_ff, sol_ff_peak, 1e-10) * 100},
-                'vol': {'value': base_vol, 'diff': abs(base_vol - sol_vol) / max(base_vol, sol_vol, 1e-10) * 100},
-                'of': {'value': base_of, 'diff': abs(base_of - sol_of_peak) / max(base_of, sol_of_peak, 1e-10) * 100},
+                'ff': {
+                    'value': base_ff, 
+                    'diff': (base_ff - sol_ff_peak) / max(sol_ff_peak, 1e-10) * 100,
+                    'abs_diff': abs(base_ff - sol_ff_peak) / max(sol_ff_peak, 1e-10) * 100
+                },
+                'vol': {
+                    'value': base_vol, 
+                    'diff': (base_vol - sol_vol) / max(sol_vol, 1e-10) * 100,
+                    'abs_diff': abs(base_vol - sol_vol) / max(sol_vol, 1e-10) * 100
+                },
+                'of': {
+                    'value': base_of, 
+                    'diff': (base_of - sol_of_peak) / max(sol_of_peak, 1e-10) * 100,
+                    'abs_diff': abs(base_of - sol_of_peak) / max(sol_of_peak, 1e-10) * 100
+                },
             }
 
         # Colores por métrica
         metric_colors = {'ff': '#E74C3C', 'vol': '#3498DB', 'of': '#2ECC71'}
         metric_names = {'ff': 'Flooding Flow Peak', 'vol': 'Flooding Volume', 'of': 'Outfall Flow Peak'}
 
-        # Función para dibujar grupo de barras
+        # Función para dibujar grupo de barras con signo
         def _plot_metric_group(ax, y_start, metric_key, label):
-            diffs = [tr_metrics[tr][metric_key]['diff'] for tr in self.tr_list]
-            min_diff = min(diffs)
-            best_idx = diffs.index(min_diff)
+            # Para encontrar el más similar usamos valor absoluto
+            abs_diffs = [tr_metrics[tr][metric_key]['abs_diff'] for tr in self.tr_list]
+            min_abs_diff = min(abs_diffs)
+            best_idx = abs_diffs.index(min_abs_diff)
+            
+            # Diferencias con signo para graficar
+            signed_diffs = [tr_metrics[tr][metric_key]['diff'] for tr in self.tr_list]
             color = metric_colors[metric_key]
             
             # Título del grupo
@@ -595,19 +614,21 @@ class CrossTRValidator:
             # Dibujar barras
             for i, tr in enumerate(self.tr_list):
                 y = y_start - i * 0.7
-                diff = tr_metrics[tr][metric_key]['diff']
+                diff = signed_diffs[i]
+                abs_diff = abs_diffs[i]
                 is_best = (i == best_idx)
                 is_design = (tr == self.tr_actual)
                 
-                # Estilo de barra
+                # Color más intenso si es el mejor, más tenue si no
                 alpha = 1.0 if is_best else 0.35
                 edge = '#2C2C2C' if is_best else 'white'
                 lw = 2 if is_best else 0.5
                 
+                # Dibujar barra - puede ser positiva o negativa
                 ax.barh(y, diff, height=0.55, color=color, alpha=alpha,
                         edgecolor=edge, linewidth=lw, zorder=3)
                 
-                # Etiqueta TR
+                # Etiqueta TR - siempre al lado opuesto de la barra
                 tr_lbl = f'TR{tr}'
                 if is_design:
                     tr_lbl += ' ★'
@@ -616,14 +637,38 @@ class CrossTRValidator:
                 
                 weight = 'bold' if (is_best or is_design) else 'normal'
                 lbl_color = '#2E7D32' if is_best else ('#1F77B4' if is_design else '#666666')
-                ax.text(-0.5, y, tr_lbl, va='center', ha='right', fontsize=8,
+                
+                # Posición: lado opuesto a la dirección de la barra
+                # Si barra positiva (derecha), label va a la izquierda
+                # Si barra negativa (izquierda), label va a la derecha
+                if diff >= 0:
+                    lbl_x = -2  # Izquierda del 0
+                    lbl_ha = 'right'
+                else:
+                    lbl_x = 2   # Derecha del 0
+                    lbl_ha = 'left'
+                
+                ax.text(lbl_x, y, tr_lbl, va='center', ha=lbl_ha, fontsize=8,
                         fontweight=weight, color=lbl_color)
                 
-                # Valor
-                ax.text(diff + 0.8, y, f'{diff:.1f}%', va='center', fontsize=8,
-                        fontweight='bold' if is_best else 'normal', color='#2C2C2C')
+                # Valor con signo + o -
+                sign = '+' if diff >= 0 else ''
+                val_text = f'{sign}{diff:.1f}%'
+                
+                # Posición del texto: más alejado de la barra para evitar solapamiento
+                offset = max(abs(diff) * 0.15, 5)  # Mínimo 5% de offset
+                if diff >= 0:
+                    text_x = diff + offset
+                    ha = 'left'
+                else:
+                    text_x = diff - offset
+                    ha = 'right'
+                    
+                ax.text(text_x, y, val_text, va='center', fontsize=8,
+                        fontweight='bold' if is_best else 'normal', color='#2C2C2C',
+                        ha=ha)
             
-            return min_diff, self.tr_list[best_idx], y_start - len(self.tr_list) * 0.7
+            return min_abs_diff, self.tr_list[best_idx], y_start - len(self.tr_list) * 0.7
 
         # Dibujar los 3 grupos
         y_pos = 13
@@ -640,15 +685,24 @@ class CrossTRValidator:
         min_of, best_of, y_pos = _plot_metric_group(ax_bar, y_pos, 'of', 'Outfall Flow Peak')
         results.append(('Outfall Flow', best_of, min_of))
 
-        # Configurar ejes
-        ax_bar.set_xlim(-12, max(80, max([
-            max(tr_metrics[tr]['ff']['diff'] for tr in self.tr_list),
-            max(tr_metrics[tr]['vol']['diff'] for tr in self.tr_list),
-            max(tr_metrics[tr]['of']['diff'] for tr in self.tr_list)
-        ]) * 1.2))
+        # Configurar ejes - ahora permite valores negativos y positivos
+        all_diffs = []
+        for tr in self.tr_list:
+            all_diffs.extend([
+                tr_metrics[tr]['ff']['diff'],
+                tr_metrics[tr]['vol']['diff'],
+                tr_metrics[tr]['of']['diff']
+            ])
+        
+        max_val = max(abs(min(all_diffs)), abs(max(all_diffs))) * 1.2
+        ax_bar.set_xlim(-max_val, max_val)
         ax_bar.set_ylim(y_pos - 1, 15)
-        ax_bar.set_xlabel('Diferencia vs Solución (%)', fontsize=9, color=COLORS['text'])
+        ax_bar.set_xlabel('Diferencia vs Solución (%)  ← Menos flooding / Más flooding →', 
+                          fontsize=8, color=COLORS['text'])
         ax_bar.set_yticks([])
+        
+        # Línea vertical en 0 (referencia)
+        ax_bar.axvline(x=0, color='#333333', linewidth=1.5, linestyle='-', zorder=1)
         
         # Grid y spines
         ax_bar.grid(True, axis='x', color='#E0E0E0', linewidth=0.8, zorder=0)
