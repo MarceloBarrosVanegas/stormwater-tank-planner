@@ -353,7 +353,8 @@ class CrossTRValidator:
         self._export_nodes_csv(sol_extractors, sol_fig_dir, name)
 
         print(f"\n[CrossTR] Guardado en: {out_dir}")
-
+        self.out_dir = out_dir  # Guardar referencia para uso externo
+        
         # Retornar resumen
         return {
             tr: {
@@ -453,8 +454,12 @@ class CrossTRValidator:
             fontsize=12, fontweight='bold', color=COLORS['text'], y=0.99
         )
 
+        # gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.32,
+        #                        left=0.08, right=0.97, top=0.93, bottom=0.08)
+
+        # DESPUÉS
         gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.32,
-                               left=0.08, right=0.97, top=0.93, bottom=0.08)
+                               left=0.08, right=0.97, top=0.93, bottom=0.12)
 
         ax_ff = fig.add_subplot(gs[0, 0])
         ax_of = fig.add_subplot(gs[0, 1])
@@ -572,23 +577,22 @@ class CrossTRValidator:
             base_ff = max(base_m.system_flood_hydrograph.get('total_rate', [0]))
             base_vol = base_m.total_flooding_volume
             base_of = max(base_m.system_outfall_flow_hydrograph.get('total_rate', [0]))
-            
-            # Diferencia relativa con signo: (base - sol) / sol * 100
+
             tr_metrics[tr] = {
                 'ff': {
-                    'value': base_ff, 
-                    'diff': (base_ff - sol_ff_peak) / max(sol_ff_peak, 1e-10) * 100,
-                    'abs_diff': abs(base_ff - sol_ff_peak) / max(sol_ff_peak, 1e-10) * 100
+                    'value': base_ff,
+                    'sol_value': sol_ff_peak,
+                    'diff': (sol_ff_peak - base_ff) / max(base_ff, 1e-10) * 100,
                 },
                 'vol': {
-                    'value': base_vol, 
-                    'diff': (base_vol - sol_vol) / max(sol_vol, 1e-10) * 100,
-                    'abs_diff': abs(base_vol - sol_vol) / max(sol_vol, 1e-10) * 100
+                    'value': base_vol,
+                    'sol_value': sol_vol,
+                    'diff': (sol_vol - base_vol) / max(base_vol, 1e-10) * 100,
                 },
                 'of': {
-                    'value': base_of, 
-                    'diff': (base_of - sol_of_peak) / max(sol_of_peak, 1e-10) * 100,
-                    'abs_diff': abs(base_of - sol_of_peak) / max(sol_of_peak, 1e-10) * 100
+                    'value': base_of,
+                    'sol_value': sol_of_peak,
+                    'diff': (sol_of_peak - base_of) / max(base_of, 1e-10) * 100,
                 },
             }
 
@@ -598,13 +602,27 @@ class CrossTRValidator:
 
         # Función para dibujar grupo de barras con signo
         def _plot_metric_group(ax, y_start, metric_key, label):
-            # Para encontrar el más similar usamos valor absoluto
-            abs_diffs = [tr_metrics[tr][metric_key]['abs_diff'] for tr in self.tr_list]
-            min_abs_diff = min(abs_diffs)
-            best_idx = abs_diffs.index(min_abs_diff)
-            
             # Diferencias con signo para graficar
             signed_diffs = [tr_metrics[tr][metric_key]['diff'] for tr in self.tr_list]
+            
+            # Best match: el TR que cumple diff <= tolerancia (con fuzzy)
+            # Si ninguno cumple, el que tenga menor diff (mejor reducción)
+            # DESPUÉS
+            TOLERANCE = getattr(config, 'CROSS_TR_TOLERANCE', 0.10)
+            FUZZY = getattr(config, 'CROSS_TR_FUZZY_ATOL', 0.02)
+
+            best_idx = None
+            for i, tr in enumerate(self.tr_list):
+                sol_val = tr_metrics[tr][metric_key]['sol_value']
+                base_val = tr_metrics[tr][metric_key]['value']
+                if sol_val <= base_val * (1 + TOLERANCE + FUZZY):
+                    best_idx = i
+                    break
+
+            # Si ninguno cumple, el de menor diff (menos peor)
+            if best_idx is None:
+                best_idx = signed_diffs.index(min(signed_diffs))
+            
             color = metric_colors[metric_key]
             
             # Título del grupo
@@ -615,7 +633,6 @@ class CrossTRValidator:
             for i, tr in enumerate(self.tr_list):
                 y = y_start - i * 0.7
                 diff = signed_diffs[i]
-                abs_diff = abs_diffs[i]
                 is_best = (i == best_idx)
                 is_design = (tr == self.tr_actual)
                 
@@ -668,7 +685,7 @@ class CrossTRValidator:
                         fontweight='bold' if is_best else 'normal', color='#2C2C2C',
                         ha=ha)
             
-            return min_abs_diff, self.tr_list[best_idx], y_start - len(self.tr_list) * 0.7
+            return signed_diffs[best_idx], self.tr_list[best_idx], y_start - len(self.tr_list) * 0.7
 
         # Dibujar los 3 grupos
         y_pos = 13
@@ -697,6 +714,7 @@ class CrossTRValidator:
         max_val = max(abs(min(all_diffs)), abs(max(all_diffs))) * 1.2
         ax_bar.set_xlim(-max_val, max_val)
         ax_bar.set_ylim(y_pos - 1, 15)
+        ax_bar.set_xscale('symlog', linthresh=50)  # lineal entre -50% y +50%, log fuera
         ax_bar.set_xlabel('Diferencia vs Solución (%)  ← Menos flooding / Más flooding →', 
                           fontsize=8, color=COLORS['text'])
         ax_bar.set_yticks([])
@@ -731,15 +749,84 @@ class CrossTRValidator:
             note_lines.append(f'✓ {metric}: TR{tr} ({diff:.1f}%)')
         note_lines.append('★ TR de diseño')
         
-        ax_bar.text(0.98, 0.98, '\n'.join(note_lines), transform=ax_bar.transAxes,
-                    fontsize=8, va='top', ha='right', color='#2C2C2C', linespacing=1.2,
-                    bbox=dict(boxstyle='round,pad=0.4', facecolor='#E8F5E9',
-                              edgecolor='#4CAF50', linewidth=1.5))
+        # ax_bar.text(0.98, 0.98, '\n'.join(note_lines), transform=ax_bar.transAxes,
+        #             fontsize=8, va='top', ha='right', color='#2C2C2C', linespacing=1.2,
+        #             bbox=dict(boxstyle='round,pad=0.4', facecolor='#E8F5E9',
+        #                       edgecolor='#4CAF50', linewidth=1.5))
+
+        # DESPUÉS
+        note_parts = ['Más similar por métrica:']
+        for metric, tr, diff in results:
+            sign = '+' if diff >= 0 else ''
+            note_parts.append(f'✓ {metric}: TR{tr} ({sign}{diff:.1f}%)')
+        note_parts.append('★ TR de diseño')
+
+        fig.text(0.5, 0.02, '     '.join(note_parts),
+                 ha='center', va='bottom', fontsize=9, color='#2C2C2C',
+                 bbox=dict(boxstyle='round,pad=0.4', facecolor='#E8F5E9',
+                           edgecolor='#4CAF50', linewidth=1.5))
+
+        # Guardar datos de comparación a CSV para uso en rut_15
+        import csv
+        # Guardar tabla de comparacion a CSV
+        csv_path = out_dir / f"cross_tr_comparison_{name}.csv"
+        # Tolerancia de 0-1 (ej: 0.15 = 15%)
+        SIMILARITY_TOLERANCE = getattr(config, 'CROSS_TR_TOLERANCE', 0.15) * 100
+        
+        # Encontrar el TR con menor diferencia (best match) para cada métrica
+        ff_best_tr = min(self.tr_list, key=lambda tr: abs(tr_metrics[tr]['ff']['diff']))
+        vol_best_tr = min(self.tr_list, key=lambda tr: abs(tr_metrics[tr]['vol']['diff']))
+        of_best_tr = min(self.tr_list, key=lambda tr: abs(tr_metrics[tr]['of']['diff']))
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            cw = csv.writer(f)
+            # Encabezados con valores base, solución, diferencia absoluta y diferencia %
+            cw.writerow(['TR', 
+                         'ff_base', 'ff_sol', 'ff_diff_abs', 'flooding_flow',
+                         'vol_base', 'vol_sol', 'vol_diff_abs', 'flooding_volume', 
+                         'of_base', 'of_sol', 'of_diff_abs', 'outfall_peak_flow',
+                         'TR_Design', 'Best_Match',
+                         'ff_best_tr', 'vol_best_tr', 'of_best_tr'])
+            
+            for tr in self.tr_list:
+                ff_diff = tr_metrics[tr]['ff']['diff']
+                vol_diff = tr_metrics[tr]['vol']['diff']
+                of_diff = tr_metrics[tr]['of']['diff']
+                ff_base = tr_metrics[tr]['ff']['value']
+                vol_base = tr_metrics[tr]['vol']['value']
+                of_base = tr_metrics[tr]['of']['value']
+                is_design = tr == self.tr_actual
+                
+                # Calcular valores de solución a partir de la diferencia
+                ff_sol = ff_base * (1 + ff_diff/100) if ff_base > 0 else 0
+                vol_sol = vol_base * (1 + vol_diff/100) if vol_base > 0 else 0
+                of_sol = of_base * (1 + of_diff/100) if of_base > 0 else 0
+                
+                # Diferencias absolutas (sol - base)
+                ff_diff_abs = ff_sol - ff_base
+                vol_diff_abs = vol_sol - vol_base
+                of_diff_abs = of_sol - of_base
+                
+                # Verificar si este TR esta dentro de tolerancia para todas las metricas
+                ff_ok = abs(ff_diff) <= SIMILARITY_TOLERANCE
+                vol_ok = abs(vol_diff) <= SIMILARITY_TOLERANCE
+                of_ok = abs(of_diff) <= SIMILARITY_TOLERANCE
+                best_match = ff_ok and vol_ok and of_ok
+                
+                cw.writerow([tr, 
+                            f"{ff_base:.2f}", f"{ff_sol:.2f}", f"{ff_diff_abs:.2f}", f"{ff_diff:.2f}",
+                            f"{vol_base:.2f}", f"{vol_sol:.2f}", f"{vol_diff_abs:.2f}", f"{vol_diff:.2f}",
+                            f"{of_base:.2f}", f"{of_sol:.2f}", f"{of_diff_abs:.2f}", f"{of_diff:.2f}",
+                            is_design, best_match,
+                            ff_best_tr, vol_best_tr, of_best_tr])
+        print(f"    Guardado: cross_tr_comparison_{name}.csv")
 
         fig.savefig(out_dir / f"paso4_cross_tr_{name}.png",
                     dpi=160, bbox_inches='tight', facecolor='white')
         plt.close(fig)
         print(f"    Guardado: paso4_cross_tr_{name}.png")
+
+
 
     # -------------------------------------------------------------------------
     # HELPERS DE PLOTS
@@ -1047,7 +1134,7 @@ class CrossTRValidator:
                 elif pipes_gdf.crs is None:
                     pipes_gdf = pipes_gdf.set_crs(target_crs)
 
-                print(f"    Red de tuberías cargada: {len(pipes_gdf)} segmentos (CRS: {pipes_gdf.crs})")
+                # print(f"    Red de tuberías cargada: {len(pipes_gdf)} segmentos (CRS: {pipes_gdf.crs})")
 
                 # Colorear por capacidad si está disponible, si no gris uniforme
                 if 'Capacity' in pipes_gdf.columns or 'utilization' in pipes_gdf.columns:

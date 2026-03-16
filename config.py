@@ -149,8 +149,8 @@ REPORT_STEP_MINUTES = 5               # Report step for SWMM and Itzi
 SHOW_PREDIOS_IN_REPORTS = False  # Enable/Disable predios background in comparison maps (slow)
 
 # GREEN (NATURAL) SCENARIO PARAMETERS
-GREEN_SCENARIO_CN = 78.0              # Default Curve Number for natural state (Forest/Pasture)
-GREEN_SCENARIO_IMPERV = 15.0           # 3% residual imperviousness (rocks, clay, etc.)
+GREEN_SCENARIO_CN = 70.0              # Default Curve Number for natural state (Forest/Pasture)
+GREEN_SCENARIO_IMPERV = 5.0           # 3% residual imperviousness (rocks, clay, etc.)
 
 # =============================================================================
 # COST PARAMETERS
@@ -314,3 +314,62 @@ if PYPIPER_DIR:
     print(f"[Config] PyPiper found at: {PYPIPER_DIR}")
 else:
     print(f"[Config] PyPiper NOT FOUND within candidates.")
+
+
+# =============================================================================
+# MODO EJECUCION POR OBJETIVOS SECUENCIALES
+# =============================================================================
+
+# Flag para activar modo secuencial de objetivos
+RUN_PER_OBJECTIVE = True  # True = Cambia pesos automaticamente al cumplir objetivos
+
+# Secuencia de objetivos - DICCIONARIO con orden numérico
+# El contador CURRENT_OBJECTIVE_INDEX se incrementa cuando se cumple el objetivo actual
+# 
+# Estructura:
+#   - name: Nombre descriptivo del objetivo
+#   - target_tr: TR objetivo contra el que comparar
+#   - weights: Pesos para el ranking (qué variable priorizar al elegir nodos)
+#   - validation_metric: Qué columna del CSV usar para verificar si se cumplió
+#                        ('Outfall_Flow_Diff_Pct', 'Flooding_Flow_Diff_Pct', 'Flooding_Volume_Diff_Pct')
+#
+OBJECTIVE_SEQUENCE = {
+    1: {
+        'name': 'outfall_flow',
+        'target_tr': 5,
+        'weights': {'flow_over_capacity': 0.8, 'flow_node_flooding': 0.1,
+                   'vol_node_flooding': 0.1, 'outfall_peak_flow': 0.0,
+                   'failure_probability': 0},
+        'validation_metric': 'outfall_peak_flow',
+        'CAPACITY_MAX_HD': 0,
+
+    },
+    2: {
+        'name': 'flooding_volume',
+        'target_tr': 5,
+        'weights': {'flow_over_capacity': 0.1, 'flow_node_flooding': 0.1,
+                   'vol_node_flooding': 0.8, 'outfall_peak_flow': 0.0,
+                   'failure_probability': 0},
+        'validation_metric': 'flooding_volume',
+        'CAPACITY_MAX_HD': 0,
+    },
+    3: {
+        'name': 'flooding_flow',
+        'target_tr': 5,
+        'weights': {'flow_over_capacity': 0.1, 'flow_node_flooding': 0.8,
+                   'vol_node_flooding': 0.1, 'outfall_peak_flow': 0.0,
+                   'failure_probability': 0},
+        'validation_metric': 'flooding_flow',
+        'CAPACITY_MAX_HD': 0,
+
+    },
+}
+
+# Tolerancia para considerar objetivo cumplido (en decimal 0-1)
+# Ej: 0.10 = 10% de tolerancia
+CROSS_TR_TOLERANCE = 0.10
+
+# Margen adicional para fuzzy matching (en decimal 0-1, igual que TOLERANCE)
+# Ej: si TOLERANCE=0.10 (10%) y FUZZY_ATOL=0.02 (2%), entonces valores hasta 12% son aceptados
+CROSS_TR_FUZZY_ATOL = 0.02  # 2% de margen difuso
+

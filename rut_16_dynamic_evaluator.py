@@ -116,6 +116,15 @@ class DynamicSolutionEvaluator:
         self.inp_file = config.SWMM_FILE
         self.predio_capacity = {}
         
+        # Si RUN_PER_OBJECTIVE está activo, usar pesos del primer objetivo desde el inicio
+        if getattr(config, 'RUN_PER_OBJECTIVE', False):
+            obj_sequence = getattr(config, 'OBJECTIVE_SEQUENCE', {})
+            if 1 in obj_sequence:
+                ranking_weights = obj_sequence[1]['weights']
+                config.FLOODING_RANKING_WEIGHTS = ranking_weights  # Actualizar config global
+                print(f"[Init] RUN_PER_OBJECTIVE activo - Usando pesos del objetivo 1: {obj_sequence[1]['name']}")
+                print(f"[Init] Pesos: {ranking_weights}")
+        
         # Parametros EXPLICITOS (opcionales) - NO modificar config aqui
         self.ranking_weights = ranking_weights
         self.capacity_max_hd = capacity_max_hd
@@ -441,12 +450,17 @@ class DynamicSolutionEvaluator:
             ramal = row.node_ramal
 
             swmm_gdf = self.metrics_extractor.swmm_gdf
-            node_id = row.get('node_id')
+            node_id = str(row.get('node_id')).strip()
             matching_conduits = swmm_gdf[swmm_gdf['InletNode'] == node_id]
             if matching_conduits.empty:
                 matching_conduits = swmm_gdf[swmm_gdf['OutletNode'] == node_id]
             existing_height = np.mean(matching_conduits.Geom1)
-            h_min = row.node_max_depth - round(config.CAPACITY_MAX_HD * existing_height, 2)
+            # h_min = row.node_max_depth - round(config.CAPACITY_MAX_HD * existing_height, 2)
+
+            hd_to_use = self.node_hd_memory.get(node_id, config.CAPACITY_MAX_HD)
+            h_min = row.node_max_depth - round(hd_to_use * existing_height, 2)
+            print(f'  [RUT03] Adding path for node {node_id} with h_min={h_min:.2f} m (hd_to_use={hd_to_use:.2f}), while default would be {config.CAPACITY_MAX_HD:.2f}')
+
             
             rut03_rows.append({
                 'geometry': geom,
@@ -1369,7 +1383,9 @@ class DynamicSolutionEvaluator:
         # STEP 4: SWMM INTEGRATION - Add derivation to model
         # =====================================================================
         swmm_modifier = SWMMModifier(inp_file=self.inp_file, crs=config.PROJECT_CRS)
-        current_inp_file = swmm_modifier.add_derivation_to_model(self.last_designed_gdf, case_dir, solution_name)
+        current_inp_file = swmm_modifier.add_derivation_to_model(self.last_designed_gdf, case_dir,
+                                                                 solution_name,
+                                                                 node_hd_memory=self.node_hd_memory)
 
         self.metrics_extractor.run(current_inp_file, self.last_designed_gdf)
         self.current_metrics = self.metrics_extractor.metrics

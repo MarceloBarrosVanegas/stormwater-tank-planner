@@ -860,7 +860,7 @@ class SWMMModifier:
         with open(output_path, 'w', encoding='latin-1') as f:
             f.writelines(self.lines)
 
-    def add_derivation_to_model(self, last_design_gdf, case_dir, solution_name):
+    def add_derivation_to_model(self, last_design_gdf, case_dir, solution_name, node_hd_memory):
         """
         Adds derivation pipelines from the last design GeoDataFrame to the SWMM model.
         The last node of each ramal is created as a storage tank or junction based on metadata.
@@ -921,7 +921,11 @@ class SWMMModifier:
                 if is_first_node:
                     node_start = node_metadata['node_id']
                     existing_height = self.get_existing_conduit_geom1(node_start)
-                    inlet_offset = round(config.CAPACITY_MAX_HD * existing_height, 2)
+
+                    hd_to_use = node_hd_memory.get(node_start, config.CAPACITY_MAX_HD)
+                    inlet_offset = round(hd_to_use * existing_height, 2)
+
+                    # inlet_offset = round(config.CAPACITY_MAX_HD * existing_height, 2)
                     tramo = f"{node_start}-{node_end}" if not is_last_node else f"{node_start}-{target_id}"
                 else:
                     node_start = previous_node

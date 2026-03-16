@@ -114,8 +114,14 @@ class GreedyTankOptimizer:
         self.stop_at_breakeven = stop_at_breakeven
         self.breakeven_multiplier = breakeven_multiplier
         self.enable_cross_tr_per_iteration = enable_cross_tr_per_iteration
-    
 
+        self.node_hd_memory = {}  # {node_id: capacity_max_hd_usado}
+        
+        # Inicializar contador de objetivo actual para modo RUN_PER_OBJECTIVE
+        self.current_objective_index = 1
+        
+        # Flag para detener cuando todos los objetivos están cumplidos
+        self.all_objectives_completed = False
         
     def compare_solutions(self, active_pairs):
             """
@@ -229,12 +235,175 @@ class GreedyTankOptimizer:
         
         print(f"\n  [CrossTR] Validando {self.solution_name}...")
         
-
-        
         cross_tr_validator.compare_solution(
             sol_inp=Path(self.current_inp_file),
             name=self.solution_name,
         )
+        
+        # Verificar objetivos si RUN_PER_OBJECTIVE está activo
+        if getattr(config, 'RUN_PER_OBJECTIVE', False):
+            all_completed = self._check_and_switch_objective()
+            self.all_objectives_completed = all_completed
+
+    def _check_objectives_from_cross_tr(self, current_obj):
+        """
+        Verifica si el objetivo se cumple comparando el % de diferencia contra el TR target.
+        
+        Lógica: Leer la fila del target_tr, obtener el % de diferencia de la métrica,
+        y verificar si diff <= tolerancia (con fuzzy matching).
+        
+        Args:
+            current_obj: dict con 'name', 'target_tr', y 'validation_metric'
+                         (ej: {'name': 'outfall_flow', 'target_tr': 2, 
+                               'validation_metric': 'outfall_peak_flow'})
+        
+        Retorna True si el objetivo se cumple, False si no.
+        """
+        from pathlib import Path
+        
+        # Obtener ruta del CSV desde el validator usando getattr
+        cross_tr_validator = getattr(self.evaluator, 'cross_tr_validator', None)
+        if not cross_tr_validator:
+            print("  [Objectives] cross_tr_validator no disponible")
+            return False
+        
+        csv_folder_path = getattr(cross_tr_validator, 'out_dir', None)
+        if not csv_folder_path:
+            print("  [Objectives] out_dir no encontrado en validator")
+            return False
+        
+        csv_path = csv_folder_path / f"cross_tr_comparison_{self.solution_name}.csv"
+        if not csv_path.exists():
+            print(f"  [Objectives] CSV no encontrado: {csv_path}")
+            return False
+        
+        # Leer CSV con pandas
+        df = pd.read_csv(csv_path)
+        
+        # Obtener target TR y metrica de validacion del objetivo actual
+        target_tr = current_obj['target_tr']
+        obj_name = current_obj['name']
+        validation_metric = current_obj.get('validation_metric', None)
+        
+        # Fallback: si no hay validation_metric, inferir del nombre
+        if validation_metric is None:
+            if obj_name == 'outfall_flow':
+                validation_metric = 'outfall_peak_flow'
+            elif obj_name == 'flooding_flow':
+                validation_metric = 'flooding_flow'
+            elif obj_name == 'flooding_volume':
+                validation_metric = 'flooding_volume'
+            else:
+                print(f"  [Objectives] Objetivo desconocido: {obj_name}")
+                return False
+        
+        # Verificar que la columna de la métrica existe
+        if validation_metric not in df.columns:
+            print(f"  [Objectives] Métrica '{validation_metric}' no encontrada en CSV")
+            print(f"  [Objectives] Columnas disponibles: {list(df.columns)}")
+            return False
+        
+        # Filtrar fila del target TR
+        target_row = df[df['TR'] == target_tr]
+        if target_row.empty:
+            print(f"  [Objectives] TR{target_tr} no encontrado en CSV")
+            return False
+        
+        # Obtener el % de diferencia para esta métrica en el target TR
+        diff = float(target_row[validation_metric].iloc[0])
+        
+        # Convertir tolerancias de decimal (0-1) a porcentaje para comparar con diff del CSV
+        SIMILARITY_TOLERANCE = getattr(config, 'CROSS_TR_TOLERANCE', 0.10) * 100  # 0.10 → 10%
+        MARGEN_DIFUSO = getattr(config, 'CROSS_TR_FUZZY_ATOL', 0.02) * 100        # 0.02 → 2%
+
+        # diff = (sol - base_TR ) / base_TR
+        is_ok = (diff <= SIMILARITY_TOLERANCE) or np.isclose(diff, SIMILARITY_TOLERANCE, atol=MARGEN_DIFUSO)
+        
+        return is_ok
+
+    def _check_and_switch_objective(self):
+        """
+        Verifica el estado de TODOS los objetivos y ajusta el objetivo actual.
+        
+        Lógica:
+        - Revisa todos los objetivos en orden (1, 2, 3...)
+        - El objetivo activo es el de menor número que NO esté cumplido
+        - Si cambia el objetivo, actualiza pesos y recalcula ranking
+        - Retorna True si todos los objetivos están cumplidos
+        
+        Se ejecuta cuando RUN_PER_OBJECTIVE = True.
+        
+        Returns:
+            bool: True si todos los objetivos están cumplidos, False si no.
+        """
+        obj_sequence = getattr(config, 'OBJECTIVE_SEQUENCE', {})
+        current_idx = self.current_objective_index
+        
+        if not obj_sequence or current_idx not in obj_sequence:
+            return False
+        
+        # Ordenar objetivos por su índice numérico
+        sorted_indices = sorted(obj_sequence.keys())
+        
+        # Verificar TODOS los objetivos y encontrar el primero no cumplido
+        first_pending_idx = None
+        status_lines = []
+        all_completed = True
+        
+        for idx in sorted_indices:
+            obj = obj_sequence[idx]
+            is_cumplido = self._check_objectives_from_cross_tr(obj)
+            status = "✓" if is_cumplido else "✗"
+            status_lines.append(f"  [Objective Check] Objetivo {idx} '{obj['name']}': {status}")
+            
+            if not is_cumplido:
+                all_completed = False
+                if first_pending_idx is None:
+                    first_pending_idx = idx
+        
+        # Imprimir estado de todos los objetivos
+        for line in status_lines:
+            print(line)
+        
+        # Si todos están cumplidos, guardar flag y retornar True
+        if all_completed:
+            print(f"\n  [Objective Switch] TODOS los objetivos cumplidos! (Contador final: {current_idx})")
+            return True
+        
+        # Si el objetivo activo ya es el correcto, no hacer nada
+        if first_pending_idx == current_idx:
+            return False
+        
+        # Cambiar al nuevo objetivo
+        obj_actual = obj_sequence[current_idx]
+        obj_nuevo = obj_sequence[first_pending_idx]
+        
+        self.current_objective_index = first_pending_idx
+        config.FLOODING_RANKING_WEIGHTS = obj_nuevo['weights']
+        config.CAPACITY_MAX_HD = obj_nuevo['CAPACITY_MAX_HD']
+        
+        # Determinar dirección del cambio
+        if first_pending_idx < current_idx:
+            action, direction = "RETROCEDER", "←"
+        else:
+            action, direction = "AVANZAR", "→"
+        
+        # IMPRESIÓN GRANDE Y LLAMATIVA DEL CAMBIO DE OBJETIVO
+        print("\n" + "="*70)
+        print(f"  ★ ★ ★  CAMBIO DE OBJETIVO ({action}) {direction}  ★ ★ ★")
+        print("="*70)
+        print(f"  OBJETIVO ANTERIOR: {obj_actual['name']} (Target TR{obj_actual['target_tr']})")
+        print(f"  OBJETIVO NUEVO:    {obj_nuevo['name']} (Target TR{obj_nuevo['target_tr']})")
+        print(f"  CONTADOR: {current_idx} -> {first_pending_idx}")
+        print("="*70 + "\n")
+        print(f"  [Objective Switch] Nuevos pesos: {obj_nuevo['weights']}")
+        
+        # Recalcular ranking con nuevos pesos
+        df = self.metrics_extractor.calculate_scores(self.metrics_extractor.nodes_gdf)
+        self.metrics_extractor.ranked_candidates = df.to_dict('records')
+        print(f"  [Objective Switch] Ranking recalculado: {len(self.metrics_extractor.ranked_candidates)} candidatos")
+        
+        return False
 
     def _remove_case_directory(self):
         """Remove a case directory if it exists, preserving hydrological_impact files."""
@@ -437,12 +606,15 @@ class GreedyTankOptimizer:
         used_nodes = set()              # Nodos ya ocupados por tanques
         permanently_excluded = set()    # Nodos permanentemente excluidos
         pruning_failures = {}           # Contador de fallos por nodo (para retry)
+
         
         # Métricas de referencia (baseline sin intervención)
         self.baseline_metrics = self.metrics_extractor.metrics
         self.predios_gdf = self.metrics_extractor.predios_gdf
         self.nodes_gdf = self.metrics_extractor.nodes_gdf
         candidates = self.metrics_extractor.ranked_candidates.copy()
+        # Pasar el diccionario  actualizado al evaluator en rut_16_evaluate_solution para que lo use en la próxima iteración
+        self.evaluator.node_hd_memory = self.node_hd_memory
         
         # Log de inicio
         print(f"\n{'='*60}")
@@ -503,6 +675,15 @@ class GreedyTankOptimizer:
         volume_condition = True
         
         while volume_condition:
+            # -----------------------------------------------------------------
+            # 2.0 VERIFICAR SI TODOS LOS OBJETIVOS ESTÁN CUMPLIDOS
+            # -----------------------------------------------------------------
+            if self.all_objectives_completed:
+                print("\n" + "="*70)
+                print("  ★ ★ ★  TODOS LOS OBJETIVOS CUMPLIDOS - DETENIENDO OPTIMIZACIÓN  ★ ★ ★")
+                print("="*70)
+                break
+            
             # -----------------------------------------------------------------
             # 2.1 VERIFICAR DISPONIBILIDAD DE CANDIDATOS
             # -----------------------------------------------------------------
@@ -672,8 +853,17 @@ class GreedyTankOptimizer:
             # -----------------------------------------------------------------
             # 2.6 REGISTRAR RESULTADOS DE ITERACIÓN EXITOSA
             # -----------------------------------------------------------------
+
+
+            # guardar la elevacion de salida de la derivacion para replicar en las proximas iteraciones
+            # no puede ser mas abajo porque en compare solutions se hace el cambio de dict weigths
+            if str(cand['node_id']).strip() not in self.evaluator.node_hd_memory:
+                self.evaluator.node_hd_memory[str(cand['node_id']).strip()] = config.CAPACITY_MAX_HD
+
             # Comparación visual con baseline
             self.compare_solutions(active_candidates)
+
+
             
             # Refrescar candidatos para siguiente iteración
             candidates = self.metrics_extractor.ranked_candidates.copy()
@@ -716,10 +906,27 @@ class GreedyTankOptimizer:
                 tank_depth = 0
                 tank_design = 0
                 tank_util = 0
-            
+
+            # VERIFICAR OBJETIVO ACTUAL
+            obj_sequence = getattr(config, 'OBJECTIVE_SEQUENCE', {})
+            current_idx = self.current_objective_index
+
+            if current_idx in obj_sequence:
+                current_obj = obj_sequence[current_idx]
+                obj_name = current_obj['name']  # ← AQUÍ ESTÁ: "outfall_flow", "flooding_volume", etc.
+                target_tr = current_obj['target_tr']  # ← TR objetivo (2, 10, etc.)
+                print(f"\n  [Objetivo Actual] {obj_name} (Target TR{target_tr})")
+            else:
+                obj_name = 'unknown'
+
+
+
+
+
             # Construir diccionario de resultados
             result = {
                 # Identificación
+                'target_model': obj_name  ,
                 'step': iteration,
                 'n_tanks': n_tanks,
                 'added_node': cand['node_id'],

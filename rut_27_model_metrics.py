@@ -828,11 +828,8 @@ class MetricExtractor:
         Uses config.FLOODING_RANKING_WEIGHTS keys as the metric names (no hardcodes).
         Normalizes each metric to 0-1 (min-max) before weighting.
         """
-        # Usar pesos explicitos si estan disponibles, sino usar config
-        if self.explicit_ranking_weights is not None:
-            self.weights = self.explicit_ranking_weights
-        else:
-            self.weights = config.FLOODING_RANKING_WEIGHTS
+        # Siempre usar pesos de config (permite cambio dinámico en RUN_PER_OBJECTIVE)
+        self.weights = config.FLOODING_RANKING_WEIGHTS
 
         if gdf.empty:
             gdf = gdf.copy()
@@ -857,12 +854,19 @@ class MetricExtractor:
             df["score"] = 0.0
             return df
 
+        # DEBUG: Mostrar pesos usados
+        print(f"\n[DEBUG calculate_scores] Pesos config: {self.weights}")
+        print(f"[DEBUG calculate_scores] Métricas disponibles: {available}")
+        
         # 2) normalize metrics + build score
         norm_cols = []
         for m in available:
             col = f"__norm__{m}"
             df[col] = normalize(df[m])
             norm_cols.append(col)
+            # DEBUG: Mostrar normalización
+            print(f"[DEBUG] {m}: min={df[m].min():.2f}, max={df[m].max():.2f}")
+            print(f"[DEBUG] {m} normalizado: {df[col].iloc[0]:.4f}, {df[col].iloc[1]:.4f}, ...")
 
         # 3) optionally renormalize weights among available metrics
         w = np.array([float(self.weights[m]) for m in available], dtype=float)
@@ -872,13 +876,21 @@ class MetricExtractor:
             w = np.ones_like(w) / len(w)
         else:
             w = w / w_sum
+        
+        # DEBUG: Mostrar pesos finales
+        print(f"[DEBUG] Pesos renormalizados: {dict(zip(available, w))}")
 
         # 4) weighted score
         score = np.zeros(len(df), dtype=float)
         for wi, m in zip(w, available):
-            score += wi * df[f"__norm__{m}"]
+            contribution = wi * df[f"__norm__{m}"]
+            score += contribution
+            # DEBUG: Mostrar contribución de cada métrica al primer candidato
+            print(f"[DEBUG] {m}: peso={wi:.4f} * norm={df[f'__norm__{m}'].iloc[0]:.4f} = {contribution.iloc[0]:.4f}")
 
         df["score"] = score
+        print(f"[DEBUG] Score primer candidato: {score[0]:.4f}")
+        print(f"[DEBUG] Score segundo candidato: {score[1]:.4f}")
 
         # 5) cleanup + sort
         df.drop(columns=norm_cols, inplace=True)
