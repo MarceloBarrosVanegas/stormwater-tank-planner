@@ -9,6 +9,8 @@ import matplotlib.transforms as mtransforms
 import matplotlib.patches as mpatches
 from datetime import datetime
 from matplotlib.ticker import MaxNLocator, FuncFormatter
+import json
+import contextily as ctx
 
 class EvolutionDashboardGenerator:
     """
@@ -1855,25 +1857,450 @@ class EvolutionDashboardGenerator:
         plt.close(fig)
         print(f"  [Dashboard] Saved: {save_path}")
 
+    def plot_group_cards_map_from_networks_and_swmm(
+        self,
+        networks_gpkg_path: str,
+        swmm_inp_path: str,
+        sequence_csv_path: str,
+        basemap_alpha: float = 0.5,
+        output_name: str = "group_cards_network_map"
+    ):
+        """
+        Genera figura con panel izquierdo (fichas de tanques) y panel derecho (mapa de red).
+        
+        Panel izquierdo: fichas apiladas T1, T2, T3... ordenadas por costo descendente
+        Panel derecho: mapa con red en gris, grupos coloreados, labels T*, globos azules con ramal
+        
+        Args:
+            networks_gpkg_path: Ruta al GPKG de redes (con columna Obs en JSON)
+            swmm_inp_path: Ruta al modelo SWMM .inp
+            sequence_csv_path: Ruta al CSV con costos y secuencia
+            basemap_alpha: Opacidad del basemap satelital (default 0.5)
+            output_name: Nombre base para la figura de salida
+        """
+        import swmmio
+        
+        # ============================================================
+        # 1. CARGAR DATOS
+        # ============================================================
+        
+        # 1.1 Cargar GPKG de redes
+        networks_gdf = gpd.read_file(networks_gpkg_path)
+        
+        # Verificar columnas requeridas
+        required_cols = ['Obs', 'Ramal']
+        for col in required_cols:
+            if col not in networks_gdf.columns:
+                raise KeyError(f"Columna requerida '{col}' no encontrada en GPKG de redes")
+        
+        # 1.2 Parsear columna Obs (JSON) y extraer datos del tanque
+        def parse_obs_json(obs_str):
+            """Parsea el JSON de la columna Obs."""
+            if pd.isna(obs_str):
+                return {}
+            try:
+                return json.loads(obs_str)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"JSON inválido en columna Obs: {obs_str[:100]}...") from e
+        
+        networks_gdf['obs_parsed'] = networks_gdf['Obs'].apply(parse_obs_json)
+        
+        # Extraer campos del JSON
+        networks_gdf['target_id'] = networks_gdf['obs_parsed'].apply(lambda x: x.get('target_id'))
+        networks_gdf['target_x'] = networks_gdf['obs_parsed'].apply(lambda x: x.get('target_x'))
+        networks_gdf['target_y'] = networks_gdf['obs_parsed'].apply(lambda x: x.get('target_y'))
+        networks_gdf['target_total_volume'] = networks_gdf['obs_parsed'].apply(lambda x: x.get('target_total_volume', 0))
+        networks_gdf['target_ramal'] = networks_gdf['obs_parsed'].apply(lambda x: x.get('target_ramal'))
+        
+        # Filtrar solo las tuberías que tienen target_id (pertenecen a un grupo/tanque)
+        networks_with_target = networks_gdf[networks_gdf['target_id'].notna()].copy()
+        
+        if networks_with_target.empty:
+            raise ValueError("No se encontraron tuberías con target_id válido en el GPKG")
+        
+        # 1.3 Cargar CSV de secuencia
+        sequence_df = pd.read_csv(sequence_csv_path)
+        
+        # Limpiar columnas de costo (quitar $ y comas)
+        currency_cols = ['current_tank_cost', 'current_tank_land', 'cost_links']
+        for col in currency_cols:
+            if col in sequence_df.columns:
+                sequence_df[col] = sequence_df[col].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False).str.replace(' ', '', regex=False)
+                sequence_df[col] = pd.to_numeric(sequence_df[col], errors='coerce').fillna(0)
+        
+        # 1.4 Cargar modelo SWMM para obtener volúmenes por ramal
+        swmm_model = swmmio.Model(swmm_inp_path)
+        
+        # ============================================================
+        # 2. CALCULAR MÉTRICAS POR GRUPO/TANQUE
+        # ============================================================
+        
+        # Agrupar por target_id
+        group_data = []
+        
+        for target_id, group_gdf in networks_with_target.groupby('target_id'):
+            # Datos del tanque del JSON
+            tank_x = group_gdf['target_x'].iloc[0]
+            tank_y = group_gdf['target_y'].iloc[0]
+            tank_volume = group_gdf['target_total_volume'].iloc[0]
+            
+            # Buscar datos del tanque en el CSV (por added_node o similar)
+            # El target_id suele ser el node_id (ej: P0071343)
+            tank_row = sequence_df[sequence_df['added_node'] == target_id]
+            
+            if tank_row.empty:
+                # Intentar buscar por predio si no encuentra por nodo
+                tank_row = sequence_df[sequence_df['added_predio'].astype(str) == str(target_id)]
+            
+            if tank_row.empty:
+                # Si no se encuentra, usar valores por defecto (0)
+                tank_cost_value = 0
+                tank_land_cost = 0
+            else:
+                # Tomar el último valor (iteración final)
+                tank_row = tank_row.iloc[-1]
+                tank_cost_value = tank_row.get('current_tank_cost', 0)
+                tank_land_cost = tank_row.get('current_tank_land', 0)
+            
+            # Calcular métricas por ramal dentro de este grupo
+            ramal_data = []
+            for ramal_name, ramal_gdf in group_gdf.groupby('Ramal'):
+                # Longitud total del ramal
+                total_length = ramal_gdf.geometry.length.sum()
+                
+                # Diámetro máximo
+                if 'Diameter' in ramal_gdf.columns:
+                    dmax = ramal_gdf['Diameter'].max()
+                elif 'Geom1' in ramal_gdf.columns:
+                    dmax = ramal_gdf['Geom1'].max()
+                else:
+                    dmax = 0
+                
+                # Costo de derivación para este ramal (del CSV)
+                # Buscar en el CSV el costo_links correspondiente
+                deriv_cost = 0  # Placeholder - se mejorará con SWMM
+                
+                # Volumen aportado (placeholder - bloque separado para mejorar después)
+                volume_aportado = 0
+                
+                ramal_data.append({
+                    'ramal': ramal_name,
+                    'costo': deriv_cost,
+                    'volumen': volume_aportado,
+                    'longitud': total_length,
+                    'dmax': dmax,
+                    'geometry': ramal_gdf.geometry.unary_union
+                })
+            
+            # Calcular totales del grupo
+            total_cost = tank_cost_value + tank_land_cost + sum([r['costo'] for r in ramal_data])
+            total_volume = tank_volume + sum([r['volumen'] for r in ramal_data])
+            total_length = sum([r['longitud'] for r in ramal_data])
+            
+            group_data.append({
+                'target_id': target_id,
+                'tank_x': tank_x,
+                'tank_y': tank_y,
+                'tank_cost': tank_cost_value,
+                'tank_land_cost': tank_land_cost,
+                'tank_volume': tank_volume,
+                'total_cost': total_cost,
+                'total_volume': total_volume,
+                'total_length': total_length,
+                'ramales': ramal_data,
+                'geometry': group_gdf.geometry.unary_union
+            })
+        
+        # ============================================================
+        # 3. ORDENAR GRUPOS POR COSTO TOTAL (DESCENDENTE)
+        # ============================================================
+        
+        group_data.sort(key=lambda x: x['total_cost'], reverse=True)
+        
+        # Asignar nombres T1, T2, T3...
+        colors = plt.cm.Set3(np.linspace(0, 1, len(group_data)))
+        for i, group in enumerate(group_data):
+            group['tank_label'] = f"T{i+1}"
+            group['color'] = colors[i]
+        
+        # ============================================================
+        # 4. CREAR FIGURA CON GridSpec
+        # ============================================================
+        
+        fig = plt.figure(figsize=(20, 14))
+        gs = fig.add_gridspec(1, 2, width_ratios=[0.35, 0.65], wspace=0.1)
+        
+        ax_left = fig.add_subplot(gs[0, 0])
+        ax_right = fig.add_subplot(gs[0, 1])
+        
+        # ============================================================
+        # 5. PANEL IZQUIERDO: FICHAS DE TANQUES
+        # ============================================================
+        
+        ax_left.set_facecolor('white')
+        ax_left.axis('off')
+        
+        # Calcular posiciones verticales para las fichas
+        n_groups = len(group_data)
+        card_height = 0.85 / n_groups
+        card_spacing = 0.02
+        
+        for i, group in enumerate(group_data):
+            y_top = 0.95 - i * (card_height + card_spacing)
+            y_bottom = y_top - card_height
+            
+            # Dibujar rectángulo de la ficha
+            rect = mpatches.FancyBboxPatch(
+                (0.02, y_bottom), 0.96, card_height,
+                boxstyle="round,pad=0.01",
+                facecolor='#F8F9FA',
+                edgecolor=group['color'],
+                linewidth=2,
+                transform=ax_left.transAxes
+            )
+            ax_left.add_patch(rect)
+            
+            # Título del tanque
+            title_text = f"Tanque {group['tank_label']}"
+            ax_left.text(0.05, y_top - 0.02, title_text,
+                        transform=ax_left.transAxes,
+                        fontsize=12, fontweight='bold',
+                        color=group['color'])
+            
+            # Línea resumen: X | Y | Valor tanque | Volumen total
+            summary_y = y_top - 0.06
+            summary_text = f"X: {group['tank_x']:.2f} | Y: {group['tank_y']:.2f} | Valor tanque: ${group['tank_cost']/1e6:.2f}M | Volumen total: {group['tank_volume']/1000:.1f}k m³"
+            ax_left.text(0.05, summary_y, summary_text,
+                        transform=ax_left.transAxes,
+                        fontsize=8, color='#495057')
+            
+            # Tabla de ramales
+            table_y_start = summary_y - 0.05
+            row_height = 0.035
+            
+            # Headers de tabla
+            headers = ['Ramal', 'Costo', 'Volumen', 'Longitud', 'Dmáx']
+            x_positions = [0.05, 0.25, 0.45, 0.65, 0.85]
+            
+            for j, header in enumerate(headers):
+                ax_left.text(x_positions[j], table_y_start, header,
+                            transform=ax_left.transAxes,
+                            fontsize=8, fontweight='bold',
+                            color='#212529')
+            
+            # Filas de ramales
+            for j, ramal in enumerate(group['ramales']):
+                row_y = table_y_start - (j + 1) * row_height
+                
+                ax_left.text(x_positions[0], row_y, str(ramal['ramal']),
+                            transform=ax_left.transAxes, fontsize=7, color='#495057')
+                ax_left.text(x_positions[1], row_y, f"${ramal['costo']/1e6:.2f}M" if ramal['costo'] > 0 else "$-",
+                            transform=ax_left.transAxes, fontsize=7, color='#495057')
+                ax_left.text(x_positions[2], row_y, f"{ramal['volumen']/1000:.1f}k" if ramal['volumen'] > 0 else "-",
+                            transform=ax_left.transAxes, fontsize=7, color='#495057')
+                ax_left.text(x_positions[3], row_y, f"{ramal['longitud']:.0f}",
+                            transform=ax_left.transAxes, fontsize=7, color='#495057')
+                ax_left.text(x_positions[4], row_y, f"{ramal['dmax']:.2f}" if ramal['dmax'] > 0 else "-",
+                            transform=ax_left.transAxes, fontsize=7, color='#495057')
+            
+            # Fila TOTAL GRUPO
+            total_row_y = table_y_start - (len(group['ramales']) + 1.5) * row_height
+            
+            ax_left.text(x_positions[0], total_row_y, 'TOTAL GRUPO',
+                        transform=ax_left.transAxes, fontsize=8, fontweight='bold',
+                        color='#212529')
+            ax_left.text(x_positions[1], total_row_y, f"${group['total_cost']/1e6:.2f}M",
+                        transform=ax_left.transAxes, fontsize=8, fontweight='bold',
+                        color='#212529')
+            ax_left.text(x_positions[2], total_row_y, f"{group['total_volume']/1000:.1f}k",
+                        transform=ax_left.transAxes, fontsize=8, fontweight='bold',
+                        color='#212529')
+            ax_left.text(x_positions[3], total_row_y, f"{group['total_length']:.0f}",
+                        transform=ax_left.transAxes, fontsize=8, fontweight='bold',
+                        color='#212529')
+            ax_left.text(x_positions[4], total_row_y, '—',
+                        transform=ax_left.transAxes, fontsize=8, fontweight='bold',
+                        color='#6C757D')
+        
+        # ============================================================
+        # 6. PANEL DERECHO: MAPA DE RED
+        # ============================================================
+        
+        # Convertir a GeoDataFrame para facilitar plotting
+        all_network = networks_gdf.copy()
+        
+        # Convertir a CRS Web Mercator para contextily
+        if all_network.crs is None:
+            all_network.set_crs(epsg=4326, inplace=True)
+        all_network_3857 = all_network.to_crs(epsg=3857)
+        
+        # Crear GeoDataFrame de los grupos
+        groups_gdf = gpd.GeoDataFrame(
+            group_data,
+            geometry=[g['geometry'] for g in group_data],
+            crs=all_network.crs
+        )
+        groups_gdf_3857 = groups_gdf.to_crs(epsg=3857)
+        
+        # 6.1 Dibujar toda la red en gris suave
+        all_network_3857.plot(
+            ax=ax_right,
+            color='#ADB5BD',
+            alpha=0.4,
+            linewidth=0.8,
+            label='Red existente'
+        )
+        
+        # 6.2 Dibujar cada grupo con su color
+        for i, group in enumerate(group_data):
+            group_geom = groups_gdf_3857.iloc[i]
+            
+            # Dibujar geometría del grupo
+            if hasattr(group_geom.geometry, 'geoms'):
+                for geom in group_geom.geometry.geoms:
+                    ax_right.plot(*geom.xy, color=group['color'], linewidth=3, alpha=0.8)
+            else:
+                ax_right.plot(*group_geom.geometry.xy, color=group['color'], linewidth=3, alpha=0.8)
+            
+            # Calcular centroide para label T*
+            centroid = group_geom.geometry.centroid
+            
+            # Label T1, T2, etc.
+            ax_right.annotate(
+                group['tank_label'],
+                xy=(centroid.x, centroid.y),
+                fontsize=14, fontweight='bold',
+                color='white',
+                ha='center', va='center',
+                bbox=dict(boxstyle='circle,pad=0.3', facecolor=group['color'], 
+                         edgecolor='white', linewidth=2)
+            )
+        
+        # 6.3 Globos azules con nombre del ramal en el punto de salida
+        for group in group_data:
+            for ramal in group['ramales']:
+                # Calcular punto de salida del ramal (punto más cercano al tanque)
+                ramal_geom = ramal['geometry']
+                
+                if hasattr(ramal_geom, 'coords'):
+                    # Es una LineString - tomar el primer punto
+                    if len(list(ramal_geom.coords)) > 0:
+                        punto_salida = ramal_geom.coords[0]
+                    else:
+                        continue
+                elif hasattr(ramal_geom, 'geoms') and len(list(ramal_geom.geoms)) > 0:
+                    # Es una GeometryCollection o similar - tomar el primer punto de la primera geometría
+                    first_geom = list(ramal_geom.geoms)[0]
+                    if hasattr(first_geom, 'coords') and len(list(first_geom.coords)) > 0:
+                        punto_salida = first_geom.coords[0]
+                    else:
+                        continue
+                else:
+                    continue
+                
+                # Convertir punto a Web Mercator si es necesario
+                if all_network.crs.to_epsg() == 4326:
+                    from shapely.geometry import Point
+                    punto = Point(punto_salida)
+                    punto_gdf = gpd.GeoDataFrame(geometry=[punto], crs=all_network.crs)
+                    punto_3857 = punto_gdf.to_crs(epsg=3857).geometry.iloc[0]
+                    px, py = punto_3857.x, punto_3857.y
+                else:
+                    px, py = punto_salida[0], punto_salida[1]
+                
+                # Globo azul con nombre del ramal
+                ax_right.annotate(
+                    str(ramal['ramal']),
+                    xy=(px, py),
+                    xytext=(15, 15),
+                    textcoords='offset points',
+                    fontsize=9, fontweight='bold',
+                    color='white',
+                    ha='center', va='center',
+                    bbox=dict(boxstyle='round,pad=0.4', facecolor='#0D6EFD',
+                             edgecolor='white', linewidth=1.5),
+                    arrowprops=dict(arrowstyle='->', color='#0D6EFD', lw=1.5)
+                )
+        
+        # 6.4 Agregar basemap satelital con opacidad
+        ctx.add_basemap(
+            ax_right,
+            source=ctx.providers.Esri.WorldImagery,
+            alpha=basemap_alpha
+        )
+        
+        # Configurar ejes del mapa
+        ax_right.set_title('Distribución Espacial de Tanques y Derivaciones',
+                          fontsize=14, fontweight='bold', pad=10)
+        ax_right.set_axis_off()
+        
+        # ============================================================
+        # 7. GUARDAR FIGURA
+        # ============================================================
+        
+        save_path = self._get_next_figure_path(output_name)
+        fig.savefig(save_path, dpi=200, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"  [Dashboard] Saved: {save_path}")
+
 
 if __name__ == "__main__":
     print("Running Dashboard Generator with REAL data...")
     
+    # ============================================
+    # CONFIGURABLE: Carpeta de resultados
+    # ============================================
+    RESULTS_FOLDER = "optimization_results_t5_min_vol"  # <-- Cambiar según el caso
+    # ============================================
+    
     # Read real results from optimization
-    csv_path = Path("optimization_results/sequence_tracking.csv")
+    csv_path = Path(RESULTS_FOLDER) / "sequence_tracking.csv"
     
     if csv_path.exists():
         df_real = pd.read_csv(csv_path)
         print(f"  Loaded {len(df_real)} rows from {csv_path}")
         print(f"  Columns: {list(df_real.columns)}")
         
+        # ============================================================
+        # LIMPIAR COLUMNAS DE MONEDA (quitar $ y comas)
+        # ============================================================
+        currency_cols = ['cost_social_total', 'cost_investment_total', 'cost_links', 
+                        'cost_tanks', 'cost_land', 'cost_residual_total', 'cost_residual_flood',
+                        'cost_residual_infra', 'current_tank_cost', 'current_tank_land',
+                        '_marginal_cost', 'cost_display']
+        
+        for col in currency_cols:
+            if col in df_real.columns:
+                df_real[col] = df_real[col].astype(str).str.replace('$', '', regex=False).str.replace(',', '', regex=False).str.replace(' ', '', regex=False)
+                df_real[col] = pd.to_numeric(df_real[col], errors='coerce').fillna(0)
+        
+        # ============================================================
+        
         # Generate in the same output folder
-        output_path = Path("optimization_results")
+        output_path = Path(RESULTS_FOLDER)
         
         gen = EvolutionDashboardGenerator(df_real, output_path)
         gen.generate_all()
         
-        print(f"Done. Check {output_path.absolute()}")
+        # ============================================
+        # NUEVA FUNCIÓN: Mapa de grupos/tanques con red
+        # ============================================
+        print("\n  [Dashboard] Generating group cards with network map...")
+        try:
+            gen.plot_group_cards_map_from_networks_and_swmm(
+                networks_gpkg_path="base_network.gpkg",
+                swmm_inp_path="base_swmm.inp",
+                sequence_csv_path=str(csv_path),
+                basemap_alpha=0.5,
+                output_name="group_cards_network_map"
+            )
+        except Exception as e:
+            # Re-lanzar el error para ver el traceback completo
+            import traceback
+            traceback.print_exc()
+            raise
+        
+        print(f"\nDone. Check {output_path.absolute()}")
     else:
         print(f"ERROR: CSV not found at {csv_path}")
         print("Run the optimization first (rut_10_run_tanque_tormenta.py)")
